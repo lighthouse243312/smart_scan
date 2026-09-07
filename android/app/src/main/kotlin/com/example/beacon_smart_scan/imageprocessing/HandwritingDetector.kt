@@ -1,0 +1,291 @@
+package com.example.beacon_smart_scan.imageprocessing
+
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfDouble
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Rect
+import org.opencv.geometry.Geometry
+import org.opencv.imgproc.Imgproc
+import kotlin.math.min
+import kotlin.math.sqrt
+
+/**
+ * Best-effort "is this text block handwritten?" per-word measurement. This returns raw
+ * per-word stats — it does NOT decide handwriting vs print itself. Dart (ImageProcessingService)
+ * makes that call by comparing every word's stats against the PAGE'S OWN most-common values
+ * (a self-calibrating "reference style/color" instead of a fixed threshold): most of a page is
+ * printed text sharing one font and one ink color, so whichever words deviate from that
+ * majority — different stroke width, different ink color, different baseline (see
+ * TextRecognitionService) — are the handwriting candidates.
+ *
+ * Two native pixel-level stats are measured here, based on the Stroke Width Transform
+ * text-classification idea (Epshtein et al.): printed fonts render every character with the
+ * same stroke width by design, while handwriting's stroke width drifts with pen pressure/speed.
+ * The key fix over a naive per-pixel measurement: aggregate stroke width **per connected
+ * component** (per character/glyph cluster) first, then look at variance ACROSS components —
+ * not across every ink pixel pooled together, which mixes in each letter's own thick joints and
+ * corners and drowns out the real signal (verified empirically: pooling all pixels scored a
+ * clean printed line *higher* than actual handwriting).
+ */
+object HandwritingDetector {
+    private const val MIN_INK_PIXELS = 20
+    private const val MIN_COMPONENT_AREA = 3
+
+    data class RegionStats(
+        val strokeVariationScore: Double,
+        val componentRatioScore: Double,
+        val angleVariationScore: Double,
+        val avgStrokeWidth: Double,
+        val inkColorB: Double,
+        val inkColorG: Double,
+        val inkColorR: Double,
+        val inkIntensityStdDev: Double,
+        val hasWideUnderline: Boolean,
+        val hasInk: Boolean,
+    )
+
+    fun detect(imagePath: String, textBlocks: List<Map<String, Any>>): List<Map<String, Any>> {
+        val src = ImageIO.readOrThrow(imagePath)
+        val gray = Mat()
+        try {
+            Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
+            return textBlocks.map { block ->
+                val id = block["id"] as? String ?: ""
+                val charCount = (block["charCount"] as? Number)?.toInt()?.coerceAtLeast(1) ?: 1
+                val rect = ImageIO.mapToClippedRect(block, gray.width(), gray.height())
+                val stats = scoreRegion(src, gray, rect, charCount)
+                mapOf(
+                    "id" to id,
+                    // Native-only fallback confidence (stroke shape + component count), used if
+                    // the page-relative signals in Dart have nothing to compare against.
+                    "confidence" to (0.5 * stats.strokeVariationScore + 0.5 * stats.componentRatioScore),
+                    "angleVariationScore" to stats.angleVariationScore,
+                    "avgStrokeWidth" to stats.avgStrokeWidth,
+                    "inkColorB" to stats.inkColorB,
+                    "inkColorG" to stats.inkColorG,
+                    "inkColorR" to stats.inkColorR,
+                    "inkIntensityStdDev" to stats.inkIntensityStdDev,
+                    "hasWideUnderline" to stats.hasWideUnderline,
+                    "hasInk" to stats.hasInk,
+                )
+            }
+        } finally {
+            gray.release()
+            src.release()
+        }
+    }
+
+    private fun scoreRegion(src: Mat, gray: Mat, rect: Rect, charCount: Int): RegionStats {
+        val colorCrop = Mat(src, rect)
+        val crop = Mat(gray, rect)
+        val binary = Mat()
+        try {
+            Imgproc.threshold(crop, binary, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
+            if (Core.countNonZero(binary) < MIN_INK_PIXELS) {
+                // too little ink in this box to say anything meaningful
+                return RegionStats(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, hasWideUnderline = false, hasInk = false)
+            }
+
+            val (strokeWidthsPerComponent, componentCount) = perComponentStrokeWidths(binary)
+            val avgStrokeWidth = if (strokeWidthsPerComponent.isEmpty()) 0.0 else strokeWidthsPerComponent.average()
+            val strokeScore = strokeVariationAcrossComponentsScore(strokeWidthsPerComponent)
+            val ratioScore = componentCountRatioScore(componentCount, charCount)
+            val angleScore = componentAngleVariationScore(binary, rect.height)
+            val inkColor = averageInkColor(colorCrop, binary)
+            val inkIntensityStdDev = inkIntensityStdDev(crop, binary)
+            val hasWideUnderline = hasWideUnderlineBelow(gray, rect)
+
+            return RegionStats(
+                strokeVariationScore = strokeScore,
+                componentRatioScore = ratioScore,
+                angleVariationScore = angleScore,
+                avgStrokeWidth = avgStrokeWidth,
+                inkColorB = inkColor[0],
+                inkColorG = inkColor[1],
+                inkColorR = inkColor[2],
+                inkIntensityStdDev = inkIntensityStdDev,
+                hasWideUnderline = hasWideUnderline,
+                hasInk = true,
+            )
+        } finally {
+            binary.release()
+            crop.release()
+            colorCrop.release()
+        }
+    }
+
+    /** Mean BGR of the ink pixels (the actual glyph strokes, not the paper background). */
+    private fun averageInkColor(colorCrop: Mat, binaryInk: Mat): DoubleArray {
+        val mean = Core.mean(colorCrop, binaryInk)
+        return doubleArrayOf(mean.`val`[0], mean.`val`[1], mean.`val`[2])
+    }
+
+    /**
+     * How much pixel darkness varies within the ink itself. Printed toner/ink lays down at a
+     * near-uniform density, so its ink pixels cluster tightly around one dark value; pen ink
+     * varies with pressure/speed/flow (skips, fades, presses darker), spreading that value out.
+     */
+    private fun inkIntensityStdDev(grayCrop: Mat, binaryInk: Mat): Double {
+        val mean = MatOfDouble()
+        val stddev = MatOfDouble()
+        try {
+            Core.meanStdDev(grayCrop, mean, stddev, binaryInk)
+            return stddev.toArray().firstOrNull() ?: 0.0
+        } finally {
+            mean.release()
+            stddev.release()
+        }
+    }
+
+    /**
+     * A fill-in-the-blank answer sits on top of a pre-printed blank line that's wider than the
+     * answer itself (the blank was sized for a guessed-longer answer). A printed word's own
+     * underline (used for in-text emphasis) hugs the word tightly instead. So: look for a long,
+     * near-solid dark horizontal run in a thin strip just below the word, spanning noticeably
+     * wider than the word's own bounding box — that combination is specific to "sits on a blank
+     * line", not just "happens to be underlined".
+     */
+    private fun hasWideUnderlineBelow(gray: Mat, rect: Rect): Boolean {
+        val marginX = (rect.width * 0.6).toInt().coerceAtLeast(4)
+        val bandLeft = (rect.x - marginX).coerceAtLeast(0)
+        val bandRight = (rect.x + rect.width + marginX).coerceAtMost(gray.width())
+        val bandWidth = bandRight - bandLeft
+        if (bandWidth <= 0) return false
+
+        val gapBelow = (rect.height * 0.05).toInt().coerceAtLeast(1)
+        val bandHeight = (rect.height * 0.25).toInt().coerceAtLeast(2)
+        val bandTop = (rect.y + rect.height + gapBelow).coerceAtMost(gray.height() - 1)
+        val bandBottom = (bandTop + bandHeight).coerceAtMost(gray.height())
+        if (bandBottom <= bandTop) return false
+
+        val band = Mat(gray, Rect(bandLeft, bandTop, bandWidth, bandBottom - bandTop))
+        val binaryBand = Mat()
+        try {
+            Imgproc.threshold(band, binaryBand, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
+
+            val rows = binaryBand.rows()
+            val cols = binaryBand.cols()
+            val flat = ByteArray(rows * cols)
+            binaryBand.get(0, 0, flat)
+
+            var longestRun = 0
+            for (y in 0 until rows) {
+                var currentRun = 0
+                val rowOffset = y * cols
+                for (x in 0 until cols) {
+                    if (flat[rowOffset + x].toInt() != 0) {
+                        currentRun++
+                        if (currentRun > longestRun) longestRun = currentRun
+                    } else {
+                        currentRun = 0
+                    }
+                }
+            }
+            return longestRun > rect.width * 1.25
+        } finally {
+            binaryBand.release()
+            band.release()
+        }
+    }
+
+    /**
+     * How much each letter's own tilt varies from the next, WITHIN this one word — a signal
+     * intrinsic to the ink shape itself, independent of position/underline/color, so it still
+     * fires on handwriting that isn't sitting on a fill-in-blank line. A printed font renders
+     * the exact same glyph outline every time a letter repeats, so every "tall" stroke (a
+     * letter's main vertical, not a dot or serif fleck) sits at the same angle across the whole
+     * word; a human hand never repeats a stroke at a perfectly identical angle twice.
+     */
+    private fun componentAngleVariationScore(binaryInk: Mat, wordHeight: Int): Double {
+        val contours = ArrayList<MatOfPoint>()
+        val hierarchy = Mat()
+        val angleDeviations = ArrayList<Double>()
+        try {
+            Imgproc.findContours(binaryInk, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            for (contour in contours) {
+                val points = contour.toArray()
+                val boundingRect = Geometry.boundingRect(contour)
+                // Only "tall" strokes carry a meaningful dominant angle — skip dots/serifs/noise.
+                if (boundingRect.height >= wordHeight * 0.4 && points.size >= 5) {
+                    val contour2f = MatOfPoint2f(*points)
+                    val angle = Geometry.minAreaRect(contour2f).angle
+                    contour2f.release()
+                    // minAreaRect's angle is ambiguous mod 90° (which side is "width" flips it);
+                    // fold into "deviation from the nearest axis" in [0, 45] so that's comparable.
+                    val mod90 = ((angle % 90.0) + 90.0) % 90.0
+                    angleDeviations.add(min(mod90, 90.0 - mod90))
+                }
+                contour.release()
+            }
+        } finally {
+            hierarchy.release()
+        }
+        if (angleDeviations.size < 2) return 0.0
+        val mean = angleDeviations.average()
+        val variance = angleDeviations.sumOf { (it - mean) * (it - mean) } / angleDeviations.size
+        val stdDev = sqrt(variance)
+        // Degrees; not tuned against a labeled dataset yet.
+        return (stdDev / 12.0).coerceIn(0.0, 1.0)
+    }
+
+    /** Returns (one mean stroke-width value per component, total valid component count). */
+    private fun perComponentStrokeWidths(binaryInk: Mat): Pair<List<Double>, Int> {
+        val labels = Mat()
+        val stats = Mat()
+        val centroids = Mat()
+        val distance = Mat()
+        try {
+            val numLabels = Imgproc.connectedComponentsWithStats(binaryInk, labels, stats, centroids, 8, CvType.CV_32S)
+            Imgproc.distanceTransform(binaryInk, distance, Geometry.DIST_L2, 3)
+
+            val pixelCount = binaryInk.rows() * binaryInk.cols()
+            val labelFlat = IntArray(pixelCount)
+            labels.get(0, 0, labelFlat)
+            val distFlat = FloatArray(pixelCount)
+            distance.get(0, 0, distFlat)
+
+            val sumByLabel = DoubleArray(numLabels)
+            val countByLabel = IntArray(numLabels)
+            for (i in 0 until pixelCount) {
+                val label = labelFlat[i]
+                if (label != 0) { // 0 == background
+                    sumByLabel[label] += distFlat[i].toDouble()
+                    countByLabel[label]++
+                }
+            }
+
+            val strokeWidths = ArrayList<Double>()
+            var validComponents = 0
+            for (label in 1 until numLabels) {
+                if (countByLabel[label] >= MIN_COMPONENT_AREA) {
+                    validComponents++
+                    strokeWidths.add(2.0 * sumByLabel[label] / countByLabel[label])
+                }
+            }
+            return Pair(strokeWidths, validComponents)
+        } finally {
+            labels.release()
+            stats.release()
+            centroids.release()
+            distance.release()
+        }
+    }
+
+    private fun strokeVariationAcrossComponentsScore(strokeWidthsPerComponent: List<Double>): Double {
+        if (strokeWidthsPerComponent.size < 2) return 0.0
+        val mean = strokeWidthsPerComponent.average()
+        val variance = strokeWidthsPerComponent.sumOf { (it - mean) * (it - mean) } / strokeWidthsPerComponent.size
+        val stdDev = sqrt(variance)
+        val variationRatio = stdDev / (mean + 1e-6)
+        return (variationRatio / 0.5).coerceIn(0.0, 1.0)
+    }
+
+    /** Fewer components than characters (letters visually joined) suggests cursive handwriting. */
+    private fun componentCountRatioScore(componentCount: Int, charCount: Int): Double {
+        val ratio = componentCount.toDouble() / charCount
+        return (1.0 - ratio).coerceIn(0.0, 1.0)
+    }
+}

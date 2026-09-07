@@ -8,18 +8,36 @@ import 'package:flutter/services.dart';
 class NativeWordStats {
   const NativeWordStats({
     required this.confidence,
+    required this.angleVariationScore,
     required this.avgStrokeWidth,
     required this.inkColorB,
     required this.inkColorG,
     required this.inkColorR,
+    required this.inkIntensityStdDev,
+    required this.hasWideUnderline,
     required this.hasInk,
   });
 
   final double confidence;
+
+  /// Self-contained [0, 1] score: how much each letter's tilt varies from the next within this
+  /// one word — intrinsic to the ink shape, independent of position/color. A printed font
+  /// repeats the exact same glyph angle every time; a hand never repeats a stroke identically.
+  final double angleVariationScore;
   final double avgStrokeWidth;
   final double inkColorB;
   final double inkColorG;
   final double inkColorR;
+
+  /// Std-dev of pixel darkness within the word's own ink — printed ink/toner is near-uniform
+  /// (low value), pen ink varies with pressure/speed/flow (higher value).
+  final double inkIntensityStdDev;
+
+  /// True when the word sits on a long, near-solid dark line spanning noticeably wider than the
+  /// word itself — a fill-in-the-blank answer written on its pre-printed blank line. A printed
+  /// word's own in-text underline (emphasis) hugs the word tightly instead, so it reads false.
+  /// The single strongest signal on a worksheet-style document.
+  final bool hasWideUnderline;
   final bool hasInk;
 }
 
@@ -88,10 +106,13 @@ class ImageProcessingChannel {
       final id = entry['id'] as String;
       map[id] = NativeWordStats(
         confidence: (entry['confidence'] as num).toDouble(),
+        angleVariationScore: (entry['angleVariationScore'] as num).toDouble(),
         avgStrokeWidth: (entry['avgStrokeWidth'] as num).toDouble(),
         inkColorB: (entry['inkColorB'] as num).toDouble(),
         inkColorG: (entry['inkColorG'] as num).toDouble(),
         inkColorR: (entry['inkColorR'] as num).toDouble(),
+        inkIntensityStdDev: (entry['inkIntensityStdDev'] as num).toDouble(),
+        hasWideUnderline: entry['hasWideUnderline'] as bool,
         hasInk: entry['hasInk'] as bool,
       );
     }

@@ -66,6 +66,7 @@ class ImageProcessingService {
 
         final inked = regions.map((r) => stats[r.id]).whereType<NativeWordStats>().where((s) => s.hasInk).toList();
         final referenceStrokeWidth = _median(inked.map((s) => s.avgStrokeWidth).toList());
+        final referenceIntensityStdDev = _median(inked.map((s) => s.inkIntensityStdDev).toList());
         final referenceColor = (
           b: _median(inked.map((s) => s.inkColorB).toList()),
           g: _median(inked.map((s) => s.inkColorG).toList()),
@@ -83,12 +84,24 @@ class ImageProcessingService {
           // 255 * sqrt(3) is the max possible BGR distance; 60 ("noticeably different ink") is
           // a starting normalizer, not tuned against a labeled dataset yet.
           final colorDeviation = (colorDistance / 60.0).clamp(0.0, 1.0);
+          // Ink-darkness consistency is one-directional: printed ink IS the low-variance
+          // reference, so only being NOTICEABLY MORE uneven than the page's typical print
+          // counts (a word steadier than the reference isn't suspicious).
+          final intensityRatio = referenceIntensityStdDev > 0
+              ? s.inkIntensityStdDev / referenceIntensityStdDev
+              : 1.0;
+          final intensityDeviation = ((intensityRatio - 1.0)).clamp(0.0, 1.0);
 
-          final blended = (0.35 * r.baselineVarianceScore +
-                  0.30 * colorDeviation +
-                  0.20 * strokeWidthDeviation +
-                  0.15 * s.confidence)
+          final weighted = (0.25 * r.baselineVarianceScore +
+                  0.20 * colorDeviation +
+                  0.20 * s.angleVariationScore +
+                  0.15 * intensityDeviation +
+                  0.10 * strokeWidthDeviation +
+                  0.10 * s.confidence)
               .clamp(0.0, 1.0);
+          // A word sitting on a fill-in-blank's own pre-printed line is close to certain to be
+          // handwriting — a floor, not just one more diluted vote among many.
+          final blended = s.hasWideUnderline ? max(weighted, 0.8) : weighted;
           final isHandwriting = blended > 0.5;
           return TextRegion(
             id: r.id,
