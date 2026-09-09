@@ -18,7 +18,7 @@ def load_synthetic(name):
 
 
 def load_real():
-    data = np.load("real_labels.npz")
+    data = np.load("real_labels_combined.npz")
     pos = data["pos"].astype("float32") / 255.0
     neg = data["neg"].astype("float32") / 255.0
     return pos, neg
