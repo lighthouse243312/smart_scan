@@ -347,6 +347,84 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     return WriteOrFail(bgr, outputPath, error);
 }
 
+// Bridges normal letter/word spacing within one handwritten line/phrase without merging across
+// genuinely separate lines — tuned for a phone-camera scan's typical resolution.
+static const int kOrphanMergeDilatePx = 25;
+// A single stray dot, JPEG artifact, or thin table/gridline segment can pass a small area
+// threshold on its own — require real letter-scale bulk in BOTH dimensions, not just total area
+// (a 3px-tall, 300px-long line has plenty of "area" but is not a word).
+static const int kOrphanMinArea = 800;
+static const int kOrphanMinDimensionPx = 15;
+static const double kOrphanExistingBlockPaddingPx = 6.0;
+
++ (nullable NSArray<NSDictionary<NSString *, id> *> *)detectOrphanRegionsAtPath:(NSString *)imagePath
+                                                                  existingBlocks:(NSArray<NSDictionary<NSString *, id> *> *)existingBlocks
+                                                                           error:(NSError **)error {
+    cv::Mat src;
+    if (!ReadOrFail(imagePath, &src, error)) return nil;
+
+    cv::Mat gray, binary;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
+
+    // Padded, not exact — an ML Kit box is accurate but not pixel-perfect down to the ink's own
+    // edge; anti-aliased/blurred stroke edges bleed a few px outside it. Verified: with zero
+    // padding, a row of tightly-spaced letters (a weekday header "W T F") left thin unclaimed
+    // slivers around several ALREADY-correctly-detected letters, which the merge step then
+    // fused into one phantom "orphan" blob of jagged edge fragments — scored as handwriting
+    // purely because it isn't a real letter shape, even though every character involved was
+    // ordinary straight print.
+    cv::Mat unclaimed = binary.clone();
+    for (NSDictionary<NSString *, id> *rectMap in existingBlocks) {
+        cv::Rect rect;
+        if (!MapToClippedRect(rectMap, src.cols, src.rows, kOrphanExistingBlockPaddingPx, &rect, error)) {
+            return nil;
+        }
+        cv::rectangle(unclaimed, rect, cv::Scalar(0), -1);
+    }
+
+    cv::Mat dilated;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kOrphanMergeDilatePx, kOrphanMergeDilatePx));
+    cv::dilate(unclaimed, dilated, kernel);
+
+    cv::Mat labels, stats, centroids;
+    int numLabels = cv::connectedComponentsWithStats(dilated, labels, stats, centroids, 8, CV_32S);
+
+    NSMutableArray<NSDictionary<NSString *, id> *> *results = [NSMutableArray array];
+    int w = src.cols, h = src.rows;
+    for (int label = 1; label < numLabels; label++) {
+        int area = stats.at<int32_t>(label, 4);
+        if (area < kOrphanMinArea) continue;
+        int lx = stats.at<int32_t>(label, 0);
+        int ly = stats.at<int32_t>(label, 1);
+        int lw = stats.at<int32_t>(label, 2);
+        int lh = stats.at<int32_t>(label, 3);
+        if (lw < kOrphanMinDimensionPx || lh < kOrphanMinDimensionPx) continue;
+        // Skip anything spanning half the page or more in either direction — a big scanned
+        // graphic/illustration or a merged run of unrelated table gridlines the OCR engine also
+        // skipped, not one line of handwriting.
+        if (lw > w * 0.5 || lh > h * 0.5) continue;
+
+        // Tighten the box back down to the ACTUAL unclaimed ink inside this dilated region, so
+        // the merge-dilation doesn't leave a bloated box around the real word.
+        cv::Rect regionRect(MAX(0, lx), MAX(0, ly), MIN(w - lx, lw), MIN(h - ly, lh));
+        cv::Mat inkInRegion = unclaimed(regionRect);
+        std::vector<cv::Point> nz;
+        cv::findNonZero(inkInRegion, nz);
+        if (nz.empty()) continue;
+        cv::Rect tight = cv::boundingRect(nz);
+
+        [results addObject:@{
+            @"id" : [NSString stringWithFormat:@"orphan_%d", label],
+            @"left" : @(lx + tight.x),
+            @"top" : @(ly + tight.y),
+            @"right" : @(lx + tight.x + tight.width),
+            @"bottom" : @(ly + tight.y + tight.height),
+        }];
+    }
+    return results;
+}
+
 + (nullable NSArray<NSDictionary<NSString *, id> *> *)detectHandwritingRegionsAtPath:(NSString *)imagePath
                                                                            textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
                                                                                 error:(NSError **)error {

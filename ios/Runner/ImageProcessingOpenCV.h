@@ -38,6 +38,19 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
                 error:(NSError **)error
     NS_SWIFT_NAME(rotate(atPath:outputPath:quarterTurnsClockwise:));
 
+/// ML Kit's text recognizer sometimes emits NO region at all for loosely-connected cursive
+/// handwriting — verified on a real photo where two lines of a handwritten note got zero boxes
+/// while a clearer third line was detected fine, an OCR-side "is this legible text" confidence
+/// gate that messy cursive can fall below. Finds ink NOT already covered by any of
+/// `existingBlocks`, merges nearby letters/words into phrase-level blobs (bridging normal
+/// within-line gaps), and returns them as extra candidate regions — the CNN classifier only
+/// needs a pixel crop, not a transcription, so it can still score what ML Kit never boxed.
+/// Entries are `{ "id": String, "left": Double, "top": Double, "right": Double, "bottom": Double }`.
++ (nullable NSArray<NSDictionary<NSString *, id> *> *)detectOrphanRegionsAtPath:(NSString *)imagePath
+                                                                  existingBlocks:(NSArray<NSDictionary<NSString *, id> *> *)existingBlocks
+                                                                           error:(NSError **)error
+    NS_SWIFT_NAME(detectOrphanRegions(atPath:existingBlocks:));
+
 /// `textBlocks` / return entries are `{ "id": String, "left": Double, "top": Double, "right": Double, "bottom": Double }`.
 /// Returns `{ "id": String, "confidence": Double, "isLikelyHandwriting": Bool }` per input block.
 + (nullable NSArray<NSDictionary<NSString *, id> *> *)detectHandwritingRegionsAtPath:(NSString *)imagePath

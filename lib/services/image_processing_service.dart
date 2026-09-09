@@ -48,8 +48,38 @@ class ImageProcessingService {
   /// — which still acts as a floor. Regions scored as likely-handwriting come back pre-selected
   /// for erase; the user can still toggle any of them.
   Future<List<TextRegion>> scoreHandwriting(String imagePath, List<TextRegion> regions) => _run(() async {
-        if (regions.isEmpty) return regions;
-        final textBlocks = regions
+        final mlKitBlocks = regions
+            .map((r) => {
+                  'left': r.boundingBox.left,
+                  'top': r.boundingBox.top,
+                  'right': r.boundingBox.right,
+                  'bottom': r.boundingBox.bottom,
+                })
+            .toList();
+
+        // ML Kit sometimes emits no region at all for loosely-connected cursive handwriting —
+        // verified on a real photo where two lines of a handwritten note got zero boxes while a
+        // clearer third line was detected fine. Find ink it left unclaimed and add those as
+        // extra candidate regions before scoring, so this isn't a dead end for the classifier —
+        // it only ever needs a pixel crop, not a transcription.
+        final orphanMaps = await ImageProcessingChannel.detectOrphanRegions(
+          imagePath: imagePath,
+          existingBlocks: mlKitBlocks,
+        );
+        final orphanRegions = orphanMaps.map((m) => TextRegion(
+              id: m['id'] as String,
+              boundingBox: Rect.fromLTRB(
+                (m['left'] as num).toDouble(),
+                (m['top'] as num).toDouble(),
+                (m['right'] as num).toDouble(),
+                (m['bottom'] as num).toDouble(),
+              ),
+              text: '',
+            ));
+        final allRegions = [...regions, ...orphanRegions];
+        if (allRegions.isEmpty) return allRegions;
+
+        final textBlocks = allRegions
             .map((r) => {
                   'id': r.id,
                   'left': r.boundingBox.left,
@@ -67,8 +97,20 @@ class ImageProcessingService {
         final stats = results[0] as Map<String, NativeWordStats>;
         final mlConfidence = results[1] as Map<String, double>;
 
-        final inked = regions.map((r) => stats[r.id]).whereType<NativeWordStats>().where((s) => s.hasInk).toList();
-        final referenceStrokeWidth = _median(inked.map((s) => s.avgStrokeWidth).toList());
+        // Stroke width scales with font size — a big bold title and a tiny calendar-grid number
+        // can both be perfectly ordinary print, just at very different sizes. Comparing raw
+        // pixel stroke widths made the bigger one look like a wild outlier purely because most
+        // of a page's words (e.g. a calendar's ~300 date numbers) are small, dragging the
+        // reference stroke width down and flagging any large heading as "different style".
+        // Normalizing by each word's own height first makes the comparison scale-invariant.
+        double normalizedStrokeWidth(NativeWordStats s, TextRegion region) {
+          final height = region.boundingBox.height;
+          return height > 0 ? s.avgStrokeWidth / height : s.avgStrokeWidth;
+        }
+
+        final inkedRegions = allRegions.where((r) => stats[r.id]?.hasInk ?? false).toList();
+        final referenceStrokeWidth = _median(inkedRegions.map((r) => normalizedStrokeWidth(stats[r.id]!, r)).toList());
+        final inked = inkedRegions.map((r) => stats[r.id]!).toList();
         final referenceIntensityStdDev = _median(inked.map((s) => s.inkIntensityStdDev).toList());
         final referenceColor = (
           b: _median(inked.map((s) => s.inkColorB).toList()),
@@ -76,12 +118,12 @@ class ImageProcessingService {
           r: _median(inked.map((s) => s.inkColorR).toList()),
         );
 
-        return regions.map((r) {
+        return allRegions.map((r) {
           final s = stats[r.id];
           if (s == null || !s.hasInk) return r;
 
           final strokeWidthDeviation = referenceStrokeWidth > 0
-              ? ((s.avgStrokeWidth - referenceStrokeWidth).abs() / referenceStrokeWidth).clamp(0.0, 1.0)
+              ? ((normalizedStrokeWidth(s, r) - referenceStrokeWidth).abs() / referenceStrokeWidth).clamp(0.0, 1.0)
               : 0.0;
           final colorDistance = _colorDistance(s, referenceColor);
           // 255 * sqrt(3) is the max possible BGR distance; 60 ("noticeably different ink") is
@@ -95,10 +137,10 @@ class ImageProcessingService {
               : 1.0;
           final intensityDeviation = ((intensityRatio - 1.0)).clamp(0.0, 1.0);
 
-          final heuristic = (0.25 * r.baselineVarianceScore +
-                  0.20 * colorDeviation +
-                  0.20 * s.angleVariationScore +
-                  0.15 * intensityDeviation +
+          final heuristic = (0.20 * r.baselineVarianceScore +
+                  0.15 * colorDeviation +
+                  0.35 * s.angleVariationScore +
+                  0.10 * intensityDeviation +
                   0.10 * strokeWidthDeviation +
                   0.10 * s.confidence)
               .clamp(0.0, 1.0);
@@ -106,10 +148,18 @@ class ImageProcessingService {
           // against this page's own printed text) stays as a secondary vote.
           final ml = mlConfidence[r.id] ?? heuristic;
           final weighted = (0.75 * ml + 0.25 * heuristic).clamp(0.0, 1.0);
+          // Printed glyphs repeat the exact same stroke angle; a real hand never does — verified
+          // directly on a case that fooled the CNN (several calendar date numbers merged by the
+          // text recognizer into one garbled multi-digit block, which the CNN read as irregular
+          // and thus handwriting-like): angle-variation score came out 0.0-0.3 for those merged-
+          // but-still-printed blocks vs a consistent ~1.0 for genuine handwriting in the same
+          // photo. That's a wide enough margin to treat a very low score as near-certain print,
+          // overriding the CNN — a ceiling, mirroring hasWideUnderline's floor on the other side.
+          final cappedByStraightness = s.angleVariationScore <= 0.15 ? min(weighted, 0.2) : weighted;
           // A word sitting on a fill-in-blank's own pre-printed line is close to certain to be
           // handwriting — a floor, not just one more diluted vote among many. Also the one signal
           // here the CNN structurally can't see, since it only looks at the word's own crop.
-          final blended = s.hasWideUnderline ? max(weighted, 0.8) : weighted;
+          final blended = s.hasWideUnderline ? max(cappedByStraightness, 0.8) : cappedByStraightness;
           final isHandwriting = blended > 0.5;
           return TextRegion(
             id: r.id,

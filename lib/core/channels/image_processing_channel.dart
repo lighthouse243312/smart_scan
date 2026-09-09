@@ -89,6 +89,25 @@ class ImageProcessingChannel {
     return result!['outputPath'] as String;
   }
 
+  /// ML Kit's text recognizer sometimes emits NO region at all for loosely-connected cursive
+  /// handwriting (verified on a real photo: two lines of a handwritten note got zero boxes,
+  /// while a third line in clearer, more separated letters was detected fine) — its OCR-based
+  /// detector has an implicit "is this legible text" confidence gate that messy cursive can
+  /// fall below. This finds ink not already covered by any of [existingBlocks], merges nearby
+  /// letters/words into phrase-level blobs, and returns them as extra candidate regions so the
+  /// classifier — which only needs a pixel crop, not a transcription — can still score them.
+  /// [existingBlocks] keys: left, top, right, bottom. Returns `{id, left, top, right, bottom}` maps.
+  static Future<List<Map<String, dynamic>>> detectOrphanRegions({
+    required String imagePath,
+    required List<Map<String, Object>> existingBlocks,
+  }) async {
+    final result = await _channel.invokeListMethod<Map<Object?, Object?>>(
+      'detectOrphanRegions',
+      {'imagePath': imagePath, 'existingBlocks': existingBlocks},
+    );
+    return (result ?? const []).map((e) => e.cast<String, dynamic>()).toList();
+  }
+
   /// [textBlocks] keys: id, left, top, right, bottom, charCount (image pixel coordinates).
   /// Returns raw per-word measurements keyed by region id — NOT a handwriting decision. Native
   /// only measures; [ImageProcessingService.scoreHandwriting] decides by comparing each word

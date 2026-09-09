@@ -49,6 +49,11 @@ enum ImageProcessingChannel {
                 try ImageProcessingOpenCV.rotate(atPath: inputPath, outputPath: outputPath, quarterTurnsClockwise: quarterTurns)
                 return ["outputPath": outputPath]
 
+            case "detectOrphanRegions":
+                let imagePath = try requireString(args, "imagePath")
+                let existingBlocks = (args["existingBlocks"] as? [[String: Any]]) ?? []
+                return try ImageProcessingOpenCV.detectOrphanRegions(atPath: imagePath, existingBlocks: existingBlocks)
+
             case "detectHandwritingRegions":
                 let imagePath = try requireString(args, "imagePath")
                 let textBlocks = (args["textBlocks"] as? [[String: Any]]) ?? []

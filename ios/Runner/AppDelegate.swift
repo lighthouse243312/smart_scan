@@ -15,3 +15,4 @@ import UIKit
     ImageProcessingChannel.register(messenger: engineBridge.applicationRegistrar.messenger())
   }
 }
+

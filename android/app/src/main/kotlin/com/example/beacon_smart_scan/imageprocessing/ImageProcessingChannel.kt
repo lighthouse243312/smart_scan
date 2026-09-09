@@ -70,6 +70,11 @@ object ImageProcessingChannel {
                     requirePath(call, "outputPath"),
                     (call.argument<Any>("quarterTurnsClockwise") as? Number)?.toInt() ?: 1,
                 )
+            "detectOrphanRegions" ->
+                OrphanInkDetector.detect(
+                    requirePath(call, "imagePath"),
+                    requireMapList(call, "existingBlocks"),
+                )
             "detectHandwritingRegions" ->
                 HandwritingDetector.detect(
                     requirePath(call, "imagePath"),
