@@ -132,7 +132,13 @@ static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
             }
         }
     }
-    return longestRun > rect.width * 1.2;
+    // A page-wide printed divider/rule (a header underline, a section separator) passes right
+    // through this local band exactly like a fill-in-blank's own underline would — verified: a
+    // calendar's title-divider rule forced a printed "2023 Calendar" header to a floor of 0.8
+    // this way. The distinguishing fact is absolute scale: a rule line spans nearly the whole
+    // page regardless of which word happens to sit near it; a real answer blank is sized for one
+    // answer and is always far short of that.
+    return longestRun > rect.width * 1.2 && longestRun < gray.cols * 0.7;
 }
 
 /**
@@ -347,15 +353,27 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     return WriteOrFail(bgr, outputPath, error);
 }
 
-// Bridges normal letter/word spacing within one handwritten line/phrase without merging across
-// genuinely separate lines — tuned for a phone-camera scan's typical resolution.
-static const int kOrphanMergeDilatePx = 25;
+// Bridges within-WORD letter gaps (cursive letters are usually touching or a few px apart)
+// without also bridging the larger word-to-word gap on the same line — a fixed pixel radius
+// can't do both across very different photo resolutions. Verified on a real photo: a fixed 25px
+// radius on a high-resolution (3024px-wide) camera shot merged an ENTIRE handwritten line ("new
+// global APP") into one wide blob instead of separate words, which then squashed badly when
+// resized to the classifier's 128x64 input and scored as printed. Scaling by image width keeps
+// the radius meaningful regardless of source resolution.
+static const double kOrphanMergeDilateFraction = 0.004;
+static const int kOrphanMergeDilateMinPx = 10;
+static const int kOrphanMergeDilateMaxPx = 20;
 // A single stray dot, JPEG artifact, or thin table/gridline segment can pass a small area
 // threshold on its own — require real letter-scale bulk in BOTH dimensions, not just total area
 // (a 3px-tall, 300px-long line has plenty of "area" but is not a word).
 static const int kOrphanMinArea = 800;
 static const int kOrphanMinDimensionPx = 15;
 static const double kOrphanExistingBlockPaddingPx = 6.0;
+// Even with a tighter merge radius, a run-on phrase can still end up wider than any single word
+// the classifier was trained on. Past this width:height ratio, slice it into roughly word-sized,
+// near-square chunks instead of handing the classifier one long, badly-squashed strip — the same
+// reasoning as not classifying whole LINES in the ML-Kit path.
+static const double kOrphanMaxAspectRatio = 2.5;
 
 + (nullable NSArray<NSDictionary<NSString *, id> *> *)detectOrphanRegionsAtPath:(NSString *)imagePath
                                                                   existingBlocks:(NSArray<NSDictionary<NSString *, id> *> *)existingBlocks
@@ -383,8 +401,9 @@ static const double kOrphanExistingBlockPaddingPx = 6.0;
         cv::rectangle(unclaimed, rect, cv::Scalar(0), -1);
     }
 
+    int mergeDilatePx = MIN(kOrphanMergeDilateMaxPx, MAX(kOrphanMergeDilateMinPx, (int)(src.cols * kOrphanMergeDilateFraction)));
     cv::Mat dilated;
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kOrphanMergeDilatePx, kOrphanMergeDilatePx));
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(mergeDilatePx, mergeDilatePx));
     cv::dilate(unclaimed, dilated, kernel);
 
     cv::Mat labels, stats, centroids;
@@ -413,14 +432,37 @@ static const double kOrphanExistingBlockPaddingPx = 6.0;
         cv::findNonZero(inkInRegion, nz);
         if (nz.empty()) continue;
         cv::Rect tight = cv::boundingRect(nz);
+        int absLeft = lx + tight.x;
+        int absTop = ly + tight.y;
 
-        [results addObject:@{
-            @"id" : [NSString stringWithFormat:@"orphan_%d", label],
-            @"left" : @(lx + tight.x),
-            @"top" : @(ly + tight.y),
-            @"right" : @(lx + tight.x + tight.width),
-            @"bottom" : @(ly + tight.y + tight.height),
-        }];
+        // Still a run-on phrase (several words the merge step above couldn't cleanly separate)
+        // — split it into near-square chunks so each one resembles the single-word crops the
+        // classifier was actually trained on, rather than one long strip that gets squashed into
+        // an unrecognizable shape at the model's 128x64 input.
+        double aspectRatio = (double)tight.width / MAX(1, tight.height);
+        if (aspectRatio > kOrphanMaxAspectRatio) {
+            int chunkCount = MAX(2, (int)aspectRatio);
+            int chunkWidth = tight.width / chunkCount;
+            for (int i = 0; i < chunkCount; i++) {
+                int chunkLeft = absLeft + i * chunkWidth;
+                int chunkRight = (i == chunkCount - 1) ? absLeft + tight.width : chunkLeft + chunkWidth;
+                [results addObject:@{
+                    @"id" : [NSString stringWithFormat:@"orphan_%d_%d", label, i],
+                    @"left" : @(chunkLeft),
+                    @"top" : @(absTop),
+                    @"right" : @(chunkRight),
+                    @"bottom" : @(absTop + tight.height),
+                }];
+            }
+        } else {
+            [results addObject:@{
+                @"id" : [NSString stringWithFormat:@"orphan_%d", label],
+                @"left" : @(absLeft),
+                @"top" : @(absTop),
+                @"right" : @(absLeft + tight.width),
+                @"bottom" : @(absTop + tight.height),
+            }];
+        }
     }
     return results;
 }
@@ -497,12 +539,16 @@ static const double kOrphanExistingBlockPaddingPx = 6.0;
     return results;
 }
 
-// Grading ink is a distinct color (commonly red) from printed black/gray text. A mask built
-// from color deviation ("redness"), not plain darkness, can never include a black-print pixel
-// no matter how close or how it's grown — verified: growing on plain darkness bridged into
-// unrelated words only ~7px away on a dense worksheet, but a color-gated mask left print
-// untouched even where a stroke crosses directly over it.
-static const double kRednessThreshold = 30.0;
+// Grading/pen ink is COLORED — red, blue, green, whatever pen was on hand — while printed text
+// is black/gray (R≈G≈B, near-zero saturation). A mask built from saturation, not plain darkness,
+// can never include a black-print pixel no matter how close or how it's grown — verified:
+// growing on plain darkness bridged into unrelated words only ~7px away on a dense worksheet,
+// but a color-gated mask left print untouched even where a stroke crosses directly over it.
+// Originally gated on "redness" specifically (this app's first real test photos all happened to
+// use red pen) — verified on a later real photo written in blue ink that redness-only growth
+// found nothing there at all, leaving only each word's own tight box erased. Saturation
+// generalizes to any ink color without needing to special-case each one.
+static const double kSaturationThreshold = 40.0;
 static const int kInkDilatePx = 5;
 // How close a colored-ink connected component must be to a flagged word's box to count as
 // "its" mark. Since inclusion is gated by color, not distance, there is no risk of ever
@@ -516,14 +562,14 @@ static const int kProximityPx = 20;
 /// flagged word (cheaper than re-deriving a local mask per word, and is what lets a component's
 /// full extent be found regardless of which word ends up near which part of it).
 static int BuildInkComponents(const cv::Mat &colorSrc, const cv::Mat &graySrc, cv::Mat *labelsOut, cv::Mat *statsOut) {
-    std::vector<cv::Mat> channels;
-    cv::split(colorSrc, channels);
-    cv::Mat bg, redness, rednessMask, darkMask, inkMask, dilated, centroids;
-    cv::addWeighted(channels[0], 0.5, channels[1], 0.5, 0.0, bg);
-    cv::subtract(channels[2], bg, redness);
-    cv::compare(redness, kRednessThreshold, rednessMask, cv::CMP_GT);
+    cv::Mat hsv;
+    cv::cvtColor(colorSrc, hsv, cv::COLOR_BGR2HSV);
+    std::vector<cv::Mat> hsvChannels;
+    cv::split(hsv, hsvChannels);
+    cv::Mat satMask, darkMask, inkMask, dilated, centroids;
+    cv::compare(hsvChannels[1], kSaturationThreshold, satMask, cv::CMP_GT);
     cv::compare(graySrc, 220, darkMask, cv::CMP_LT);
-    cv::bitwise_and(rednessMask, darkMask, inkMask);
+    cv::bitwise_and(satMask, darkMask, inkMask);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kInkDilatePx, kInkDilatePx));
     cv::dilate(inkMask, dilated, kernel);

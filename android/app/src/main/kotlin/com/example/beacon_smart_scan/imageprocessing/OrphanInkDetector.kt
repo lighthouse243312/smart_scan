@@ -25,15 +25,27 @@ import kotlin.math.min
  * only ever needs a pixel crop, not a transcription, so it can still score them.
  */
 object OrphanInkDetector {
-    // Bridges normal letter/word spacing within one handwritten line/phrase without merging
-    // across genuinely separate lines — tuned for a phone-camera scan's typical resolution.
-    private const val MERGE_DILATE_PX = 25
+    // Bridges within-WORD letter gaps (cursive letters are usually touching or a few px apart)
+    // without also bridging the larger word-to-word gap on the same line — a fixed pixel radius
+    // can't do both across very different photo resolutions. Verified on a real photo: a fixed
+    // 25px radius on a high-resolution (3024px-wide) camera shot merged an ENTIRE handwritten
+    // line ("new global APP") into one wide blob instead of separate words, which then squashed
+    // badly when resized to the classifier's 128x64 input and scored as printed. Scaling by
+    // image width keeps the radius meaningful regardless of source resolution.
+    private const val MERGE_DILATE_FRACTION = 0.004
+    private const val MERGE_DILATE_MIN_PX = 10
+    private const val MERGE_DILATE_MAX_PX = 20
     // A single stray dot, JPEG artifact, or thin table/gridline segment can pass a small area
     // threshold on its own — require real letter-scale bulk in BOTH dimensions, not just total
     // area (a 3px-tall, 300px-long line has plenty of "area" but is not a word).
     private const val MIN_AREA = 800
     private const val MIN_DIMENSION_PX = 15
     private const val EXISTING_BLOCK_PADDING_PX = 6.0
+    // Even with a tighter merge radius, a run-on phrase can still end up wider than any single
+    // word the classifier was trained on. Past this width:height ratio, slice it into roughly
+    // word-sized, near-square chunks instead of handing the classifier one long, badly-squashed
+    // strip — the same reasoning as not classifying whole LINES in the ML-Kit path.
+    private const val MAX_ASPECT_RATIO = 2.5
 
     fun detect(imagePath: String, existingRects: List<Map<String, Any>>): List<Map<String, Any>> {
         val src = ImageIO.readOrThrow(imagePath)
@@ -66,7 +78,8 @@ object OrphanInkDetector {
             unclaimed.create(binary.size(), CvType.CV_8UC1)
             claimed.copyTo(unclaimed)
 
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(MERGE_DILATE_PX.toDouble(), MERGE_DILATE_PX.toDouble()))
+            val mergeDilatePx = (src.width() * MERGE_DILATE_FRACTION).toInt().coerceIn(MERGE_DILATE_MIN_PX, MERGE_DILATE_MAX_PX)
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(mergeDilatePx.toDouble(), mergeDilatePx.toDouble()))
             Imgproc.dilate(unclaimed, dilated, kernel)
 
             val numLabels = Imgproc.connectedComponentsWithStats(dilated, labels, stats, centroids, 8, CvType.CV_32S)
@@ -95,16 +108,41 @@ object OrphanInkDetector {
                 inkInRegion.release()
                 if (tight == null) continue
                 val (tx, ty, tw, th) = tight
+                val absLeft = lx + tx
+                val absTop = ly + ty
 
-                results.add(
-                    mapOf(
-                        "id" to "orphan_${label}",
-                        "left" to (lx + tx).toDouble(),
-                        "top" to (ly + ty).toDouble(),
-                        "right" to (lx + tx + tw).toDouble(),
-                        "bottom" to (ly + ty + th).toDouble(),
+                // Still a run-on phrase (several words the merge step above couldn't cleanly
+                // separate) — split it into near-square chunks so each one resembles the single-
+                // word crops the classifier was actually trained on, rather than one long strip
+                // that gets squashed into an unrecognizable shape at the model's 128x64 input.
+                val aspectRatio = tw.toDouble() / max(1, th)
+                if (aspectRatio > MAX_ASPECT_RATIO) {
+                    val chunkCount = aspectRatio.toInt().coerceAtLeast(2)
+                    val chunkWidth = tw / chunkCount
+                    for (i in 0 until chunkCount) {
+                        val chunkLeft = absLeft + i * chunkWidth
+                        val chunkRight = if (i == chunkCount - 1) absLeft + tw else chunkLeft + chunkWidth
+                        results.add(
+                            mapOf(
+                                "id" to "orphan_${label}_$i",
+                                "left" to chunkLeft.toDouble(),
+                                "top" to absTop.toDouble(),
+                                "right" to chunkRight.toDouble(),
+                                "bottom" to (absTop + th).toDouble(),
+                            )
+                        )
+                    }
+                } else {
+                    results.add(
+                        mapOf(
+                            "id" to "orphan_${label}",
+                            "left" to absLeft.toDouble(),
+                            "top" to absTop.toDouble(),
+                            "right" to (absLeft + tw).toDouble(),
+                            "bottom" to (absTop + th).toDouble(),
+                        )
                     )
-                )
+                }
             }
             return results
         } finally {

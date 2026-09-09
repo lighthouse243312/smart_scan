@@ -118,7 +118,7 @@ class ImageProcessingService {
           r: _median(inked.map((s) => s.inkColorR).toList()),
         );
 
-        return allRegions.map((r) {
+        final scored = allRegions.map((r) {
           final s = stats[r.id];
           if (s == null || !s.hasInk) return r;
 
@@ -160,7 +160,19 @@ class ImageProcessingService {
           // handwriting — a floor, not just one more diluted vote among many. Also the one signal
           // here the CNN structurally can't see, since it only looks at the word's own crop.
           final blended = s.hasWideUnderline ? max(cappedByStraightness, 0.8) : cappedByStraightness;
-          final isHandwriting = blended > 0.5;
+          // A region only exists here as an "orphan" because ML Kit's own text recognizer —
+          // which read every calendar number and header on the same real page correctly —
+          // failed to recognize it as legible text at all. Handwriting is exactly the content
+          // that DOESN'T follow a consistent template the way print does, so a legible-text
+          // detector failing on it is itself near-certain evidence it's handwriting, not a vote
+          // that still needs to clear the same bar as a word ML Kit successfully read. Verified:
+          // a genuine handwritten word ("coaching") kept landing just under 0.5 across several
+          // rounds of unrelated fixes, because the blend still expected the same certainty a
+          // normally-recognized word can produce. Treat orphans as handwriting by default; only
+          // a near-total absence of any signal for it (an oddly-shaped noise blob that slipped
+          // past the size filters) should override that.
+          final threshold = r.id.startsWith('orphan_') ? 0.15 : 0.5;
+          final isHandwriting = blended > threshold;
           return TextRegion(
             id: r.id,
             boundingBox: r.boundingBox,
@@ -170,9 +182,46 @@ class ImageProcessingService {
             selectedForErase: isHandwriting,
             isManual: r.isManual,
             baselineVarianceScore: r.baselineVarianceScore,
+            debugBreakdown: DebugScoreBreakdown(
+              mlConfidence: ml,
+              heuristic: heuristic,
+              angleVariationScore: s.angleVariationScore,
+              colorDeviation: colorDeviation,
+              intensityDeviation: intensityDeviation,
+              strokeWidthDeviation: strokeWidthDeviation,
+              hasWideUnderline: s.hasWideUnderline,
+              cappedByStraightness: cappedByStraightness != weighted,
+            ),
           );
         }).toList();
+
+        _unionSplitSiblings(scored);
+        return scored;
       });
+
+  /// A run-on handwritten phrase too wide for one classifier crop gets split into several
+  /// narrower chunks natively (see OrphanInkDetector) sharing one id prefix (`orphan_5_0`,
+  /// `orphan_5_1`, ...). Each is scored independently, but a low-ink or awkwardly-cut chunk can
+  /// individually miss the >0.5 bar even though its siblings clearly don't — verified: exactly
+  /// this left small unerased ink fragments scattered through an otherwise-erased handwritten
+  /// note. Once ANY sibling reads as handwriting, treat them all as one unit for erasure so a
+  /// slice a coin-flip away from the threshold doesn't leave a gap in the middle of one phrase.
+  void _unionSplitSiblings(List<TextRegion> regions) {
+    final bySplitGroup = <String, List<int>>{};
+    for (var i = 0; i < regions.length; i++) {
+      final match = RegExp(r'^(orphan_\d+)_\d+$').firstMatch(regions[i].id);
+      if (match != null) bySplitGroup.putIfAbsent(match.group(1)!, () => []).add(i);
+    }
+    for (final indices in bySplitGroup.values) {
+      if (indices.any((i) => regions[i].selectedForErase)) {
+        for (final i in indices) {
+          if (!regions[i].selectedForErase) {
+            regions[i] = regions[i].copyWith(selectedForErase: true);
+          }
+        }
+      }
+    }
+  }
 
   double _colorDistance(NativeWordStats s, ({double b, double g, double r}) reference) {
     final db = s.inkColorB - reference.b;

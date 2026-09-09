@@ -122,6 +122,41 @@ class _RegionPainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = region.selectedForErase ? 2.5 : 1.5,
       );
+
+      // Debug builds only: every signal that fed into the final score, next to each box — a
+      // wrong verdict's exact breakdown (vs. never having been detected at all, which shows no
+      // box whatsoever) is visible at a glance instead of guessed at one heuristic-weight change
+      // at a time. Two rounds of blind reweighting this session each fixed one real case and
+      // broke another; this exists so the next fix is aimed at the actual number, not a guess.
+      if (kDebugMode) {
+        final debug = region.debugBreakdown;
+        final label = region.isManual
+            ? 'manual'
+            : debug == null
+                ? region.confidence.toStringAsFixed(2)
+                : 'f:${region.confidence.toStringAsFixed(2)} '
+                    'ml:${debug.mlConfidence.toStringAsFixed(2)} '
+                    'h:${debug.heuristic.toStringAsFixed(2)}\n'
+                    'ang:${debug.angleVariationScore.toStringAsFixed(2)} '
+                    'col:${debug.colorDeviation.toStringAsFixed(2)} '
+                    'int:${debug.intensityDeviation.toStringAsFixed(2)}\n'
+                    'stroke:${debug.strokeWidthDeviation.toStringAsFixed(2)}'
+                    '${debug.hasWideUnderline ? " underline" : ""}'
+                    '${debug.cappedByStraightness ? " CAPPED" : ""}';
+        final painter = TextPainter(
+          text: TextSpan(
+            text: label,
+            style: const TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold, height: 1.2),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        final labelOrigin = Offset(rect.left, rect.top - painter.height);
+        canvas.drawRect(
+          Rect.fromLTWH(labelOrigin.dx, labelOrigin.dy, painter.width + 4, painter.height + 2),
+          Paint()..color = borderColor.withValues(alpha: 0.9),
+        );
+        painter.paint(canvas, labelOrigin + const Offset(2, 1));
+      }
     }
 
     if (dragStart != null && dragCurrent != null) {

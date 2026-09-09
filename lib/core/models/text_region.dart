@@ -12,6 +12,7 @@ class TextRegion {
     this.selectedForErase = false,
     this.isManual = false,
     this.baselineVarianceScore = 0.0,
+    this.debugBreakdown,
   });
 
   /// Stable id for this region within its page (used to match ML Kit boxes back to
@@ -44,6 +45,13 @@ class TextRegion {
   /// pixel-level stroke-width heuristic alone, which is blended in as a secondary signal.
   final double baselineVarianceScore;
 
+  /// Debug-only breakdown of every signal that fed into [confidence] — populated by
+  /// ImageProcessingService.scoreHandwriting, null otherwise (manual regions, or before
+  /// scoring runs). Exists purely so a wrong verdict can be diagnosed from a single screenshot
+  /// (which exact signal is driving it) instead of guessed at one heuristic-weight change at a
+  /// time — two rounds of blind reweighting this session each fixed one case and broke another.
+  final DebugScoreBreakdown? debugBreakdown;
+
   TextRegion copyWith({
     Rect? boundingBox,
     bool? selectedForErase,
@@ -57,6 +65,29 @@ class TextRegion {
       selectedForErase: selectedForErase ?? this.selectedForErase,
       isManual: isManual,
       baselineVarianceScore: baselineVarianceScore,
+      debugBreakdown: debugBreakdown,
     );
   }
+}
+
+class DebugScoreBreakdown {
+  const DebugScoreBreakdown({
+    required this.mlConfidence,
+    required this.heuristic,
+    required this.angleVariationScore,
+    required this.colorDeviation,
+    required this.intensityDeviation,
+    required this.strokeWidthDeviation,
+    required this.hasWideUnderline,
+    required this.cappedByStraightness,
+  });
+
+  final double mlConfidence;
+  final double heuristic;
+  final double angleVariationScore;
+  final double colorDeviation;
+  final double intensityDeviation;
+  final double strokeWidthDeviation;
+  final bool hasWideUnderline;
+  final bool cappedByStraightness;
 }

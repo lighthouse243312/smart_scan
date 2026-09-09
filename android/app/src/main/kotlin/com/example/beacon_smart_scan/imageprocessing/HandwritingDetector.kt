@@ -185,7 +185,13 @@ object HandwritingDetector {
                     }
                 }
             }
-            return longestRun > rect.width * 1.2
+            // A page-wide printed divider/rule (a header underline, a section separator) passes
+            // right through this local band exactly like a fill-in-blank's own underline would —
+            // verified: a calendar's title-divider rule forced a printed "2023 Calendar" header
+            // to a floor of 0.8 this way. The distinguishing fact is absolute scale: a rule line
+            // spans nearly the whole page regardless of which word happens to sit near it; a
+            // real answer blank is sized for one answer and is always far short of that.
+            return longestRun > rect.width * 1.2 && longestRun < gray.width() * 0.7
         } finally {
             band.release()
         }

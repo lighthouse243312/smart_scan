@@ -13,12 +13,16 @@ import kotlin.math.min
 
 /** Erases the given regions via OpenCV inpainting (Telea) — fills them in from surrounding pixels. */
 object Inpainter {
-    // Grading ink is a distinct color (commonly red) from printed black/gray text. A mask built
-    // from color deviation ("redness"), not plain darkness, can never include a black-print
-    // pixel no matter how close or how it's grown — verified: growing on plain darkness bridged
-    // into unrelated words only ~7px away on a dense worksheet, but a color-gated mask left
-    // print untouched even where a stroke crosses directly over it.
-    private const val REDNESS_THRESHOLD = 30.0
+    // Grading/pen ink is COLORED — red, blue, green, whatever pen was on hand — while printed
+    // text is black/gray (R≈G≈B, near-zero saturation). A mask built from saturation, not plain
+    // darkness, can never include a black-print pixel no matter how close or how it's grown —
+    // verified: growing on plain darkness bridged into unrelated words only ~7px away on a dense
+    // worksheet, but a color-gated mask left print untouched even where a stroke crosses
+    // directly over it. Originally gated on "redness" specifically (this app's first real test
+    // photos all happened to use red pen) — verified on a later real photo written in blue ink
+    // that redness-only growth found nothing there at all, leaving only each word's own tight
+    // box erased. Saturation generalizes to any ink color without needing to special-case each one.
+    private const val SATURATION_THRESHOLD = 40.0
     private const val INK_DILATE_PX = 5
     // How close a colored-ink connected component must be to a flagged word's box to count as
     // "its" mark. Since inclusion is gated by color, not distance, there is no risk of ever
@@ -49,7 +53,7 @@ object Inpainter {
 
             rects.forEach { rectMap ->
                 val rect = ImageIO.mapToClippedRect(rectMap, src.width(), src.height(), padding)
-                paintInkMask(rect, labels, stats, numLabels, mask)
+                paintInkMask(rect, gray, labels, stats, numLabels, mask)
             }
             Photo.inpaint(src, mask, dst, inpaintRadius, Photo.INPAINT_TELEA)
             ImageIO.writeOrThrow(dst, outputPath)
@@ -70,40 +74,41 @@ object Inpainter {
      * every flagged word (cheaper than re-deriving a local mask per word, and is what lets a
      * component's full extent be found regardless of which word ends up near which part of it). */
     private fun buildInkComponents(colorSrc: Mat, graySrc: Mat, inkMaskOut: Mat, labels: Mat, stats: Mat, centroids: Mat): Int {
-        val channels = ArrayList<Mat>()
-        val bg = Mat()
-        val redness = Mat()
-        val rednessMask = Mat()
+        val hsv = Mat()
+        val hsvChannels = ArrayList<Mat>()
+        val satMask = Mat()
         val darkMask = Mat()
         val dilated = Mat()
         try {
-            Core.split(colorSrc, channels)
-            val b = channels[0]
-            val g = channels[1]
-            val r = channels[2]
-            Core.addWeighted(b, 0.5, g, 0.5, 0.0, bg)
-            Core.subtract(r, bg, redness)
-            Core.compare(redness, Scalar(REDNESS_THRESHOLD), rednessMask, Core.CMP_GT)
+            Imgproc.cvtColor(colorSrc, hsv, Imgproc.COLOR_BGR2HSV)
+            Core.split(hsv, hsvChannels)
+            val saturation = hsvChannels[1]
+            Core.compare(saturation, Scalar(SATURATION_THRESHOLD), satMask, Core.CMP_GT)
             Core.compare(graySrc, Scalar(220.0), darkMask, Core.CMP_LT)
-            Core.bitwise_and(rednessMask, darkMask, inkMaskOut)
+            Core.bitwise_and(satMask, darkMask, inkMaskOut)
 
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(INK_DILATE_PX.toDouble(), INK_DILATE_PX.toDouble()))
             Imgproc.dilate(inkMaskOut, dilated, kernel)
             return Imgproc.connectedComponentsWithStats(dilated, labels, stats, centroids, 8, CvType.CV_32S)
         } finally {
-            channels.forEach { it.release() }
-            bg.release()
-            redness.release()
-            rednessMask.release()
+            hsv.release()
+            hsvChannels.forEach { it.release() }
+            satMask.release()
             darkMask.release()
             dilated.release()
         }
     }
 
     /** Paints every colored-ink component near [seed] into [mask] in full (not clipped to a
-     * local window), plus the seed's own tight box (handles plain composed handwriting glyphs,
-     * e.g. fill-in-blank answers, which aren't a distinct color from print). */
-    private fun paintInkMask(seed: Rect, labels: Mat, stats: Mat, numLabels: Int, mask: Mat) {
+     * local window), plus [seed]'s own DARK PIXELS specifically — not the whole rectangle solid.
+     * A handwritten word's bounding box is axis-aligned but the writing itself rarely is
+     * (slanted, uneven letter heights), so a solid rectangle fill reaches into its own corners —
+     * verified: this erased a nearby PRINTED word that happened to sit inside a handwriting
+     * box's corner but was never actually part of the handwriting's own ink. Thresholding to
+     * dark pixels only still fully covers plain composed handwriting glyphs that aren't a
+     * distinct color from print (the reason this fallback exists at all), just without also
+     * grabbing the blank paper — or unrelated print — around them. */
+    private fun paintInkMask(seed: Rect, gray: Mat, labels: Mat, stats: Mat, numLabels: Int, mask: Mat) {
         val sx0 = max(0, seed.x - PROXIMITY_PX)
         val sy0 = max(0, seed.y - PROXIMITY_PX)
         val sx1 = min(labels.width(), seed.x + seed.width + PROXIMITY_PX)
@@ -130,6 +135,27 @@ object Inpainter {
                 }
             }
         }
-        Imgproc.rectangle(mask, seed.tl(), seed.br(), Scalar(255.0), -1)
+
+        val clippedSeed = Rect(
+            max(0, seed.x),
+            max(0, seed.y),
+            min(gray.width() - max(0, seed.x), seed.width),
+            min(gray.height() - max(0, seed.y), seed.height),
+        )
+        if (clippedSeed.width <= 0 || clippedSeed.height <= 0) return
+        val seedCrop = Mat(gray, clippedSeed)
+        val seedDark = Mat()
+        try {
+            Imgproc.threshold(seedCrop, seedDark, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
+            val maskRoi = Mat(mask, clippedSeed)
+            try {
+                Core.bitwise_or(maskRoi, seedDark, maskRoi)
+            } finally {
+                maskRoi.release()
+            }
+        } finally {
+            seedDark.release()
+            seedCrop.release()
+        }
     }
 }
