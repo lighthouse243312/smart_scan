@@ -40,29 +40,32 @@ class ImageProcessingService {
         );
       });
 
-  /// Gets each word's raw native pixel stats, then decides handwriting vs print by comparing
-  /// every word against the PAGE'S OWN most-common stroke width and ink color — self-calibrating
-  /// against whatever this particular document's printed font/ink actually looks like, rather
-  /// than a fixed threshold. Most of a page is printed text sharing one font and one ink color;
-  /// whichever words deviate from that majority (different stroke width, different ink color,
-  /// different baseline — see TextRecognitionService) are the handwriting candidates. Regions
-  /// scored as likely-handwriting come back pre-selected for erase — the user can still toggle
-  /// any of them, since this is a best-effort heuristic, not a trained classifier.
+  /// Classifies each word with the trained CNN (see beacon_smart_scan/ml/) — the primary signal,
+  /// since 6+ rounds of pure heuristics hit a hard accuracy ceiling on real worksheet photos.
+  /// The native pixel stats (stroke width, ink color, baseline, wide-underline) are still pulled
+  /// in as a secondary signal: mostly diluted into the blend, except "sits on a wide pre-printed
+  /// blank line" — a structural cue the CNN can't see since it only looks at the word's own crop
+  /// — which still acts as a floor. Regions scored as likely-handwriting come back pre-selected
+  /// for erase; the user can still toggle any of them.
   Future<List<TextRegion>> scoreHandwriting(String imagePath, List<TextRegion> regions) => _run(() async {
         if (regions.isEmpty) return regions;
-        final stats = await ImageProcessingChannel.detectHandwritingRegions(
-          imagePath: imagePath,
-          textBlocks: regions
-              .map((r) => {
-                    'id': r.id,
-                    'left': r.boundingBox.left,
-                    'top': r.boundingBox.top,
-                    'right': r.boundingBox.right,
-                    'bottom': r.boundingBox.bottom,
-                    'charCount': r.text.replaceAll(RegExp(r'\s'), '').length,
-                  })
-              .toList(),
-        );
+        final textBlocks = regions
+            .map((r) => {
+                  'id': r.id,
+                  'left': r.boundingBox.left,
+                  'top': r.boundingBox.top,
+                  'right': r.boundingBox.right,
+                  'bottom': r.boundingBox.bottom,
+                  'charCount': r.text.replaceAll(RegExp(r'\s'), '').length,
+                })
+            .toList();
+
+        final results = await Future.wait([
+          ImageProcessingChannel.detectHandwritingRegions(imagePath: imagePath, textBlocks: textBlocks),
+          ImageProcessingChannel.classifyHandwriting(imagePath: imagePath, textBlocks: textBlocks),
+        ]);
+        final stats = results[0] as Map<String, NativeWordStats>;
+        final mlConfidence = results[1] as Map<String, double>;
 
         final inked = regions.map((r) => stats[r.id]).whereType<NativeWordStats>().where((s) => s.hasInk).toList();
         final referenceStrokeWidth = _median(inked.map((s) => s.avgStrokeWidth).toList());
@@ -92,15 +95,20 @@ class ImageProcessingService {
               : 1.0;
           final intensityDeviation = ((intensityRatio - 1.0)).clamp(0.0, 1.0);
 
-          final weighted = (0.25 * r.baselineVarianceScore +
+          final heuristic = (0.25 * r.baselineVarianceScore +
                   0.20 * colorDeviation +
                   0.20 * s.angleVariationScore +
                   0.15 * intensityDeviation +
                   0.10 * strokeWidthDeviation +
                   0.10 * s.confidence)
               .clamp(0.0, 1.0);
+          // The trained CNN is the primary signal; the heuristic (pixel stats self-calibrated
+          // against this page's own printed text) stays as a secondary vote.
+          final ml = mlConfidence[r.id] ?? heuristic;
+          final weighted = (0.75 * ml + 0.25 * heuristic).clamp(0.0, 1.0);
           // A word sitting on a fill-in-blank's own pre-printed line is close to certain to be
-          // handwriting — a floor, not just one more diluted vote among many.
+          // handwriting — a floor, not just one more diluted vote among many. Also the one signal
+          // here the CNN structurally can't see, since it only looks at the word's own crop.
           final blended = s.hasWideUnderline ? max(weighted, 0.8) : weighted;
           final isHandwriting = blended > 0.5;
           return TextRegion(

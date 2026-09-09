@@ -119,6 +119,25 @@ class ImageProcessingChannel {
     return map;
   }
 
+  /// Runs the trained CNN (see beacon_smart_scan/ml/) on each word crop — a real classifier,
+  /// not a heuristic. [textBlocks] keys: id, left, top, right, bottom (image pixel coordinates).
+  /// Returns each region's raw sigmoid output (1.0 == handwriting) keyed by id.
+  static Future<Map<String, double>> classifyHandwriting({
+    required String imagePath,
+    required List<Map<String, Object>> textBlocks,
+  }) async {
+    final result = await _channel.invokeListMethod<Map<Object?, Object?>>(
+      'classifyHandwriting',
+      {'imagePath': imagePath, 'textBlocks': textBlocks},
+    );
+    final map = <String, double>{};
+    for (final entry in result ?? const []) {
+      final id = entry['id'] as String;
+      map[id] = (entry['mlConfidence'] as num).toDouble();
+    }
+    return map;
+  }
+
   static Future<String> eraseRegions({
     required String inputPath,
     required String outputPath,
