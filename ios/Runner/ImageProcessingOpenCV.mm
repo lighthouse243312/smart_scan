@@ -8,6 +8,8 @@
 // inpaint, CLAHE...) are stable, unchanged APIs across 4.x/5.x.
 #import <opencv2/opencv.hpp>
 
+#import <set>
+
 #import <Foundation/Foundation.h>
 #import "ImageProcessingOpenCV.h"
 
@@ -417,71 +419,65 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     return results;
 }
 
-// A hand-drawn mark (circling a multiple-choice letter, a checkmark) often extends well
-// beyond the flagged word's own tight box — verified against a real annotated worksheet:
-// erasing only the word's box left the outer ring of the circle behind. Grow the erase region
-// to the actual connected ink blob near the word instead of just its bounding box. Grading ink
-// is a distinct color (commonly red) from printed black/gray text, so growing on a color-
-// deviation ("redness") mask — rather than plain darkness — bridges through more of the SAME
-// ink without eating into nearby black print (verified: a plain-darkness grow bridged into
-// unrelated words only ~7px away on a dense worksheet). A long diagonal strike-through can
-// still connect to marks far outside this one word's circle, so growth is capped to a bounded
-// margin (bigger than a typical circle's ~15-20px overshoot, small enough that a stroke merely
-// passing through the search window can't run away with it).
-static const int kGrowSearchPad = 30;
-static const int kGrowDilatePx = 7;
-static const double kGrowRednessThreshold = 30.0;
-static const int kGrowMaxPx = 22;
+// Grading ink is a distinct color (commonly red) from printed black/gray text. A mask built
+// from color deviation ("redness"), not plain darkness, can never include a black-print pixel
+// no matter how close or how it's grown — verified: growing on plain darkness bridged into
+// unrelated words only ~7px away on a dense worksheet, but a color-gated mask left print
+// untouched even where a stroke crosses directly over it.
+static const double kRednessThreshold = 30.0;
+static const int kInkDilatePx = 5;
+// How close a colored-ink connected component must be to a flagged word's box to count as
+// "its" mark. Since inclusion is gated by color, not distance, there is no risk of ever
+// marking a black-print pixel this way — so the WHOLE component is taken once any part of it
+// is this close, however far the component itself runs (a long diagonal strike-through can
+// extend 100px+ from the word it crosses out; clipping the mask to a fixed-size window around
+// the word left such strokes half-erased).
+static const int kProximityPx = 20;
 
-static cv::Rect GrowToInkRegion(const cv::Mat &colorSrc, const cv::Mat &graySrc, const cv::Rect &seed) {
-    int sx0 = MAX(0, seed.x - kGrowSearchPad);
-    int sy0 = MAX(0, seed.y - kGrowSearchPad);
-    int sx1 = MIN(colorSrc.cols, seed.x + seed.width + kGrowSearchPad);
-    int sy1 = MIN(colorSrc.rows, seed.y + seed.height + kGrowSearchPad);
-    if (sx1 <= sx0 || sy1 <= sy0) return seed;
-    cv::Rect windowRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
-
-    cv::Mat colorWindow = colorSrc(windowRect);
-    cv::Mat grayWindow = graySrc(windowRect);
-
+/// Computes the whole-page colored-ink mask and its connected components ONCE, reused for every
+/// flagged word (cheaper than re-deriving a local mask per word, and is what lets a component's
+/// full extent be found regardless of which word ends up near which part of it).
+static int BuildInkComponents(const cv::Mat &colorSrc, const cv::Mat &graySrc, cv::Mat *labelsOut, cv::Mat *statsOut) {
     std::vector<cv::Mat> channels;
-    cv::split(colorWindow, channels);
-    cv::Mat bg, redness, rednessMask, darkMask, inkMask, dilated, labels, stats, centroids;
+    cv::split(colorSrc, channels);
+    cv::Mat bg, redness, rednessMask, darkMask, inkMask, dilated, centroids;
     cv::addWeighted(channels[0], 0.5, channels[1], 0.5, 0.0, bg);
     cv::subtract(channels[2], bg, redness);
-    cv::compare(redness, kGrowRednessThreshold, rednessMask, cv::CMP_GT);
-    cv::compare(grayWindow, 220, darkMask, cv::CMP_LT);
+    cv::compare(redness, kRednessThreshold, rednessMask, cv::CMP_GT);
+    cv::compare(graySrc, 220, darkMask, cv::CMP_LT);
     cv::bitwise_and(rednessMask, darkMask, inkMask);
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kGrowDilatePx, kGrowDilatePx));
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kInkDilatePx, kInkDilatePx));
     cv::dilate(inkMask, dilated, kernel);
+    return cv::connectedComponentsWithStats(dilated, *labelsOut, *statsOut, centroids, 8, CV_32S);
+}
 
-    int numLabels = cv::connectedComponentsWithStats(dilated, labels, stats, centroids, 8, CV_32S);
-
-    int gx0 = seed.x, gy0 = seed.y;
-    int gx1 = seed.x + seed.width, gy1 = seed.y + seed.height;
-    for (int label = 1; label < numLabels; label++) {
-        int lx = stats.at<int32_t>(label, 0);
-        int ly = stats.at<int32_t>(label, 1);
-        int lw = stats.at<int32_t>(label, 2);
-        int lh = stats.at<int32_t>(label, 3);
-        if (lw * lh < 4) continue;
-        gx0 = MIN(gx0, sx0 + lx);
-        gy0 = MIN(gy0, sy0 + ly);
-        gx1 = MAX(gx1, sx0 + lx + lw);
-        gy1 = MAX(gy1, sy0 + ly + lh);
+/// Paints every colored-ink component near `seed` into `mask` in full (not clipped to a local
+/// window), plus the seed's own tight box (handles plain composed handwriting glyphs, e.g.
+/// fill-in-blank answers, which aren't a distinct color from print).
+static void PaintInkMask(const cv::Rect &seed, const cv::Mat &labels, const cv::Mat &stats, int numLabels, cv::Mat *mask) {
+    int sx0 = MAX(0, seed.x - kProximityPx);
+    int sy0 = MAX(0, seed.y - kProximityPx);
+    int sx1 = MIN(labels.cols, seed.x + seed.width + kProximityPx);
+    int sy1 = MIN(labels.rows, seed.y + seed.height + kProximityPx);
+    if (sx1 > sx0 && sy1 > sy0) {
+        cv::Mat window = labels(cv::Rect(sx0, sy0, sx1 - sx0, sy1 - sy0));
+        std::set<int> nearbyLabels;
+        for (int y = 0; y < window.rows; y++) {
+            const int32_t *row = window.ptr<int32_t>(y);
+            for (int x = 0; x < window.cols; x++) {
+                if (row[x] != 0) nearbyLabels.insert(row[x]);
+            }
+        }
+        for (int label : nearbyLabels) {
+            if (label < 1 || label >= numLabels) continue;
+            if (stats.at<int32_t>(label, 2) * stats.at<int32_t>(label, 3) < 4) continue;
+            cv::Mat componentMask;
+            cv::compare(labels, label, componentMask, cv::CMP_EQ);
+            cv::bitwise_or(*mask, componentMask, *mask);
+        }
     }
-
-    gx0 = MAX(gx0, seed.x - kGrowMaxPx);
-    gy0 = MAX(gy0, seed.y - kGrowMaxPx);
-    gx1 = MIN(gx1, seed.x + seed.width + kGrowMaxPx);
-    gy1 = MIN(gy1, seed.y + seed.height + kGrowMaxPx);
-
-    int clippedX0 = MAX(0, gx0);
-    int clippedY0 = MAX(0, gy0);
-    int clippedX1 = MIN(colorSrc.cols, gx1);
-    int clippedY1 = MIN(colorSrc.rows, gy1);
-    return cv::Rect(clippedX0, clippedY0, MAX(1, clippedX1 - clippedX0), MAX(1, clippedY1 - clippedY0));
+    cv::rectangle(*mask, seed, cv::Scalar(255), -1);
 }
 
 + (BOOL)eraseRegionsAtPath:(NSString *)inputPath
@@ -496,14 +492,16 @@ static cv::Rect GrowToInkRegion(const cv::Mat &colorSrc, const cv::Mat &graySrc,
     cv::Mat gray;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
 
+    cv::Mat labels, stats;
+    int numLabels = BuildInkComponents(src, gray, &labels, &stats);
+
     cv::Mat mask = cv::Mat::zeros(src.size(), CV_8UC1);
     for (NSDictionary<NSString *, id> *rectMap in rects) {
         cv::Rect rect;
         if (!MapToClippedRect(rectMap, src.cols, src.rows, padding, &rect, error)) {
             return NO;
         }
-        cv::Rect grown = GrowToInkRegion(src, gray, rect);
-        cv::rectangle(mask, grown, cv::Scalar(255), -1);
+        PaintInkMask(rect, labels, stats, numLabels, &mask);
     }
 
     cv::Mat dst;
