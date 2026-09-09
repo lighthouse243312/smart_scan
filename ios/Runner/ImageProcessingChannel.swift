@@ -54,6 +54,11 @@ enum ImageProcessingChannel {
                 let textBlocks = (args["textBlocks"] as? [[String: Any]]) ?? []
                 return try ImageProcessingOpenCV.detectHandwritingRegions(atPath: imagePath, textBlocks: textBlocks)
 
+            case "classifyHandwriting":
+                let imagePath = try requireString(args, "imagePath")
+                let textBlocks = (args["textBlocks"] as? [[String: Any]]) ?? []
+                return try MlHandwritingClassifier.classify(imagePath: imagePath, textBlocks: textBlocks)
+
             case "eraseRegions":
                 let inputPath = try requireString(args, "inputPath")
                 let outputPath = try requireString(args, "outputPath")

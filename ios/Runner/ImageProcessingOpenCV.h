@@ -45,6 +45,15 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
                                                                                 error:(NSError **)error
     NS_SWIFT_NAME(detectHandwritingRegions(atPath:textBlocks:));
 
+/// Crops+resizes each `textBlocks` region to the ML classifier's fixed 128x64 grayscale input
+/// size (must match ml/train.py's IMG_W/IMG_H) and returns the raw pixel bytes (row-major,
+/// 1 byte/pixel, 128*64 = 8192 bytes per entry) so Swift can feed them into Core ML without
+/// ever touching OpenCV types itself.
++ (nullable NSArray<NSData *> *)handwritingCropsAtPath:(NSString *)imagePath
+                                              textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
+                                                   error:(NSError **)error
+    NS_SWIFT_NAME(handwritingCrops(atPath:textBlocks:));
+
 + (BOOL)eraseRegionsAtPath:(NSString *)inputPath
                  outputPath:(NSString *)outputPath
                       rects:(NSArray<NSDictionary<NSString *, id> *> *)rects

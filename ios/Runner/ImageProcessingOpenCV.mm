@@ -92,36 +92,37 @@ struct RegionStats {
 };
 
 /**
- * A fill-in-the-blank answer sits on top of a pre-printed blank line that's wider than the
- * answer itself (the blank was sized for a guessed-longer answer). A printed word's own
- * underline (used for in-text emphasis) hugs the word tightly instead. So: look for a long,
- * near-solid dark horizontal run in a thin strip just below the word, spanning noticeably wider
- * than the word's own bounding box — that combination is specific to "sits on a blank line",
- * not just "happens to be underlined".
+ * A fill-in-the-blank answer is written ON TOP of a pre-printed blank line — the ink usually
+ * touches or overlaps it, not sitting cleanly above it with a gap — and that line is wider than
+ * the answer itself (the blank was sized for a guessed-longer answer). A printed word's own
+ * underline (used for in-text emphasis) hugs the word tightly instead. So: search a band spanning
+ * from partway UP INSIDE the word's own box down through a generous margin below it (covering
+ * both "line touches the ink" and "line has a small gap"), and look for a long, near-solid dark
+ * horizontal run spanning noticeably wider than the word's own box. A fixed darkness threshold is
+ * used instead of a fresh Otsu computation — Otsu on a thin, almost-entirely-blank strip (a few
+ * dark line pixels among mostly paper) is not a reliable split.
  */
 static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
+    const int kDarkPixelThreshold = 150;
+
     int marginX = std::max(4, (int)(rect.width * 0.6));
     int bandLeft = std::max(0, rect.x - marginX);
     int bandRight = std::min(gray.cols, rect.x + rect.width + marginX);
     int bandWidth = bandRight - bandLeft;
     if (bandWidth <= 0) return false;
 
-    int gapBelow = std::max(1, (int)(rect.height * 0.05));
-    int bandHeight = std::max(2, (int)(rect.height * 0.25));
-    int bandTop = std::min(gray.rows - 1, rect.y + rect.height + gapBelow);
-    int bandBottom = std::min(gray.rows, bandTop + bandHeight);
+    int bandTop = std::min(gray.rows - 1, rect.y + (int)(rect.height * 0.6));
+    int bandBottom = std::min(gray.rows, rect.y + (int)(rect.height * 1.6));
     if (bandBottom <= bandTop) return false;
 
     cv::Mat band = gray(cv::Rect(bandLeft, bandTop, bandWidth, bandBottom - bandTop));
-    cv::Mat binaryBand;
-    cv::threshold(band, binaryBand, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
 
     int longestRun = 0;
-    for (int y = 0; y < binaryBand.rows; y++) {
-        const uchar *row = binaryBand.ptr<uchar>(y);
+    for (int y = 0; y < band.rows; y++) {
+        const uchar *row = band.ptr<uchar>(y);
         int currentRun = 0;
-        for (int x = 0; x < binaryBand.cols; x++) {
-            if (row[x] != 0) {
+        for (int x = 0; x < band.cols; x++) {
+            if (row[x] < kDarkPixelThreshold) {
                 currentRun++;
                 if (currentRun > longestRun) longestRun = currentRun;
             } else {
@@ -129,26 +130,29 @@ static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
             }
         }
     }
-    return longestRun > rect.width * 1.25;
+    return longestRun > rect.width * 1.2;
 }
 
 /**
  * How much each letter's own tilt varies from the next, WITHIN this one word — a signal
  * intrinsic to the ink shape itself, independent of position/underline/color, so it still fires
  * on handwriting that isn't sitting on a fill-in-blank line. A printed font renders the exact
- * same glyph outline every time a letter repeats, so every "tall" stroke (a letter's main
- * vertical, not a dot or serif fleck) sits at the same angle across the whole word; a human hand
- * never repeats a stroke at a perfectly identical angle twice.
+ * same glyph outline every time a letter repeats, so every stroke sits at the same angle across
+ * the whole word; a human hand never repeats a stroke at a perfectly identical angle twice.
+ *
+ * Deliberately NOT filtered to "tall" strokes only: the fill-in-blank answers on a real
+ * worksheet are mostly short 2-4 letter words ("he", "it", "us", "they"...), which often have
+ * zero or one component tall enough to pass a height filter — that filter silently starved this
+ * signal on exactly the majority case. Using every component with a minimum area instead means
+ * even a two-letter word usually has enough data points.
  */
-static double ComponentAngleVariationScore(const cv::Mat &binaryInk, int wordHeight) {
+static double ComponentAngleVariationScore(const cv::Mat &binaryInk) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binaryInk, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     std::vector<double> angleDeviations;
     for (auto &contour : contours) {
-        cv::Rect boundingRect = cv::boundingRect(contour);
-        // Only "tall" strokes carry a meaningful dominant angle — skip dots/serifs/noise.
-        if (boundingRect.height >= wordHeight * 0.4 && contour.size() >= 5) {
+        if (contour.size() >= 5 && cv::contourArea(contour) >= 3) {
             double angle = cv::minAreaRect(contour).angle;
             // minAreaRect's angle is ambiguous mod 90° (which side is "width" flips it); fold
             // into "deviation from the nearest axis" in [0, 45] so that's comparable.
@@ -235,7 +239,7 @@ static RegionStats ScoreRegion(const cv::Mat &color, const cv::Mat &gray, const 
     double ratio = componentCount / safeCharCount;
     double ratioScore = std::min(1.0, std::max(0.0, 1.0 - ratio));
 
-    double angleScore = ComponentAngleVariationScore(binary, rect.height);
+    double angleScore = ComponentAngleVariationScore(binary);
 
     double avgStrokeWidth = 0.0;
     if (!strokeWidthsPerComponent.empty()) {
@@ -379,6 +383,107 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     return results;
 }
 
++ (nullable NSArray<NSData *> *)handwritingCropsAtPath:(NSString *)imagePath
+                                              textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
+                                                   error:(NSError **)error {
+    static const int kInputW = 128;
+    static const int kInputH = 64;
+    // Must match ml/generate_dataset.py's NATIVE_PADDING_PX exactly. A raw ML Kit word box
+    // resized straight to kInputW x kInputH makes the glyph fill ~100% of the frame — verified
+    // against a real photo, this alone (not stroke shape) made the model flag nearly every
+    // word, print included, as handwriting. Training now crops the same way this does.
+    static const double kPaddingPx = 5.0;
+
+    cv::Mat src;
+    if (!ReadOrFail(imagePath, &src, error)) return nil;
+
+    cv::Mat gray;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+
+    NSMutableArray<NSData *> *results = [NSMutableArray arrayWithCapacity:textBlocks.count];
+    for (NSDictionary<NSString *, id> *block in textBlocks) {
+        cv::Rect rect;
+        if (!MapToClippedRect(block, gray.cols, gray.rows, kPaddingPx, &rect, error)) {
+            return nil;
+        }
+        cv::Mat crop(gray, rect);
+        cv::Mat resized;
+        cv::resize(crop, resized, cv::Size(kInputW, kInputH));
+        if (!resized.isContinuous()) {
+            resized = resized.clone();
+        }
+        [results addObject:[NSData dataWithBytes:resized.data length:(NSUInteger)(kInputW * kInputH)]];
+    }
+    return results;
+}
+
+// A hand-drawn mark (circling a multiple-choice letter, a checkmark) often extends well
+// beyond the flagged word's own tight box — verified against a real annotated worksheet:
+// erasing only the word's box left the outer ring of the circle behind. Grow the erase region
+// to the actual connected ink blob near the word instead of just its bounding box. Grading ink
+// is a distinct color (commonly red) from printed black/gray text, so growing on a color-
+// deviation ("redness") mask — rather than plain darkness — bridges through more of the SAME
+// ink without eating into nearby black print (verified: a plain-darkness grow bridged into
+// unrelated words only ~7px away on a dense worksheet). A long diagonal strike-through can
+// still connect to marks far outside this one word's circle, so growth is capped to a bounded
+// margin (bigger than a typical circle's ~15-20px overshoot, small enough that a stroke merely
+// passing through the search window can't run away with it).
+static const int kGrowSearchPad = 30;
+static const int kGrowDilatePx = 7;
+static const double kGrowRednessThreshold = 30.0;
+static const int kGrowMaxPx = 22;
+
+static cv::Rect GrowToInkRegion(const cv::Mat &colorSrc, const cv::Mat &graySrc, const cv::Rect &seed) {
+    int sx0 = MAX(0, seed.x - kGrowSearchPad);
+    int sy0 = MAX(0, seed.y - kGrowSearchPad);
+    int sx1 = MIN(colorSrc.cols, seed.x + seed.width + kGrowSearchPad);
+    int sy1 = MIN(colorSrc.rows, seed.y + seed.height + kGrowSearchPad);
+    if (sx1 <= sx0 || sy1 <= sy0) return seed;
+    cv::Rect windowRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+
+    cv::Mat colorWindow = colorSrc(windowRect);
+    cv::Mat grayWindow = graySrc(windowRect);
+
+    std::vector<cv::Mat> channels;
+    cv::split(colorWindow, channels);
+    cv::Mat bg, redness, rednessMask, darkMask, inkMask, dilated, labels, stats, centroids;
+    cv::addWeighted(channels[0], 0.5, channels[1], 0.5, 0.0, bg);
+    cv::subtract(channels[2], bg, redness);
+    cv::compare(redness, kGrowRednessThreshold, rednessMask, cv::CMP_GT);
+    cv::compare(grayWindow, 220, darkMask, cv::CMP_LT);
+    cv::bitwise_and(rednessMask, darkMask, inkMask);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kGrowDilatePx, kGrowDilatePx));
+    cv::dilate(inkMask, dilated, kernel);
+
+    int numLabels = cv::connectedComponentsWithStats(dilated, labels, stats, centroids, 8, CV_32S);
+
+    int gx0 = seed.x, gy0 = seed.y;
+    int gx1 = seed.x + seed.width, gy1 = seed.y + seed.height;
+    for (int label = 1; label < numLabels; label++) {
+        int lx = stats.at<int32_t>(label, 0);
+        int ly = stats.at<int32_t>(label, 1);
+        int lw = stats.at<int32_t>(label, 2);
+        int lh = stats.at<int32_t>(label, 3);
+        if (lw * lh < 4) continue;
+        gx0 = MIN(gx0, sx0 + lx);
+        gy0 = MIN(gy0, sy0 + ly);
+        gx1 = MAX(gx1, sx0 + lx + lw);
+        gy1 = MAX(gy1, sy0 + ly + lh);
+    }
+
+    gx0 = MAX(gx0, seed.x - kGrowMaxPx);
+    gy0 = MAX(gy0, seed.y - kGrowMaxPx);
+    gx1 = MIN(gx1, seed.x + seed.width + kGrowMaxPx);
+    gy1 = MIN(gy1, seed.y + seed.height + kGrowMaxPx);
+
+    int clippedX0 = MAX(0, gx0);
+    int clippedY0 = MAX(0, gy0);
+    int clippedX1 = MIN(colorSrc.cols, gx1);
+    int clippedY1 = MIN(colorSrc.rows, gy1);
+    return cv::Rect(clippedX0, clippedY0, MAX(1, clippedX1 - clippedX0), MAX(1, clippedY1 - clippedY0));
+}
+
 + (BOOL)eraseRegionsAtPath:(NSString *)inputPath
                  outputPath:(NSString *)outputPath
                       rects:(NSArray<NSDictionary<NSString *, id> *> *)rects
@@ -388,13 +493,17 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     cv::Mat src;
     if (!ReadOrFail(inputPath, &src, error)) return NO;
 
+    cv::Mat gray;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+
     cv::Mat mask = cv::Mat::zeros(src.size(), CV_8UC1);
     for (NSDictionary<NSString *, id> *rectMap in rects) {
         cv::Rect rect;
         if (!MapToClippedRect(rectMap, src.cols, src.rows, padding, &rect, error)) {
             return NO;
         }
-        cv::rectangle(mask, rect, cv::Scalar(255), -1);
+        cv::Rect grown = GrowToInkRegion(src, gray, rect);
+        cv::rectangle(mask, grown, cv::Scalar(255), -1);
     }
 
     cv::Mat dst;
