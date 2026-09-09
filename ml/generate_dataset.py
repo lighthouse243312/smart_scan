@@ -87,6 +87,14 @@ _WORD_POOL = (
 
 
 def random_word() -> str:
+    # Standalone short numbers (calendar dates, page/question numbers, table cells) are common
+    # printed content that a word-only pool never covers — verified on a real calendar photo:
+    # specific digit shapes ("2", "4", "7") were consistently misread as handwriting regardless
+    # of crop size, because the model had essentially never seen a bare 1-3 digit printed token,
+    # only occasional digit SUFFIXES on a word. Every digit needs even coverage on its own.
+    if random.random() < 0.2:
+        return "".join(random.choices(string.digits, k=random.randint(1, 3)))
+
     word = random.choice(_WORD_POOL)
     style = random.random()
     if style < 0.25:

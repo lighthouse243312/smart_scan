@@ -577,9 +577,15 @@ static int BuildInkComponents(const cv::Mat &colorSrc, const cv::Mat &graySrc, c
 }
 
 /// Paints every colored-ink component near `seed` into `mask` in full (not clipped to a local
-/// window), plus the seed's own tight box (handles plain composed handwriting glyphs, e.g.
-/// fill-in-blank answers, which aren't a distinct color from print).
-static void PaintInkMask(const cv::Rect &seed, const cv::Mat &labels, const cv::Mat &stats, int numLabels, cv::Mat *mask) {
+/// window), plus `seed`'s own DARK PIXELS specifically — not the whole rectangle solid. A
+/// handwritten word's bounding box is axis-aligned but the writing itself rarely is (slanted,
+/// uneven letter heights), so a solid rectangle fill reaches into its own corners — verified:
+/// this erased a nearby PRINTED word that happened to sit inside a handwriting box's corner but
+/// was never actually part of the handwriting's own ink. Thresholding to dark pixels only still
+/// fully covers plain composed handwriting glyphs that aren't a distinct color from print (the
+/// reason this fallback exists at all), just without also grabbing the blank paper — or
+/// unrelated print — around them.
+static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Mat &labels, const cv::Mat &stats, int numLabels, cv::Mat *mask) {
     int sx0 = MAX(0, seed.x - kProximityPx);
     int sy0 = MAX(0, seed.y - kProximityPx);
     int sx1 = MIN(labels.cols, seed.x + seed.width + kProximityPx);
@@ -601,7 +607,14 @@ static void PaintInkMask(const cv::Rect &seed, const cv::Mat &labels, const cv::
             cv::bitwise_or(*mask, componentMask, *mask);
         }
     }
-    cv::rectangle(*mask, seed, cv::Scalar(255), -1);
+
+    cv::Rect clippedSeed = seed & cv::Rect(0, 0, gray.cols, gray.rows);
+    if (clippedSeed.width <= 0 || clippedSeed.height <= 0) return;
+    cv::Mat seedCrop = gray(clippedSeed);
+    cv::Mat seedDark;
+    cv::threshold(seedCrop, seedDark, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
+    cv::Mat maskRoi = (*mask)(clippedSeed);
+    cv::bitwise_or(maskRoi, seedDark, maskRoi);
 }
 
 + (BOOL)eraseRegionsAtPath:(NSString *)inputPath
