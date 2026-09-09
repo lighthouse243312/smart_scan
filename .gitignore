@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# ML training environment/data (see ml/README or the training scripts) — regenerable, large,
+# and not part of the app itself. Trained model outputs (.keras/.tflite/.mlpackage) ARE tracked
+# since the app ships them.
+/ml/venv/
+/ml/tfds_data/
+/ml/*.npz
+/ml/__pycache__/
