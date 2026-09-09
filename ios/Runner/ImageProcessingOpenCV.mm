@@ -8,6 +8,7 @@
 // inpaint, CLAHE...) are stable, unchanged APIs across 4.x/5.x.
 #import <opencv2/opencv.hpp>
 
+#import <algorithm>
 #import <set>
 
 #import <Foundation/Foundation.h>
@@ -354,15 +355,27 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
 }
 
 // Bridges within-WORD letter gaps (cursive letters are usually touching or a few px apart)
-// without also bridging the larger word-to-word gap on the same line — a fixed pixel radius
-// can't do both across very different photo resolutions. Verified on a real photo: a fixed 25px
-// radius on a high-resolution (3024px-wide) camera shot merged an ENTIRE handwritten line ("new
-// global APP") into one wide blob instead of separate words, which then squashed badly when
-// resized to the classifier's 128x64 input and scored as printed. Scaling by image width keeps
-// the radius meaningful regardless of source resolution.
-static const double kOrphanMergeDilateFraction = 0.004;
-static const int kOrphanMergeDilateMinPx = 10;
-static const int kOrphanMergeDilateMaxPx = 20;
+// without also bridging the larger word-to-word gap on the same line. Scaling this off the INK'S
+// OWN measured size (typical raw letter-fragment height, before any merging) rather than off the
+// image's pixel width self-calibrates to however the photo was actually framed — verified: a
+// photo of the whole page and a photo zoomed in tight on just the handwriting put the very same
+// real-world pen stroke at wildly different pixel widths, so a radius tied to overall image width
+// was still far too small to bridge cursive letters into words once zoomed in (each letter was
+// already many times wider than the old fixed 20px cap), leaving fragments too small and
+// shapeless for the classifier to read as a word at all. A radius tied to the ink's own on-page
+// size stays meaningful either way.
+static const double kOrphanMergeDilateHeightFraction = 0.4;
+static const int kOrphanMergeDilateMinPx = 8;
+static const int kOrphanMergeDilateMaxPx = 60;
+// Ignore pure noise/dust when measuring typical letter size, but keep the floor low — thin
+// stroke fragments are exactly the samples this measurement needs.
+static const int kOrphanGlyphStatMinArea = 20;
+static const int kOrphanMinGlyphSamples = 3;
+// Only used on a page with too few raw ink fragments to measure a reliable typical size (e.g. a
+// single short word) — the original width-based estimate, as a fallback only.
+static const double kOrphanFallbackMergeDilateFraction = 0.004;
+static const int kOrphanFallbackMergeDilateMinPx = 10;
+static const int kOrphanFallbackMergeDilateMaxPx = 20;
 // A single stray dot, JPEG artifact, or thin table/gridline segment can pass a small area
 // threshold on its own — require real letter-scale bulk in BOTH dimensions, not just total area
 // (a 3px-tall, 300px-long line has plenty of "area" but is not a word).
@@ -374,6 +387,29 @@ static const double kOrphanExistingBlockPaddingPx = 6.0;
 // near-square chunks instead of handing the classifier one long, badly-squashed strip — the same
 // reasoning as not classifying whole LINES in the ML-Kit path.
 static const double kOrphanMaxAspectRatio = 2.5;
+
+/// Derives the merge-dilation kernel size from the RAW (undilated) unclaimed ink's own measured
+/// letter-fragment height, so it self-calibrates to however the photo was framed — see the
+/// constants' doc comment above for why a width-based radius doesn't. Falls back to the old
+/// width-based estimate only when there's too little raw ink to measure a reliable typical size
+/// from.
+static int MeasureOrphanMergeDilatePx(const cv::Mat &unclaimed, int imageWidth) {
+    cv::Mat rawLabels, rawStats, rawCentroids;
+    int rawNumLabels = cv::connectedComponentsWithStats(unclaimed, rawLabels, rawStats, rawCentroids, 8, CV_32S);
+    std::vector<int> heights;
+    for (int label = 1; label < rawNumLabels; label++) {
+        int area = rawStats.at<int32_t>(label, 4);
+        if (area < kOrphanGlyphStatMinArea) continue;
+        heights.push_back(rawStats.at<int32_t>(label, 3));
+    }
+    if ((int)heights.size() >= kOrphanMinGlyphSamples) {
+        std::sort(heights.begin(), heights.end());
+        int medianHeight = heights[heights.size() / 2];
+        return MIN(kOrphanMergeDilateMaxPx, MAX(kOrphanMergeDilateMinPx, (int)(medianHeight * kOrphanMergeDilateHeightFraction)));
+    }
+    return MIN(kOrphanFallbackMergeDilateMaxPx,
+               MAX(kOrphanFallbackMergeDilateMinPx, (int)(imageWidth * kOrphanFallbackMergeDilateFraction)));
+}
 
 + (nullable NSArray<NSDictionary<NSString *, id> *> *)detectOrphanRegionsAtPath:(NSString *)imagePath
                                                                   existingBlocks:(NSArray<NSDictionary<NSString *, id> *> *)existingBlocks
@@ -401,7 +437,7 @@ static const double kOrphanMaxAspectRatio = 2.5;
         cv::rectangle(unclaimed, rect, cv::Scalar(0), -1);
     }
 
-    int mergeDilatePx = MIN(kOrphanMergeDilateMaxPx, MAX(kOrphanMergeDilateMinPx, (int)(src.cols * kOrphanMergeDilateFraction)));
+    int mergeDilatePx = MeasureOrphanMergeDilatePx(unclaimed, src.cols);
     cv::Mat dilated;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(mergeDilatePx, mergeDilatePx));
     cv::dilate(unclaimed, dilated, kernel);
@@ -561,31 +597,38 @@ static const int kProximityPx = 20;
 /// Computes the whole-page colored-ink mask and its connected components ONCE, reused for every
 /// flagged word (cheaper than re-deriving a local mask per word, and is what lets a component's
 /// full extent be found regardless of which word ends up near which part of it).
-static int BuildInkComponents(const cv::Mat &colorSrc, const cv::Mat &graySrc, cv::Mat *labelsOut, cv::Mat *statsOut) {
+static int BuildInkComponents(const cv::Mat &colorSrc, const cv::Mat &graySrc, cv::Mat *inkMaskOut, cv::Mat *labelsOut, cv::Mat *statsOut) {
     cv::Mat hsv;
     cv::cvtColor(colorSrc, hsv, cv::COLOR_BGR2HSV);
     std::vector<cv::Mat> hsvChannels;
     cv::split(hsv, hsvChannels);
-    cv::Mat satMask, darkMask, inkMask, dilated, centroids;
+    cv::Mat satMask, darkMask, dilated, centroids;
     cv::compare(hsvChannels[1], kSaturationThreshold, satMask, cv::CMP_GT);
     cv::compare(graySrc, 220, darkMask, cv::CMP_LT);
-    cv::bitwise_and(satMask, darkMask, inkMask);
+    cv::bitwise_and(satMask, darkMask, *inkMaskOut);
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kInkDilatePx, kInkDilatePx));
-    cv::dilate(inkMask, dilated, kernel);
+    cv::dilate(*inkMaskOut, dilated, kernel);
     return cv::connectedComponentsWithStats(dilated, *labelsOut, *statsOut, centroids, 8, CV_32S);
 }
 
 /// Paints every colored-ink component near `seed` into `mask` in full (not clipped to a local
-/// window), plus `seed`'s own DARK PIXELS specifically — not the whole rectangle solid. A
-/// handwritten word's bounding box is axis-aligned but the writing itself rarely is (slanted,
-/// uneven letter heights), so a solid rectangle fill reaches into its own corners — verified:
-/// this erased a nearby PRINTED word that happened to sit inside a handwriting box's corner but
-/// was never actually part of the handwriting's own ink. Thresholding to dark pixels only still
-/// fully covers plain composed handwriting glyphs that aren't a distinct color from print (the
-/// reason this fallback exists at all), just without also grabbing the blank paper — or
-/// unrelated print — around them.
-static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Mat &labels, const cv::Mat &stats, int numLabels, cv::Mat *mask) {
+/// window), plus `seed`'s own ink specifically — not the whole rectangle solid. A handwritten
+/// word's bounding box is axis-aligned but the writing itself rarely is (slanted, uneven letter
+/// heights), so a solid rectangle fill reaches into its own corners — verified: this erased a
+/// nearby PRINTED word that happened to sit inside a handwriting box's corner but was never
+/// actually part of the handwriting's own ink.
+///
+/// Within the seed itself, prefer the already-computed COLORED-ink mask over a fresh Otsu
+/// darkness threshold: Otsu just splits the crop's own pixels into "darker half" / "lighter
+/// half" with no idea which dark pixels are the handwriting and which are a printed word sharing
+/// the same crop — verified: a handwriting box that happened to reach right up against an
+/// adjacent printed word's edge had Otsu darken both, erasing part of the print. Color can't make
+/// that mistake (print isn't saturated). Only fall back to plain darkness when the seed has
+/// literally no colored ink at all — composed handwriting glyphs in a color that doesn't stand
+/// out from print (graphite pencil, a black pen), the one case color can't help with, which is
+/// the reason this fallback exists in the first place.
+static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Mat &inkMask, const cv::Mat &labels, const cv::Mat &stats, int numLabels, cv::Mat *mask) {
     int sx0 = MAX(0, seed.x - kProximityPx);
     int sy0 = MAX(0, seed.y - kProximityPx);
     int sx1 = MIN(labels.cols, seed.x + seed.width + kProximityPx);
@@ -610,6 +653,14 @@ static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Ma
 
     cv::Rect clippedSeed = seed & cv::Rect(0, 0, gray.cols, gray.rows);
     if (clippedSeed.width <= 0 || clippedSeed.height <= 0) return;
+
+    cv::Mat coloredInkCrop = inkMask(clippedSeed);
+    if (cv::countNonZero(coloredInkCrop) > 0) {
+        cv::Mat maskRoi = (*mask)(clippedSeed);
+        cv::bitwise_or(maskRoi, coloredInkCrop, maskRoi);
+        return;
+    }
+
     cv::Mat seedCrop = gray(clippedSeed);
     cv::Mat seedDark;
     cv::threshold(seedCrop, seedDark, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
@@ -629,8 +680,8 @@ static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Ma
     cv::Mat gray;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
 
-    cv::Mat labels, stats;
-    int numLabels = BuildInkComponents(src, gray, &labels, &stats);
+    cv::Mat inkMask, labels, stats;
+    int numLabels = BuildInkComponents(src, gray, &inkMask, &labels, &stats);
 
     cv::Mat mask = cv::Mat::zeros(src.size(), CV_8UC1);
     for (NSDictionary<NSString *, id> *rectMap in rects) {
@@ -638,7 +689,7 @@ static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Ma
         if (!MapToClippedRect(rectMap, src.cols, src.rows, padding, &rect, error)) {
             return NO;
         }
-        PaintInkMask(rect, labels, stats, numLabels, &mask);
+        PaintInkMask(rect, gray, inkMask, labels, stats, numLabels, &mask);
     }
 
     cv::Mat dst;

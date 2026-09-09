@@ -156,10 +156,25 @@ class ImageProcessingService {
           // photo. That's a wide enough margin to treat a very low score as near-certain print,
           // overriding the CNN — a ceiling, mirroring hasWideUnderline's floor on the other side.
           final cappedByStraightness = s.angleVariationScore <= 0.15 ? min(weighted, 0.2) : weighted;
+          // A second, independent ceiling for a shape the CNN reads as unusual but whose INK
+          // physically matches this page's own established print: same stroke thickness, same
+          // color, same darkness consistency as every other word already confirmed print on this
+          // page. Verified on a real calendar whose template draws its month numbers (1-12) in a
+          // casual script-styled print font — the CNN, going by shape alone, occasionally scored
+          // one of these (a lone "9") as handwriting even though nothing about the ink itself
+          // differed from the rest of the page's print. Angle-variation can't catch this case (a
+          // single compact glyph, or a stacked two-size date pair, doesn't repeat a stroke angle
+          // the way a whole word does) — but stroke width, color and darkness are direct physical
+          // measurements of the ink itself, indifferent to the glyph's shape, and printed ink from
+          // the same source (pen or printer) as the rest of the page can't drift far from the
+          // page's own reference on all three at once. Real handwriting reliably differs in at
+          // least one.
+          final matchesPageInk = strokeWidthDeviation <= 0.15 && colorDeviation <= 0.15 && intensityDeviation <= 0.1;
+          final cappedByPageInk = matchesPageInk ? min(cappedByStraightness, 0.2) : cappedByStraightness;
           // A word sitting on a fill-in-blank's own pre-printed line is close to certain to be
           // handwriting — a floor, not just one more diluted vote among many. Also the one signal
           // here the CNN structurally can't see, since it only looks at the word's own crop.
-          final blended = s.hasWideUnderline ? max(cappedByStraightness, 0.8) : cappedByStraightness;
+          final blended = s.hasWideUnderline ? max(cappedByPageInk, 0.8) : cappedByPageInk;
           // A region only exists here as an "orphan" because ML Kit's own text recognizer —
           // which read every calendar number and header on the same real page correctly —
           // failed to recognize it as legible text at all. Handwriting is exactly the content
@@ -171,7 +186,20 @@ class ImageProcessingService {
           // normally-recognized word can produce. Treat orphans as handwriting by default; only
           // a near-total absence of any signal for it (an oddly-shaped noise blob that slipped
           // past the size filters) should override that.
-          final threshold = r.id.startsWith('orphan_') ? 0.15 : 0.5;
+          // The low bar above is earned by ML Kit failing on a whole PHRASE — a multi-character
+          // run has nowhere to hide behind "maybe it's just an unusual font." A single isolated
+          // glyph doesn't get that same benefit of the doubt: verified on a real calendar whose
+          // template draws its month numerals (1-12) in a casual script-style print font — ML
+          // Kit failed to read one of them ("9", sitting right against actual handwriting above
+          // it), and the 0.15 bar then erased it outright. A lone glyph close to square (roughly
+          // as wide as it is tall) is exactly what a single stray character looks like, whereas a
+          // real handwritten word or phrase is reliably wider than that — so only a
+          // multi-character-shaped orphan gets the aggressive bar; a single-glyph-shaped one is
+          // held to the same standard as any ML-Kit-recognized word.
+          final isSplitChunk = RegExp(r'^orphan_\d+_\d+$').hasMatch(r.id);
+          final aspectRatio = r.boundingBox.height > 0 ? r.boundingBox.width / r.boundingBox.height : 0.0;
+          final isSingleGlyphScale = r.id.startsWith('orphan_') && !isSplitChunk && aspectRatio < 1.3;
+          final threshold = r.id.startsWith('orphan_') && !isSingleGlyphScale ? 0.15 : 0.5;
           final isHandwriting = blended > threshold;
           return TextRegion(
             id: r.id,
@@ -190,7 +218,8 @@ class ImageProcessingService {
               intensityDeviation: intensityDeviation,
               strokeWidthDeviation: strokeWidthDeviation,
               hasWideUnderline: s.hasWideUnderline,
-              cappedByStraightness: cappedByStraightness != weighted,
+              matchesPageInk: matchesPageInk,
+              cappedByStraightness: cappedByPageInk != weighted,
             ),
           );
         }).toList();

@@ -47,18 +47,34 @@ class _RegionOverlayState extends State<RegionOverlay> {
           return Rect.fromLTRB(left, top, right, bottom);
         }
 
+        TextRegion? regionAt(Offset localPosition) {
+          final tapImagePoint = localPosition / scale;
+          for (final region in widget.regions.reversed) {
+            if (region.boundingBox.contains(tapImagePoint)) return region;
+          }
+          return null;
+        }
+
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTapUp: widget.drawModeEnabled
               ? null
               : (details) {
-                  final tapImagePoint = details.localPosition / scale;
-                  for (final region in widget.regions.reversed) {
-                    if (region.boundingBox.contains(tapImagePoint)) {
-                      widget.onToggle(region.id);
-                      return;
-                    }
-                  }
+                  final region = regionAt(details.localPosition);
+                  if (region != null) widget.onToggle(region.id);
+                },
+          // Debug builds only: the overlay packs many small boxes edge-to-edge (every calendar
+          // date gets its own), so their score labels are too small and too crowded to read at
+          // the screen's normal fit-to-width size — and pinch-zooming the whole screen doesn't
+          // actually help, since the labels are already-painted text getting stretched, not
+          // redrawn sharper. A long-press instead shows just the one tapped region's full
+          // breakdown by itself, at normal reading size, regardless of how small or packed its
+          // box is on screen.
+          onLongPressStart: widget.drawModeEnabled || !kDebugMode
+              ? null
+              : (details) {
+                  final region = regionAt(details.localPosition);
+                  if (region != null) _showDebugDetails(context, region);
                 },
           onPanStart: widget.drawModeEnabled ? (d) => setState(() => _dragStart = d.localPosition) : null,
           onPanUpdate: widget.drawModeEnabled ? (d) => setState(() => _dragCurrent = d.localPosition) : null,
@@ -87,6 +103,45 @@ class _RegionOverlayState extends State<RegionOverlay> {
           ),
         );
       },
+    );
+  }
+
+  void _showDebugDetails(BuildContext context, TextRegion region) {
+    final debug = region.debugBreakdown;
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(region.id),
+        content: region.isManual
+            ? const Text('manual region')
+            : debug == null
+                ? Text('confidence: ${region.confidence.toStringAsFixed(3)}')
+                : SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text('final: ${region.confidence.toStringAsFixed(3)}'
+                            '  (${region.isLikelyHandwriting ? "handwriting" : "print"})'),
+                        const Divider(),
+                        Text('ml confidence: ${debug.mlConfidence.toStringAsFixed(3)}'),
+                        Text('heuristic: ${debug.heuristic.toStringAsFixed(3)}'),
+                        const Divider(),
+                        Text('angle variation: ${debug.angleVariationScore.toStringAsFixed(3)}'),
+                        Text('color deviation: ${debug.colorDeviation.toStringAsFixed(3)}'),
+                        Text('intensity deviation: ${debug.intensityDeviation.toStringAsFixed(3)}'),
+                        Text('stroke width deviation: ${debug.strokeWidthDeviation.toStringAsFixed(3)}'),
+                        const Divider(),
+                        Text('has wide underline: ${debug.hasWideUnderline}'),
+                        Text('matches page ink: ${debug.matchesPageInk}'),
+                        Text('capped: ${debug.cappedByStraightness}'),
+                      ],
+                    ),
+                  ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Đóng')),
+        ],
+      ),
     );
   }
 }
@@ -142,6 +197,7 @@ class _RegionPainter extends CustomPainter {
                     'int:${debug.intensityDeviation.toStringAsFixed(2)}\n'
                     'stroke:${debug.strokeWidthDeviation.toStringAsFixed(2)}'
                     '${debug.hasWideUnderline ? " underline" : ""}'
+                    '${debug.matchesPageInk ? " pageInk" : ""}'
                     '${debug.cappedByStraightness ? " CAPPED" : ""}';
         final painter = TextPainter(
           text: TextSpan(

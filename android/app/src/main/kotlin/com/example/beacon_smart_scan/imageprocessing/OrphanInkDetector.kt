@@ -26,15 +26,27 @@ import kotlin.math.min
  */
 object OrphanInkDetector {
     // Bridges within-WORD letter gaps (cursive letters are usually touching or a few px apart)
-    // without also bridging the larger word-to-word gap on the same line — a fixed pixel radius
-    // can't do both across very different photo resolutions. Verified on a real photo: a fixed
-    // 25px radius on a high-resolution (3024px-wide) camera shot merged an ENTIRE handwritten
-    // line ("new global APP") into one wide blob instead of separate words, which then squashed
-    // badly when resized to the classifier's 128x64 input and scored as printed. Scaling by
-    // image width keeps the radius meaningful regardless of source resolution.
-    private const val MERGE_DILATE_FRACTION = 0.004
-    private const val MERGE_DILATE_MIN_PX = 10
-    private const val MERGE_DILATE_MAX_PX = 20
+    // without also bridging the larger word-to-word gap on the same line. Scaling this off the
+    // INK'S OWN measured size (typical raw letter-fragment height, before any merging) rather
+    // than off the image's pixel width self-calibrates to however the photo was actually framed
+    // — verified: a photo of the whole page and a photo zoomed in tight on just the handwriting
+    // put the very same real-world pen stroke at wildly different pixel widths, so a radius tied
+    // to overall image width was still far too small to bridge cursive letters into words once
+    // zoomed in (each letter was already many times wider than the old fixed 20px cap), leaving
+    // fragments too small and shapeless for the classifier to read as a word at all. A radius
+    // tied to the ink's own on-page size stays meaningful either way.
+    private const val MERGE_DILATE_HEIGHT_FRACTION = 0.4
+    private const val MERGE_DILATE_MIN_PX = 8
+    private const val MERGE_DILATE_MAX_PX = 60
+    // Ignore pure noise/dust when measuring typical letter size, but keep the floor low — thin
+    // stroke fragments are exactly the samples this measurement needs.
+    private const val GLYPH_STAT_MIN_AREA = 20
+    private const val MIN_GLYPH_SAMPLES = 3
+    // Only used on a page with too few raw ink fragments to measure a reliable typical size
+    // (e.g. a single short word) — the original width-based estimate, as a fallback only.
+    private const val FALLBACK_MERGE_DILATE_FRACTION = 0.004
+    private const val FALLBACK_MERGE_DILATE_MIN_PX = 10
+    private const val FALLBACK_MERGE_DILATE_MAX_PX = 20
     // A single stray dot, JPEG artifact, or thin table/gridline segment can pass a small area
     // threshold on its own — require real letter-scale bulk in BOTH dimensions, not just total
     // area (a 3px-tall, 300px-long line has plenty of "area" but is not a word).
@@ -78,7 +90,7 @@ object OrphanInkDetector {
             unclaimed.create(binary.size(), CvType.CV_8UC1)
             claimed.copyTo(unclaimed)
 
-            val mergeDilatePx = (src.width() * MERGE_DILATE_FRACTION).toInt().coerceIn(MERGE_DILATE_MIN_PX, MERGE_DILATE_MAX_PX)
+            val mergeDilatePx = measureMergeDilatePx(unclaimed, src.width())
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(mergeDilatePx.toDouble(), mergeDilatePx.toDouble()))
             Imgproc.dilate(unclaimed, dilated, kernel)
 
@@ -155,6 +167,37 @@ object OrphanInkDetector {
             stats.release()
             centroids.release()
             src.release()
+        }
+    }
+
+    /** Derives the merge-dilation kernel size from the RAW (undilated) unclaimed ink's own
+     * measured letter-fragment height, so it self-calibrates to however the photo was framed —
+     * see the class-level doc for why a width-based radius doesn't. Falls back to the old
+     * width-based estimate only when there's too little raw ink to measure a reliable typical
+     * size from. */
+    private fun measureMergeDilatePx(unclaimed: Mat, imageWidth: Int): Int {
+        val rawLabels = Mat()
+        val rawStats = Mat()
+        val rawCentroids = Mat()
+        try {
+            val rawNumLabels = Imgproc.connectedComponentsWithStats(unclaimed, rawLabels, rawStats, rawCentroids, 8, CvType.CV_32S)
+            val heights = ArrayList<Int>()
+            for (label in 1 until rawNumLabels) {
+                val area = rawStats.get(label, 4)[0]
+                if (area < GLYPH_STAT_MIN_AREA) continue
+                heights.add(rawStats.get(label, 3)[0].toInt())
+            }
+            if (heights.size >= MIN_GLYPH_SAMPLES) {
+                heights.sort()
+                val medianHeight = heights[heights.size / 2]
+                return (medianHeight * MERGE_DILATE_HEIGHT_FRACTION).toInt().coerceIn(MERGE_DILATE_MIN_PX, MERGE_DILATE_MAX_PX)
+            }
+            return (imageWidth * FALLBACK_MERGE_DILATE_FRACTION).toInt()
+                .coerceIn(FALLBACK_MERGE_DILATE_MIN_PX, FALLBACK_MERGE_DILATE_MAX_PX)
+        } finally {
+            rawLabels.release()
+            rawStats.release()
+            rawCentroids.release()
         }
     }
 

@@ -53,7 +53,7 @@ object Inpainter {
 
             rects.forEach { rectMap ->
                 val rect = ImageIO.mapToClippedRect(rectMap, src.width(), src.height(), padding)
-                paintInkMask(rect, gray, labels, stats, numLabels, mask)
+                paintInkMask(rect, gray, inkMask, labels, stats, numLabels, mask)
             }
             Photo.inpaint(src, mask, dst, inpaintRadius, Photo.INPAINT_TELEA)
             ImageIO.writeOrThrow(dst, outputPath)
@@ -100,15 +100,22 @@ object Inpainter {
     }
 
     /** Paints every colored-ink component near [seed] into [mask] in full (not clipped to a
-     * local window), plus [seed]'s own DARK PIXELS specifically — not the whole rectangle solid.
-     * A handwritten word's bounding box is axis-aligned but the writing itself rarely is
-     * (slanted, uneven letter heights), so a solid rectangle fill reaches into its own corners —
-     * verified: this erased a nearby PRINTED word that happened to sit inside a handwriting
-     * box's corner but was never actually part of the handwriting's own ink. Thresholding to
-     * dark pixels only still fully covers plain composed handwriting glyphs that aren't a
-     * distinct color from print (the reason this fallback exists at all), just without also
-     * grabbing the blank paper — or unrelated print — around them. */
-    private fun paintInkMask(seed: Rect, gray: Mat, labels: Mat, stats: Mat, numLabels: Int, mask: Mat) {
+     * local window), plus [seed]'s own ink specifically — not the whole rectangle solid. A
+     * handwritten word's bounding box is axis-aligned but the writing itself rarely is (slanted,
+     * uneven letter heights), so a solid rectangle fill reaches into its own corners — verified:
+     * this erased a nearby PRINTED word that happened to sit inside a handwriting box's corner
+     * but was never actually part of the handwriting's own ink.
+     *
+     * Within the seed itself, prefer the already-computed COLORED-ink mask over a fresh Otsu
+     * darkness threshold: Otsu just splits the crop's own pixels into "darker half" / "lighter
+     * half" with no idea which dark pixels are the handwriting and which are a printed word
+     * sharing the same crop — verified: a handwriting box that happened to reach right up
+     * against an adjacent printed word's edge had Otsu darken both, erasing part of the print.
+     * Color can't make that mistake (print isn't saturated). Only fall back to plain darkness
+     * when the seed has literally no colored ink at all — composed handwriting glyphs in a color
+     * that doesn't stand out from print (graphite pencil, a black pen), the one case color can't
+     * help with, which is the reason this fallback exists in the first place. */
+    private fun paintInkMask(seed: Rect, gray: Mat, inkMask: Mat, labels: Mat, stats: Mat, numLabels: Int, mask: Mat) {
         val sx0 = max(0, seed.x - PROXIMITY_PX)
         val sy0 = max(0, seed.y - PROXIMITY_PX)
         val sx1 = min(labels.width(), seed.x + seed.width + PROXIMITY_PX)
@@ -143,6 +150,21 @@ object Inpainter {
             min(gray.height() - max(0, seed.y), seed.height),
         )
         if (clippedSeed.width <= 0 || clippedSeed.height <= 0) return
+        val coloredInkCrop = Mat(inkMask, clippedSeed)
+        try {
+            if (Core.countNonZero(coloredInkCrop) > 0) {
+                val maskRoi = Mat(mask, clippedSeed)
+                try {
+                    Core.bitwise_or(maskRoi, coloredInkCrop, maskRoi)
+                } finally {
+                    maskRoi.release()
+                }
+                return
+            }
+        } finally {
+            coloredInkCrop.release()
+        }
+
         val seedCrop = Mat(gray, clippedSeed)
         val seedDark = Mat()
         try {

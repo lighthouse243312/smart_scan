@@ -79,6 +79,7 @@ class DebugScoreBreakdown {
     required this.intensityDeviation,
     required this.strokeWidthDeviation,
     required this.hasWideUnderline,
+    required this.matchesPageInk,
     required this.cappedByStraightness,
   });
 
@@ -89,5 +90,6 @@ class DebugScoreBreakdown {
   final double intensityDeviation;
   final double strokeWidthDeviation;
   final bool hasWideUnderline;
+  final bool matchesPageInk;
   final bool cappedByStraightness;
 }
