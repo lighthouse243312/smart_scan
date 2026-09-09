@@ -32,6 +32,12 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    androidResources {
+        // .tflite is a binary flatbuffer — must ship byte-for-byte, not gzip-compressed like
+        // other assets (AAPT would otherwise try to compress it, which the loader can't mmap).
+        noCompress += "tflite"
+    }
 }
 
 kotlin {
@@ -46,4 +52,5 @@ flutter {
 
 dependencies {
     implementation(project(":opencv"))
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 }

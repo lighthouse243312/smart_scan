@@ -1,5 +1,6 @@
 package com.example.beacon_smart_scan.imageprocessing
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.engine.FlutterEngine
@@ -21,8 +22,10 @@ object ImageProcessingChannel {
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var openCvLoaded = false
+    private lateinit var appContext: Context
 
-    fun register(flutterEngine: FlutterEngine) {
+    fun register(flutterEngine: FlutterEngine, context: Context) {
+        appContext = context.applicationContext
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_NAME)
         channel.setMethodCallHandler { call, result ->
             executor.execute {
@@ -69,6 +72,12 @@ object ImageProcessingChannel {
                 )
             "detectHandwritingRegions" ->
                 HandwritingDetector.detect(
+                    requirePath(call, "imagePath"),
+                    requireMapList(call, "textBlocks"),
+                )
+            "classifyHandwriting" ->
+                MlHandwritingClassifier.classify(
+                    appContext,
                     requirePath(call, "imagePath"),
                     requireMapList(call, "textBlocks"),
                 )

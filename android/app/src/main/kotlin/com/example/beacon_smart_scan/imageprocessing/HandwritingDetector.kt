@@ -33,6 +33,7 @@ import kotlin.math.sqrt
 object HandwritingDetector {
     private const val MIN_INK_PIXELS = 20
     private const val MIN_COMPONENT_AREA = 3
+    private const val DARK_PIXEL_THRESHOLD = 150
 
     data class RegionStats(
         val strokeVariationScore: Double,
@@ -93,7 +94,7 @@ object HandwritingDetector {
             val avgStrokeWidth = if (strokeWidthsPerComponent.isEmpty()) 0.0 else strokeWidthsPerComponent.average()
             val strokeScore = strokeVariationAcrossComponentsScore(strokeWidthsPerComponent)
             val ratioScore = componentCountRatioScore(componentCount, charCount)
-            val angleScore = componentAngleVariationScore(binary, rect.height)
+            val angleScore = componentAngleVariationScore(binary)
             val inkColor = averageInkColor(colorCrop, binary)
             val inkIntensityStdDev = inkIntensityStdDev(crop, binary)
             val hasWideUnderline = hasWideUnderlineBelow(gray, rect)
@@ -141,12 +142,15 @@ object HandwritingDetector {
     }
 
     /**
-     * A fill-in-the-blank answer sits on top of a pre-printed blank line that's wider than the
-     * answer itself (the blank was sized for a guessed-longer answer). A printed word's own
-     * underline (used for in-text emphasis) hugs the word tightly instead. So: look for a long,
-     * near-solid dark horizontal run in a thin strip just below the word, spanning noticeably
-     * wider than the word's own bounding box — that combination is specific to "sits on a blank
-     * line", not just "happens to be underlined".
+     * A fill-in-the-blank answer is written ON TOP of a pre-printed blank line — the ink usually
+     * touches or overlaps it, not sitting cleanly above it with a gap — and that line is wider
+     * than the answer itself (the blank was sized for a guessed-longer answer). A printed word's
+     * own underline (used for in-text emphasis) hugs the word tightly instead. So: search a band
+     * spanning from partway UP INSIDE the word's own box down through a generous margin below it
+     * (covering both "line touches the ink" and "line has a small gap"), and look for a long,
+     * near-solid dark horizontal run spanning noticeably wider than the word's own box. A fixed
+     * darkness threshold is used instead of a fresh Otsu computation — Otsu on a thin, almost-
+     * entirely-blank strip (a few dark line pixels among mostly paper) is not a reliable split.
      */
     private fun hasWideUnderlineBelow(gray: Mat, rect: Rect): Boolean {
         val marginX = (rect.width * 0.6).toInt().coerceAtLeast(4)
@@ -155,28 +159,25 @@ object HandwritingDetector {
         val bandWidth = bandRight - bandLeft
         if (bandWidth <= 0) return false
 
-        val gapBelow = (rect.height * 0.05).toInt().coerceAtLeast(1)
-        val bandHeight = (rect.height * 0.25).toInt().coerceAtLeast(2)
-        val bandTop = (rect.y + rect.height + gapBelow).coerceAtMost(gray.height() - 1)
-        val bandBottom = (bandTop + bandHeight).coerceAtMost(gray.height())
+        val bandTop = (rect.y + (rect.height * 0.6).toInt()).coerceIn(0, gray.height() - 1)
+        val bandBottom = (rect.y + (rect.height * 1.6).toInt()).coerceAtMost(gray.height())
         if (bandBottom <= bandTop) return false
 
         val band = Mat(gray, Rect(bandLeft, bandTop, bandWidth, bandBottom - bandTop))
-        val binaryBand = Mat()
         try {
-            Imgproc.threshold(band, binaryBand, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
-
-            val rows = binaryBand.rows()
-            val cols = binaryBand.cols()
+            val rows = band.rows()
+            val cols = band.cols()
             val flat = ByteArray(rows * cols)
-            binaryBand.get(0, 0, flat)
+            band.get(0, 0, flat)
 
             var longestRun = 0
             for (y in 0 until rows) {
                 var currentRun = 0
                 val rowOffset = y * cols
                 for (x in 0 until cols) {
-                    if (flat[rowOffset + x].toInt() != 0) {
+                    // Fixed threshold, not Otsu: this strip is mostly blank paper with a thin
+                    // dark line, too skewed a histogram for Otsu to split reliably.
+                    if ((flat[rowOffset + x].toInt() and 0xFF) < DARK_PIXEL_THRESHOLD) {
                         currentRun++
                         if (currentRun > longestRun) longestRun = currentRun
                     } else {
@@ -184,9 +185,8 @@ object HandwritingDetector {
                     }
                 }
             }
-            return longestRun > rect.width * 1.25
+            return longestRun > rect.width * 1.2
         } finally {
-            binaryBand.release()
             band.release()
         }
     }
@@ -195,11 +195,17 @@ object HandwritingDetector {
      * How much each letter's own tilt varies from the next, WITHIN this one word — a signal
      * intrinsic to the ink shape itself, independent of position/underline/color, so it still
      * fires on handwriting that isn't sitting on a fill-in-blank line. A printed font renders
-     * the exact same glyph outline every time a letter repeats, so every "tall" stroke (a
-     * letter's main vertical, not a dot or serif fleck) sits at the same angle across the whole
-     * word; a human hand never repeats a stroke at a perfectly identical angle twice.
+     * the exact same glyph outline every time a letter repeats, so every stroke sits at the same
+     * angle across the whole word; a human hand never repeats a stroke at a perfectly identical
+     * angle twice.
+     *
+     * Deliberately NOT filtered to "tall" strokes only: the fill-in-blank answers on a real
+     * worksheet are mostly short 2-4 letter words ("he", "it", "us", "they"...), which often
+     * have zero or one component tall enough to pass a height filter — that filter silently
+     * starved this signal on exactly the majority case. Using every component with a minimum
+     * area instead means even a two-letter word usually has enough data points.
      */
-    private fun componentAngleVariationScore(binaryInk: Mat, wordHeight: Int): Double {
+    private fun componentAngleVariationScore(binaryInk: Mat): Double {
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         val angleDeviations = ArrayList<Double>()
@@ -207,9 +213,7 @@ object HandwritingDetector {
             Imgproc.findContours(binaryInk, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
             for (contour in contours) {
                 val points = contour.toArray()
-                val boundingRect = Geometry.boundingRect(contour)
-                // Only "tall" strokes carry a meaningful dominant angle — skip dots/serifs/noise.
-                if (boundingRect.height >= wordHeight * 0.4 && points.size >= 5) {
+                if (points.size >= 5 && Geometry.contourArea(contour) >= MIN_COMPONENT_AREA) {
                     val contour2f = MatOfPoint2f(*points)
                     val angle = Geometry.minAreaRect(contour2f).angle
                     contour2f.release()
