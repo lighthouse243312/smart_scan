@@ -361,7 +361,16 @@ class ImageProcessingService {
     for (var i = 0; i < regions.length; i++) {
       final region = regions[i];
       if (region.selectedForErase || region.isManual) continue;
-      final looksLikePrint = region.debugBreakdown?.cappedByStraightness ?? false;
+      // `cappedByStraightness` only covers the two SPECIFIC ceilings (dead-straight angle, or
+      // page-ink match) — a region can fail both of those on a technicality while its own raw
+      // blended score already sits confidently near zero (both the CNN and the heuristic
+      // independently agreeing it's print). Verified: a region at final confidence 0.06 (ml:0.00,
+      // heuristic:0.22) still got erased by this boost, because its angle (0.25) was too high to
+      // trip the straightness ceiling and its stroke deviation (0.46) was just over the page-ink
+      // ceiling — neither ceiling's specific condition matched, even though the region's own
+      // score already said print about as clearly as this blend ever does. A flat confidence
+      // floor catches that case without needing a new named ceiling for it.
+      final looksLikePrint = (region.debugBreakdown?.cappedByStraightness ?? false) || region.confidence < 0.1;
       if (looksLikePrint) continue;
       final expanded = region.boundingBox.inflate(proximityPx);
       final hasConfidentHandwritingNeighbor = regions.any(
