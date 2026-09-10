@@ -10,6 +10,7 @@
 
 #import <algorithm>
 #import <set>
+#import <utility>
 
 #import <Foundation/Foundation.h>
 #import "ImageProcessingOpenCV.h"
@@ -91,6 +92,14 @@ struct RegionStats {
     double inkColorR = 0.0;
     double inkIntensityStdDev = 0.0;
     bool hasWideUnderline = false;
+    // False when there weren't even 2 qualifying stroke components to compare angles across (a
+    // tiny fragment — one short stroke, a single curl) — angleVariationScore is then a
+    // meaningless 0.0 placeholder, NOT a measurement of "this is dead straight." Dart's
+    // straightness ceiling must see this to avoid treating "no data" the same as "definitely
+    // print" — verified: a real handwriting fragment this small (the tail end of a word, split
+    // off during merging) got angle 0.0 from having only one stroke to look at, and was capped
+    // to a near-zero score as if it were confidently straight print.
+    bool hasReliableAngleData = false;
     bool hasInk = false;
 };
 
@@ -120,18 +129,23 @@ static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
 
     cv::Mat band = gray(cv::Rect(bandLeft, bandTop, bandWidth, bandBottom - bandTop));
 
+    double minRunLength = rect.width * 1.2;
     int longestRun = 0;
+    int qualifyingRows = 0;
     for (int y = 0; y < band.rows; y++) {
         const uchar *row = band.ptr<uchar>(y);
         int currentRun = 0;
+        int rowLongestRun = 0;
         for (int x = 0; x < band.cols; x++) {
             if (row[x] < kDarkPixelThreshold) {
                 currentRun++;
-                if (currentRun > longestRun) longestRun = currentRun;
+                if (currentRun > rowLongestRun) rowLongestRun = currentRun;
             } else {
                 currentRun = 0;
             }
         }
+        if (rowLongestRun > longestRun) longestRun = rowLongestRun;
+        if (rowLongestRun >= minRunLength) qualifyingRows++;
     }
     // A page-wide printed divider/rule (a header underline, a section separator) passes right
     // through this local band exactly like a fill-in-blank's own underline would — verified: a
@@ -139,7 +153,19 @@ static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
     // this way. The distinguishing fact is absolute scale: a rule line spans nearly the whole
     // page regardless of which word happens to sit near it; a real answer blank is sized for one
     // answer and is always far short of that.
-    return longestRun > rect.width * 1.2 && longestRun < gray.cols * 0.7;
+    //
+    // A genuine ruled line is thin but SOLID — every row it passes through has the same long
+    // dark run, because it's one continuous stroke. A dense row of separate print glyphs (a
+    // calendar's date grid) can, on ONE lucky scanline through several characters' mid-bodies,
+    // coincidentally produce a single long run too — verified: an entire un-detected row of
+    // calendar dates, treated as one merged "orphan" blob and split into per-character chunks,
+    // had this fire on nearly every chunk purely because the row of digits below happened to
+    // align that way on one scanline, even though the chunks' own strokes were perfectly
+    // straight print. Requiring the long run to persist across MOST of the band's rows — not
+    // just its single best one — keeps the real ruled-line case (solid on every row) while
+    // rejecting a row of glyphs (long on at most a couple of coincidental rows).
+    bool sustained = qualifyingRows >= std::max(2.0, band.rows * 0.6);
+    return sustained && longestRun < gray.cols * 0.7;
 }
 
 /**
@@ -155,7 +181,7 @@ static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
  * signal on exactly the majority case. Using every component with a minimum area instead means
  * even a two-letter word usually has enough data points.
  */
-static double ComponentAngleVariationScore(const cv::Mat &binaryInk) {
+static std::pair<double, bool> ComponentAngleVariationScore(const cv::Mat &binaryInk) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binaryInk, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
@@ -169,7 +195,7 @@ static double ComponentAngleVariationScore(const cv::Mat &binaryInk) {
             angleDeviations.push_back(std::min(mod90, 90.0 - mod90));
         }
     }
-    if (angleDeviations.size() < 2) return 0.0;
+    if (angleDeviations.size() < 2) return {0.0, false};
 
     double sum = 0.0;
     for (double a : angleDeviations) sum += a;
@@ -179,7 +205,7 @@ static double ComponentAngleVariationScore(const cv::Mat &binaryInk) {
     variance /= angleDeviations.size();
     double stdDev = std::sqrt(variance);
     // Degrees; not tuned against a labeled dataset yet.
-    return std::min(1.0, std::max(0.0, stdDev / 12.0));
+    return {std::min(1.0, std::max(0.0, stdDev / 12.0)), true};
 }
 
 /// Stroke Width Transform-style measurement (Epshtein et al.) — printed fonts render every
@@ -248,7 +274,11 @@ static RegionStats ScoreRegion(const cv::Mat &color, const cv::Mat &gray, const 
     double ratio = componentCount / safeCharCount;
     double ratioScore = std::min(1.0, std::max(0.0, 1.0 - ratio));
 
-    double angleScore = ComponentAngleVariationScore(binary);
+    // Not `auto [a, b] = ...` (C++17 structured bindings) — this project compiles as gnu++0x
+    // (C++11); see kOrphanMergeDilate*'s doc comment for the same constraint hitting std::clamp.
+    std::pair<double, bool> angleResult = ComponentAngleVariationScore(binary);
+    double angleScore = angleResult.first;
+    bool hasReliableAngleData = angleResult.second;
 
     double avgStrokeWidth = 0.0;
     if (!strokeWidthsPerComponent.empty()) {
@@ -275,6 +305,7 @@ static RegionStats ScoreRegion(const cv::Mat &color, const cv::Mat &gray, const 
     result.inkColorR = inkColor[2];
     result.inkIntensityStdDev = intensityStdDev[0];
     result.hasWideUnderline = HasWideUnderlineBelow(gray, rect);
+    result.hasReliableAngleData = hasReliableAngleData;
     result.hasInk = true;
     return result;
 }
@@ -298,7 +329,7 @@ static RegionStats ScoreRegion(const cv::Mat &color, const cv::Mat &gray, const 
 
     return WriteOrFail(sharpened, outputPath, error);
 }
-
+                                                                                   
 + (BOOL)rotateAtPath:(NSString *)inputPath
            outputPath:(NSString *)outputPath
 quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
@@ -387,6 +418,16 @@ static const double kOrphanExistingBlockPaddingPx = 6.0;
 // near-square chunks instead of handing the classifier one long, badly-squashed strip — the same
 // reasoning as not classifying whole LINES in the ML-Kit path.
 static const double kOrphanMaxAspectRatio = 2.5;
+// A real run-on handwritten phrase, even badly merged, is at most a handful of words — past this
+// many equal-width slices it's no longer plausibly one phrase at all. Verified: an entire
+// un-detected row of tightly-packed calendar digits (a whole week's dates, or a weekday-header
+// row like "S M T W T F S") merges into ONE wide blob just like a genuine phrase would, then
+// slices into 14-17 near-identical small chunks — each one individually ambiguous (uniform
+// uncropped height regardless of that slice's actual glyph, unlike a real per-word crop) and
+// collectively nothing like the classifier's actual training data. Above this count it's far
+// more likely one mis-merged row of separate print characters than anything resembling a phrase,
+// so skip the whole blob rather than manufacture chunks for it.
+static const int kOrphanMaxChunkCount = 6;
 
 /// Derives the merge-dilation kernel size from the RAW (undilated) unclaimed ink's own measured
 /// letter-fragment height, so it self-calibrates to however the photo was framed — see the
@@ -478,6 +519,7 @@ static int MeasureOrphanMergeDilatePx(const cv::Mat &unclaimed, int imageWidth) 
         double aspectRatio = (double)tight.width / MAX(1, tight.height);
         if (aspectRatio > kOrphanMaxAspectRatio) {
             int chunkCount = MAX(2, (int)aspectRatio);
+            if (chunkCount > kOrphanMaxChunkCount) continue;
             int chunkWidth = tight.width / chunkCount;
             for (int i = 0; i < chunkCount; i++) {
                 int chunkLeft = absLeft + i * chunkWidth;
@@ -535,6 +577,7 @@ static int MeasureOrphanMergeDilatePx(const cv::Mat &unclaimed, int imageWidth) 
             @"inkColorR" : @(stats.inkColorR),
             @"inkIntensityStdDev" : @(stats.inkIntensityStdDev),
             @"hasWideUnderline" : @(stats.hasWideUnderline),
+            @"hasReliableAngleData" : @(stats.hasReliableAngleData),
             @"hasInk" : @(stats.hasInk),
         }];
     }
@@ -671,6 +714,7 @@ static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Ma
 + (BOOL)eraseRegionsAtPath:(NSString *)inputPath
                  outputPath:(NSString *)outputPath
                       rects:(NSArray<NSDictionary<NSString *, id> *> *)rects
+                  keepRects:(NSArray<NSDictionary<NSString *, id> *> *)keepRects
                     padding:(double)padding
               inpaintRadius:(double)inpaintRadius
                       error:(NSError **)error {
@@ -690,6 +734,21 @@ static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Ma
             return NO;
         }
         PaintInkMask(rect, gray, inkMask, labels, stats, numLabels, &mask);
+    }
+
+    // A region explicitly classified as print — NOT selected for erase — carved back out of the
+    // mask, no matter how it got painted in. Verified: real handwriting directly touching a
+    // correctly-classified printed digit (their boxes literally overlapped) still eroded part of
+    // that digit, because nothing upstream of this point has any notion of "this pixel belongs
+    // to a DIFFERENT, kept region" — painting is driven entirely by proximity to the word being
+    // erased. This is the one place that can enforce it unconditionally, after everything else
+    // has already run.
+    for (NSDictionary<NSString *, id> *keepMap in keepRects) {
+        cv::Rect keepRect;
+        if (!MapToClippedRect(keepMap, src.cols, src.rows, 0.0, &keepRect, error)) {
+            return NO;
+        }
+        cv::rectangle(mask, keepRect, cv::Scalar(0), -1);
     }
 
     cv::Mat dst;

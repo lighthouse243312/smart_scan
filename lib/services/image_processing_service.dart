@@ -109,6 +109,12 @@ class ImageProcessingService {
         }
 
         final inkedRegions = allRegions.where((r) => stats[r.id]?.hasInk ?? false).toList();
+        // The page's own typical text-line height, at whatever resolution/zoom this particular
+        // photo happens to be — a fixed pixel gap can't tell "touching letters" from "two
+        // unrelated words three lines apart" once the same physical page is photographed at a
+        // very different zoom level (see OrphanInkDetector's merge-dilation fix for the same
+        // lesson, hit earlier this session, applied here too).
+        final referenceRegionHeight = _median(inkedRegions.map((r) => r.boundingBox.height).toList());
         final referenceStrokeWidth = _median(inkedRegions.map((r) => normalizedStrokeWidth(stats[r.id]!, r)).toList());
         final inked = inkedRegions.map((r) => stats[r.id]!).toList();
         final referenceIntensityStdDev = _median(inked.map((s) => s.inkIntensityStdDev).toList());
@@ -144,10 +150,32 @@ class ImageProcessingService {
                   0.10 * strokeWidthDeviation +
                   0.10 * s.confidence)
               .clamp(0.0, 1.0);
-          // The trained CNN is the primary signal; the heuristic (pixel stats self-calibrated
-          // against this page's own printed text) stays as a secondary vote.
+          // A word-or-phrase crop is reliably WIDER than tall; a single character (a digit, a
+          // lone weekday-header letter) is roughly as wide as it is tall or narrower. Computed
+          // up front because it also gates how much weight the CNN gets, below.
+          final isSplitChunk = RegExp(r'^orphan_\d+_\d+$').hasMatch(r.id);
+          final aspectRatio = r.boundingBox.height > 0 ? r.boundingBox.width / r.boundingBox.height : 0.0;
+          final isGlyphShaped = aspectRatio > 0 && aspectRatio < 1.3;
+          // Only distrust the CNN's shape-based read on a glyph when the ink COLOR also fails to
+          // rule out print (verified this needed adding: a real single-character handwriting
+          // fragment — colorDeviation 1.00, about as far from the page's print reference as this
+          // scale goes — still got under-scored and left unerased, because the blanket CNN-weight
+          // cut below applied to every glyph-shaped box regardless of what its ink actually
+          // looked like). A color that clearly isn't the page's print ink is real independent
+          // evidence of a pen mark that a print font, however unusually shaped, cannot produce.
+          final glyphColorMatchesPage = isGlyphShaped && colorDeviation <= 0.35;
+          // The trained CNN is the primary signal in general — but it was trained on realistic
+          // word/phrase crops, never truly isolated single characters, and it shows: verified on
+          // a real calendar whose month numerals (1-12) and weekday-header letters (S M T W T F
+          // S) are printed in a casual script-style font — the CNN repeatedly scored individual
+          // digits and letters from that font as handwriting with near-1.0 confidence, on shape
+          // alone, despite their ink matching the page's own print in every physical measurement
+          // (stroke width, color, darkness). Cut the CNN's weight for anything glyph-shaped AND
+          // lean more on the heuristic, which is self-calibrated against this exact page's own
+          // print rather than a fixed training set that never saw this font's single characters.
+          final mlWeight = glyphColorMatchesPage ? 0.35 : 0.75;
           final ml = mlConfidence[r.id] ?? heuristic;
-          final weighted = (0.75 * ml + 0.25 * heuristic).clamp(0.0, 1.0);
+          final weighted = (mlWeight * ml + (1 - mlWeight) * heuristic).clamp(0.0, 1.0);
           // Printed glyphs repeat the exact same stroke angle; a real hand never does — verified
           // directly on a case that fooled the CNN (several calendar date numbers merged by the
           // text recognizer into one garbled multi-digit block, which the CNN read as irregular
@@ -155,7 +183,24 @@ class ImageProcessingService {
           // but-still-printed blocks vs a consistent ~1.0 for genuine handwriting in the same
           // photo. That's a wide enough margin to treat a very low score as near-certain print,
           // overriding the CNN — a ceiling, mirroring hasWideUnderline's floor on the other side.
-          final cappedByStraightness = s.angleVariationScore <= 0.15 ? min(weighted, 0.2) : weighted;
+          //
+          // Capped to 0.08, not the more conventional-looking 0.2: an orphan region (ML Kit
+          // never read it at all) is held to an aggressive 0.15 bar specifically because ML
+          // Kit's own failure is itself near-certain evidence of handwriting — verified this cap
+          // has to clear THAT bar too, not just the normal 0.5 one, or it does nothing for
+          // exactly the orphans it exists to protect: a whole un-detected row of straight-print
+          // calendar digits, each one correctly identified as straight print and capped to 0.2,
+          // still read as 0.2 > 0.15 and got erased anyway — the cap's own value was silently
+          // higher than one of the two bars it needs to sit under.
+          // Gated on hasReliableAngleData: with fewer than 2 measurable stroke components (a
+          // tiny fragment — one short stroke, a single curl, often the split-off tail end of a
+          // word during merging), angleVariationScore is a meaningless 0.0 placeholder, not a
+          // measurement of "this is dead straight" — verified: a real handwriting fragment this
+          // small got capped to near-zero purely for lacking enough data to measure, not because
+          // anything about it actually looked like print.
+          final cappedByStraightness = s.hasReliableAngleData && s.angleVariationScore <= 0.15
+              ? min(weighted, 0.08)
+              : weighted;
           // A second, independent ceiling for a shape the CNN reads as unusual but whose INK
           // physically matches this page's own established print: same stroke thickness, same
           // color, same darkness consistency as every other word already confirmed print on this
@@ -169,8 +214,32 @@ class ImageProcessingService {
           // the same source (pen or printer) as the rest of the page can't drift far from the
           // page's own reference on all three at once. Real handwriting reliably differs in at
           // least one.
-          final matchesPageInk = strokeWidthDeviation <= 0.15 && colorDeviation <= 0.15 && intensityDeviation <= 0.1;
-          final cappedByPageInk = matchesPageInk ? min(cappedByStraightness, 0.2) : cappedByStraightness;
+          // Thresholds loosened from an initial 0.15/0.15/0.10 based on a real debug dump: this
+          // calendar's month-NAME titles ("July", "September"...) render their letters touching/
+          // connected (a script-style print font), which starves angleVariationScore of enough
+          // separate contours to be reliable (see hasReliableAngleData) — leaving THIS ceiling as
+          // the only one that could still catch them, and it was missing them too. The actual
+          // dump showed confirmed real handwriting consistently landing at colorDeviation >= 0.37,
+          // while these print titles sat at 0.18-0.35 — a clean gap — with strokeWidthDeviation
+          // and intensityDeviation showing similarly clean separation once checked against the
+          // same data. Retuned to sit just past the print side of each observed gap.
+          // strokeWidthDeviation raised to match colorDeviation's 0.35 after a real dump showed
+          // a genuine print title ("July", colorDeviation 0.05 — about as close to the page's
+          // print reference as it gets) narrowly missing this ceiling on stroke width alone
+          // (0.31, just over the old 0.3), while every confirmed real handwriting sample so far
+          // still sits at 0.48+ — comfortably clear of 0.35.
+          final matchesPageInk = strokeWidthDeviation <= 0.35 && colorDeviation <= 0.35 && intensityDeviation <= 0.15;
+          // Same 0.08 reasoning as cappedByStraightness above — must clear the orphan bar too.
+          final cappedByPageInk = matchesPageInk ? min(cappedByStraightness, 0.08) : cappedByStraightness;
+          // The real "is there physical evidence this is print" signal — NOT "did capping change
+          // the number." Those aren't the same thing: a region whose ml+heuristic blend was
+          // ALREADY very low on its own (no cap needed to get it there) has just as much of a
+          // print-straightness/page-ink match as one that needed the cap, but "value changed"
+          // reads false for it. Verified this exact gap let a confidently-print word (its own
+          // angle already <=0.15, needing no capping since its raw score was already near zero)
+          // get erased anyway by the neighbor-boost below, which used the old "did it change"
+          // proxy to decide whether a region already had print evidence.
+          final looksLikePrint = (s.hasReliableAngleData && s.angleVariationScore <= 0.15) || matchesPageInk;
           // A word sitting on a fill-in-blank's own pre-printed line is close to certain to be
           // handwriting — a floor, not just one more diluted vote among many. Also the one signal
           // here the CNN structurally can't see, since it only looks at the word's own crop.
@@ -196,9 +265,7 @@ class ImageProcessingService {
           // real handwritten word or phrase is reliably wider than that — so only a
           // multi-character-shaped orphan gets the aggressive bar; a single-glyph-shaped one is
           // held to the same standard as any ML-Kit-recognized word.
-          final isSplitChunk = RegExp(r'^orphan_\d+_\d+$').hasMatch(r.id);
-          final aspectRatio = r.boundingBox.height > 0 ? r.boundingBox.width / r.boundingBox.height : 0.0;
-          final isSingleGlyphScale = r.id.startsWith('orphan_') && !isSplitChunk && aspectRatio < 1.3;
+          final isSingleGlyphScale = r.id.startsWith('orphan_') && !isSplitChunk && isGlyphShaped;
           final threshold = r.id.startsWith('orphan_') && !isSingleGlyphScale ? 0.15 : 0.5;
           final isHandwriting = blended > threshold;
           return TextRegion(
@@ -219,12 +286,13 @@ class ImageProcessingService {
               strokeWidthDeviation: strokeWidthDeviation,
               hasWideUnderline: s.hasWideUnderline,
               matchesPageInk: matchesPageInk,
-              cappedByStraightness: cappedByPageInk != weighted,
+              cappedByStraightness: looksLikePrint,
             ),
           );
         }).toList();
 
         _unionSplitSiblings(scored);
+        _boostSpatialNeighbors(scored, referenceRegionHeight);
         return scored;
       });
 
@@ -233,8 +301,18 @@ class ImageProcessingService {
   /// `orphan_5_1`, ...). Each is scored independently, but a low-ink or awkwardly-cut chunk can
   /// individually miss the >0.5 bar even though its siblings clearly don't — verified: exactly
   /// this left small unerased ink fragments scattered through an otherwise-erased handwritten
-  /// note. Once ANY sibling reads as handwriting, treat them all as one unit for erasure so a
-  /// slice a coin-flip away from the threshold doesn't leave a gap in the middle of one phrase.
+  /// note. Once ANY sibling reads as handwriting, treat the merely-LOW-scoring ones as part of
+  /// the same unit so a slice a coin-flip away from the threshold doesn't leave a gap in the
+  /// middle of one phrase.
+  ///
+  /// Excludes a sibling that was actively CAPPED (cappedByStraightness in its debug breakdown) —
+  /// that isn't "just below the bar," it's the straightness/page-ink ceiling having found actual
+  /// physical evidence this specific chunk is print, independent of what its neighbors are.
+  /// Verified: real handwriting sitting immediately next to unrelated print merged into one
+  /// orphan blob (adjacent, not overlapping) split into several chunks — one genuinely
+  /// handwritten (high angle variation, correctly flagged) and the rest genuinely straight print
+  /// (correctly capped) — and this union used to force-erase the print chunks too just because
+  /// they shared a merge blob with a real handwriting neighbor.
   void _unionSplitSiblings(List<TextRegion> regions) {
     final bySplitGroup = <String, List<int>>{};
     for (var i = 0; i < regions.length; i++) {
@@ -244,10 +322,56 @@ class ImageProcessingService {
     for (final indices in bySplitGroup.values) {
       if (indices.any((i) => regions[i].selectedForErase)) {
         for (final i in indices) {
-          if (!regions[i].selectedForErase) {
-            regions[i] = regions[i].copyWith(selectedForErase: true);
+          final region = regions[i];
+          final looksLikePrint = region.debugBreakdown?.cappedByStraightness ?? false;
+          if (!region.selectedForErase && !looksLikePrint) {
+            regions[i] = region.copyWith(selectedForErase: true);
           }
         }
+      }
+    }
+  }
+
+  /// Generalizes [_unionSplitSiblings] from "pieces of the same native merge blob" to ANY two
+  /// regions that simply sit next to each other on the page — a human reading the page doesn't
+  /// need two letters to have come from the same upstream merge step to see they're part of the
+  /// same handwritten word; physical adjacency alone is the evidence. Verified: a single letter
+  /// inside a real handwritten word (touching-distance from an already-confirmed handwriting
+  /// neighbor, its own angle-variation score showing real irregularity) still got missed because
+  /// the CNN, on that one small glyph crop in isolation, read it as print — exactly the class of
+  /// single-character crop the CNN was never trained on and is least reliable about (see the
+  /// glyph-shaped mlWeight cut above, same root cause, opposite failure direction).
+  ///
+  /// A region only borrows confidence from a neighbor when it isn't ALREADY confidently print
+  /// (cappedByStraightness) — proximity to real handwriting is corroborating context for an
+  /// otherwise-ambiguous glyph, not permission to override a ceiling that found actual physical
+  /// evidence. This is what keeps it from repeating the exact bug [Inpainter]'s keepRects
+  /// protection exists for (real handwriting eating an adjacent, confidently-print digit) — that
+  /// protection stays in place regardless, since it acts on selectedForErase after this runs.
+  void _boostSpatialNeighbors(List<TextRegion> regions, double referenceRegionHeight) {
+    // A fraction of this page's OWN typical text height, not a fixed pixel count — a photo
+    // zoomed in tight on the handwriting puts real letter-to-letter gaps at many times more
+    // pixels than the same gap in a whole-page shot. Falls back to a small fixed value only if
+    // there's no reference at all (e.g. a page with no other detected text to measure from).
+    final proximityPx = referenceRegionHeight > 0 ? referenceRegionHeight * 0.4 : 20.0;
+    // Only a CONFIRMED neighbor counts — one comfortably past the erase threshold on its own
+    // merits, not one that itself only got there via this same boost (which could otherwise
+    // chain arbitrarily far across a whole page of touching print).
+    const confidentNeighborThreshold = 0.7;
+    for (var i = 0; i < regions.length; i++) {
+      final region = regions[i];
+      if (region.selectedForErase || region.isManual) continue;
+      final looksLikePrint = region.debugBreakdown?.cappedByStraightness ?? false;
+      if (looksLikePrint) continue;
+      final expanded = region.boundingBox.inflate(proximityPx);
+      final hasConfidentHandwritingNeighbor = regions.any(
+        (other) =>
+            !identical(other, region) &&
+            other.confidence >= confidentNeighborThreshold &&
+            expanded.overlaps(other.boundingBox),
+      );
+      if (hasConfidentHandwritingNeighbor) {
+        regions[i] = region.copyWith(selectedForErase: true);
       }
     }
   }
@@ -266,9 +390,15 @@ class ImageProcessingService {
     return sorted.length.isOdd ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
   }
 
-  Future<String> eraseRegions(String inputPath, List<Rect> rects) => _run(() async {
+  Future<String> eraseRegions(String inputPath, List<Rect> rects, {List<Rect> keepRects = const []}) =>
+      _run(() async {
         final outputPath = await TempPaths.next('erased.png');
-        return ImageProcessingChannel.eraseRegions(inputPath: inputPath, outputPath: outputPath, rects: rects);
+        return ImageProcessingChannel.eraseRegions(
+          inputPath: inputPath,
+          outputPath: outputPath,
+          rects: rects,
+          keepRects: keepRects,
+        );
       });
 
   Future<T> _run<T>(Future<T> Function() action) async {

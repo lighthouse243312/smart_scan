@@ -121,7 +121,16 @@ class ScanSession extends ChangeNotifier {
     if (page == null) return;
     final rects = page.textRegions.where((r) => r.selectedForErase).map((r) => r.boundingBox).toList();
     if (rects.isEmpty) return;
-    final result = await _guarded(() => _imageProcessingService.eraseRegions(page.displayPath, rects));
+    // Regions explicitly NOT selected — i.e. already decided to be print — carved back out of
+    // whatever mask the erase step builds. Verified: a real handwritten word directly touching a
+    // correctly-classified printed digit (their boxes literally overlapped) still ate part of
+    // that digit, because the native erase step has no concept of "this pixel belongs to a
+    // DIFFERENT, kept region" — it only sees ink to fill in near the word it's erasing. Passing
+    // every kept box through means the final mask can never touch them, regardless of how it was
+    // built.
+    final keepRects = page.textRegions.where((r) => !r.selectedForErase).map((r) => r.boundingBox).toList();
+    final result =
+        await _guarded(() => _imageProcessingService.eraseRegions(page.displayPath, rects, keepRects: keepRects));
     if (result == null) return;
     _pages[currentPageIndex] = page.copyWith(finalPath: result);
     step = ScanStep.export;

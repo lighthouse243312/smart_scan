@@ -70,10 +70,11 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
 + (BOOL)eraseRegionsAtPath:(NSString *)inputPath
                  outputPath:(NSString *)outputPath
                       rects:(NSArray<NSDictionary<NSString *, id> *> *)rects
+                  keepRects:(NSArray<NSDictionary<NSString *, id> *> *)keepRects
                     padding:(double)padding
               inpaintRadius:(double)inpaintRadius
                       error:(NSError **)error
-    NS_SWIFT_NAME(eraseRegions(atPath:outputPath:rects:padding:inpaintRadius:));
+    NS_SWIFT_NAME(eraseRegions(atPath:outputPath:rects:keepRects:padding:inpaintRadius:));
 
 @end
 

@@ -94,7 +94,7 @@ class _RegionOverlayState extends State<RegionOverlay> {
               : null,
           child: CustomPaint(
             size: Size(constraints.maxWidth, constraints.maxHeight),
-            painter: _RegionPainter(
+            painter: RegionPainter(
               regions: widget.regions,
               scale: scale,
               dragStart: _dragStart,
@@ -122,7 +122,7 @@ class _RegionOverlayState extends State<RegionOverlay> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Text('final: ${region.confidence.toStringAsFixed(3)}'
-                            '  (${region.isLikelyHandwriting ? "handwriting" : "print"})'),
+                            '  (${region.selectedForErase ? "will erase" : "keeping"})'),
                         const Divider(),
                         Text('ml confidence: ${debug.mlConfidence.toStringAsFixed(3)}'),
                         Text('heuristic: ${debug.heuristic.toStringAsFixed(3)}'),
@@ -146,13 +146,35 @@ class _RegionOverlayState extends State<RegionOverlay> {
   }
 }
 
-class _RegionPainter extends CustomPainter {
-  _RegionPainter({required this.regions, required this.scale, this.dragStart, this.dragCurrent});
+/// Builds the same multi-line debug-score label shown on the overlay, for reuse anywhere that
+/// needs the identical text (e.g. compositing it into a full-resolution exported image).
+String buildRegionDebugLabel(TextRegion region) {
+  final debug = region.debugBreakdown;
+  if (region.isManual) return 'manual';
+  if (debug == null) return region.confidence.toStringAsFixed(2);
+  return 'f:${region.confidence.toStringAsFixed(2)} '
+      'ml:${debug.mlConfidence.toStringAsFixed(2)} '
+      'h:${debug.heuristic.toStringAsFixed(2)}\n'
+      'ang:${debug.angleVariationScore.toStringAsFixed(2)} '
+      'col:${debug.colorDeviation.toStringAsFixed(2)} '
+      'int:${debug.intensityDeviation.toStringAsFixed(2)}\n'
+      'stroke:${debug.strokeWidthDeviation.toStringAsFixed(2)}'
+      '${debug.hasWideUnderline ? " underline" : ""}'
+      '${debug.matchesPageInk ? " pageInk" : ""}'
+      '${debug.cappedByStraightness ? " CAPPED" : ""}';
+}
+
+/// Public (not the screen-only `_RegionPainter` it used to be) so a full-resolution export can
+/// reuse the exact same box/label drawing at scale 1.0 with a larger [fontSize] — the on-screen
+/// use keeps the small default, sized for the phone's own logical pixels.
+class RegionPainter extends CustomPainter {
+  RegionPainter({required this.regions, required this.scale, this.dragStart, this.dragCurrent, this.fontSize = 8});
 
   final List<TextRegion> regions;
   final double scale;
   final Offset? dragStart;
   final Offset? dragCurrent;
+  final double fontSize;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -184,25 +206,11 @@ class _RegionPainter extends CustomPainter {
       // at a time. Two rounds of blind reweighting this session each fixed one real case and
       // broke another; this exists so the next fix is aimed at the actual number, not a guess.
       if (kDebugMode) {
-        final debug = region.debugBreakdown;
-        final label = region.isManual
-            ? 'manual'
-            : debug == null
-                ? region.confidence.toStringAsFixed(2)
-                : 'f:${region.confidence.toStringAsFixed(2)} '
-                    'ml:${debug.mlConfidence.toStringAsFixed(2)} '
-                    'h:${debug.heuristic.toStringAsFixed(2)}\n'
-                    'ang:${debug.angleVariationScore.toStringAsFixed(2)} '
-                    'col:${debug.colorDeviation.toStringAsFixed(2)} '
-                    'int:${debug.intensityDeviation.toStringAsFixed(2)}\n'
-                    'stroke:${debug.strokeWidthDeviation.toStringAsFixed(2)}'
-                    '${debug.hasWideUnderline ? " underline" : ""}'
-                    '${debug.matchesPageInk ? " pageInk" : ""}'
-                    '${debug.cappedByStraightness ? " CAPPED" : ""}';
+        final label = buildRegionDebugLabel(region);
         final painter = TextPainter(
           text: TextSpan(
             text: label,
-            style: const TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold, height: 1.2),
+            style: TextStyle(fontSize: fontSize, color: Colors.white, fontWeight: FontWeight.bold, height: 1.2),
           ),
           textDirection: TextDirection.ltr,
         )..layout();
@@ -229,7 +237,7 @@ class _RegionPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _RegionPainter oldDelegate) {
+  bool shouldRepaint(covariant RegionPainter oldDelegate) {
     return oldDelegate.regions != regions ||
         oldDelegate.dragStart != dragStart ||
         oldDelegate.dragCurrent != dragCurrent;

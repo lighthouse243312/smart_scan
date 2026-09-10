@@ -58,6 +58,16 @@ object OrphanInkDetector {
     // word-sized, near-square chunks instead of handing the classifier one long, badly-squashed
     // strip — the same reasoning as not classifying whole LINES in the ML-Kit path.
     private const val MAX_ASPECT_RATIO = 2.5
+    // A real run-on handwritten phrase, even badly merged, is at most a handful of words — past
+    // this many equal-width slices it's no longer plausibly one phrase at all. Verified: an
+    // entire un-detected row of tightly-packed calendar digits (a whole week's dates, or a
+    // weekday-header row like "S M T W T F S") merges into ONE wide blob just like a genuine
+    // phrase would, then slices into 14-17 near-identical small chunks — each one individually
+    // ambiguous (uniform uncropped height regardless of that slice's actual glyph, unlike a
+    // real per-word crop) and collectively nothing like the classifier's actual training data.
+    // Above this count it's far more likely one mis-merged row of separate print characters than
+    // anything resembling a phrase, so skip the whole blob rather than manufacture chunks for it.
+    private const val MAX_CHUNK_COUNT = 6
 
     fun detect(imagePath: String, existingRects: List<Map<String, Any>>): List<Map<String, Any>> {
         val src = ImageIO.readOrThrow(imagePath)
@@ -130,6 +140,7 @@ object OrphanInkDetector {
                 val aspectRatio = tw.toDouble() / max(1, th)
                 if (aspectRatio > MAX_ASPECT_RATIO) {
                     val chunkCount = aspectRatio.toInt().coerceAtLeast(2)
+                    if (chunkCount > MAX_CHUNK_COUNT) continue
                     val chunkWidth = tw / chunkCount
                     for (i in 0 until chunkCount) {
                         val chunkLeft = absLeft + i * chunkWidth

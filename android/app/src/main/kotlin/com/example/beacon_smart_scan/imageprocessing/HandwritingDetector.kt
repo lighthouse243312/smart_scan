@@ -45,6 +45,14 @@ object HandwritingDetector {
         val inkColorR: Double,
         val inkIntensityStdDev: Double,
         val hasWideUnderline: Boolean,
+        // False when there weren't even 2 qualifying stroke components to compare angles across
+        // (a tiny fragment — one short stroke, a single curl) — angleVariationScore is then a
+        // meaningless 0.0 placeholder, NOT a measurement of "this is dead straight." Dart's
+        // straightness ceiling must see this to avoid treating "no data" the same as "definitely
+        // print" — verified: a real handwriting fragment this small (the tail end of a word,
+        // split off during merging) got angle 0.0 from having only one stroke to look at, and
+        // was capped to a near-zero score as if it were confidently straight print.
+        val hasReliableAngleData: Boolean,
         val hasInk: Boolean,
     )
 
@@ -70,6 +78,7 @@ object HandwritingDetector {
                     "inkColorR" to stats.inkColorR,
                     "inkIntensityStdDev" to stats.inkIntensityStdDev,
                     "hasWideUnderline" to stats.hasWideUnderline,
+                    "hasReliableAngleData" to stats.hasReliableAngleData,
                     "hasInk" to stats.hasInk,
                 )
             }
@@ -87,14 +96,17 @@ object HandwritingDetector {
             Imgproc.threshold(crop, binary, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
             if (Core.countNonZero(binary) < MIN_INK_PIXELS) {
                 // too little ink in this box to say anything meaningful
-                return RegionStats(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, hasWideUnderline = false, hasInk = false)
+                return RegionStats(
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    hasWideUnderline = false, hasReliableAngleData = false, hasInk = false,
+                )
             }
 
             val (strokeWidthsPerComponent, componentCount) = perComponentStrokeWidths(binary)
             val avgStrokeWidth = if (strokeWidthsPerComponent.isEmpty()) 0.0 else strokeWidthsPerComponent.average()
             val strokeScore = strokeVariationAcrossComponentsScore(strokeWidthsPerComponent)
             val ratioScore = componentCountRatioScore(componentCount, charCount)
-            val angleScore = componentAngleVariationScore(binary)
+            val (angleScore, hasReliableAngleData) = componentAngleVariationScore(binary)
             val inkColor = averageInkColor(colorCrop, binary)
             val inkIntensityStdDev = inkIntensityStdDev(crop, binary)
             val hasWideUnderline = hasWideUnderlineBelow(gray, rect)
@@ -109,6 +121,7 @@ object HandwritingDetector {
                 inkColorR = inkColor[2],
                 inkIntensityStdDev = inkIntensityStdDev,
                 hasWideUnderline = hasWideUnderline,
+                hasReliableAngleData = hasReliableAngleData,
                 hasInk = true,
             )
         } finally {
@@ -170,20 +183,25 @@ object HandwritingDetector {
             val flat = ByteArray(rows * cols)
             band.get(0, 0, flat)
 
+            val minRunLength = rect.width * 1.2
             var longestRun = 0
+            var qualifyingRows = 0
             for (y in 0 until rows) {
                 var currentRun = 0
+                var rowLongestRun = 0
                 val rowOffset = y * cols
                 for (x in 0 until cols) {
                     // Fixed threshold, not Otsu: this strip is mostly blank paper with a thin
                     // dark line, too skewed a histogram for Otsu to split reliably.
                     if ((flat[rowOffset + x].toInt() and 0xFF) < DARK_PIXEL_THRESHOLD) {
                         currentRun++
-                        if (currentRun > longestRun) longestRun = currentRun
+                        if (currentRun > rowLongestRun) rowLongestRun = currentRun
                     } else {
                         currentRun = 0
                     }
                 }
+                if (rowLongestRun > longestRun) longestRun = rowLongestRun
+                if (rowLongestRun >= minRunLength) qualifyingRows++
             }
             // A page-wide printed divider/rule (a header underline, a section separator) passes
             // right through this local band exactly like a fill-in-blank's own underline would —
@@ -191,7 +209,20 @@ object HandwritingDetector {
             // to a floor of 0.8 this way. The distinguishing fact is absolute scale: a rule line
             // spans nearly the whole page regardless of which word happens to sit near it; a
             // real answer blank is sized for one answer and is always far short of that.
-            return longestRun > rect.width * 1.2 && longestRun < gray.width() * 0.7
+            //
+            // A genuine ruled line is thin but SOLID — every row it passes through has the same
+            // long dark run, because it's one continuous stroke. A dense row of separate print
+            // glyphs (a dictionary's tightly-kerned digits: a calendar's date grid) can, on ONE
+            // lucky scanline through several characters' mid-bodies, coincidentally produce a
+            // single long run too — verified: an entire un-detected row of calendar dates,
+            // treated as one merged "orphan" blob and split into per-character chunks, had this
+            // fire on nearly every chunk purely because the row of digits below happened to align
+            // that way on one scanline, even though the chunks' own strokes were perfectly
+            // straight print. Requiring the long run to persist across MOST of the band's rows —
+            // not just its single best one — keeps the real ruled-line case (solid on every row)
+            // while rejecting a row of glyphs (long on at most a couple of coincidental rows).
+            val sustained = qualifyingRows >= (rows * 0.6).coerceAtLeast(2.0)
+            return sustained && longestRun < gray.width() * 0.7
         } finally {
             band.release()
         }
@@ -211,7 +242,7 @@ object HandwritingDetector {
      * starved this signal on exactly the majority case. Using every component with a minimum
      * area instead means even a two-letter word usually has enough data points.
      */
-    private fun componentAngleVariationScore(binaryInk: Mat): Double {
+    private fun componentAngleVariationScore(binaryInk: Mat): Pair<Double, Boolean> {
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
         val angleDeviations = ArrayList<Double>()
@@ -233,12 +264,12 @@ object HandwritingDetector {
         } finally {
             hierarchy.release()
         }
-        if (angleDeviations.size < 2) return 0.0
+        if (angleDeviations.size < 2) return 0.0 to false
         val mean = angleDeviations.average()
         val variance = angleDeviations.sumOf { (it - mean) * (it - mean) } / angleDeviations.size
         val stdDev = sqrt(variance)
         // Degrees; not tuned against a labeled dataset yet.
-        return (stdDev / 12.0).coerceIn(0.0, 1.0)
+        return (stdDev / 12.0).coerceIn(0.0, 1.0) to true
     }
 
     /** Returns (one mean stroke-width value per component, total valid component count). */

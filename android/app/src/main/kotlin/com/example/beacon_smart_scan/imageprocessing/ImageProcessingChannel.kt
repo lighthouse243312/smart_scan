@@ -91,6 +91,7 @@ object ImageProcessingChannel {
                     requirePath(call, "inputPath"),
                     requirePath(call, "outputPath"),
                     requireMapList(call, "rects"),
+                    requireMapList(call, "keepRects"),
                     requireDouble(call, "padding", 6.0),
                     requireDouble(call, "inpaintRadius", 5.0),
                 )

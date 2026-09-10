@@ -68,9 +68,10 @@ enum ImageProcessingChannel {
                 let inputPath = try requireString(args, "inputPath")
                 let outputPath = try requireString(args, "outputPath")
                 let rects = (args["rects"] as? [[String: Any]]) ?? []
+                let keepRects = (args["keepRects"] as? [[String: Any]]) ?? []
                 let padding = (args["padding"] as? Double) ?? 6.0
                 let inpaintRadius = (args["inpaintRadius"] as? Double) ?? 5.0
-                try ImageProcessingOpenCV.eraseRegions(atPath: inputPath, outputPath: outputPath, rects: rects, padding: padding, inpaintRadius: inpaintRadius)
+                try ImageProcessingOpenCV.eraseRegions(atPath: inputPath, outputPath: outputPath, rects: rects, keepRects: keepRects, padding: padding, inpaintRadius: inpaintRadius)
                 return ["outputPath": outputPath]
 
             default:

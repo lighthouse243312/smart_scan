@@ -15,6 +15,7 @@ class NativeWordStats {
     required this.inkColorR,
     required this.inkIntensityStdDev,
     required this.hasWideUnderline,
+    required this.hasReliableAngleData,
     required this.hasInk,
   });
 
@@ -38,6 +39,15 @@ class NativeWordStats {
   /// word's own in-text underline (emphasis) hugs the word tightly instead, so it reads false.
   /// The single strongest signal on a worksheet-style document.
   final bool hasWideUnderline;
+
+  /// False when the native side had fewer than 2 measurable stroke components to compare angles
+  /// across (a tiny fragment — a single short stroke or curl, e.g. a split-off tail end of a
+  /// word) — [angleVariationScore] is then a meaningless 0.0 placeholder, NOT a measurement of
+  /// "this is dead straight." The straightness ceiling in ImageProcessingService must check this
+  /// before treating a low angleVariationScore as evidence of print — verified: a genuine
+  /// handwriting fragment this small got angle 0.0 purely from lacking enough data, and was
+  /// capped to a near-zero score as if confidently straight print.
+  final bool hasReliableAngleData;
   final bool hasInk;
 }
 
@@ -132,6 +142,7 @@ class ImageProcessingChannel {
         inkColorR: (entry['inkColorR'] as num).toDouble(),
         inkIntensityStdDev: (entry['inkIntensityStdDev'] as num).toDouble(),
         hasWideUnderline: entry['hasWideUnderline'] as bool,
+        hasReliableAngleData: entry['hasReliableAngleData'] as bool,
         hasInk: entry['hasInk'] as bool,
       );
     }
@@ -161,20 +172,21 @@ class ImageProcessingChannel {
     required String inputPath,
     required String outputPath,
     required List<Rect> rects,
+    List<Rect> keepRects = const [],
     double padding = 6.0,
     double inpaintRadius = 5.0,
   }) async {
+    Map<String, double> rectToMap(Rect r) => {
+          'left': r.left,
+          'top': r.top,
+          'right': r.right,
+          'bottom': r.bottom,
+        };
     final result = await _channel.invokeMapMethod<String, dynamic>('eraseRegions', {
       'inputPath': inputPath,
       'outputPath': outputPath,
-      'rects': rects
-          .map((r) => {
-                'left': r.left,
-                'top': r.top,
-                'right': r.right,
-                'bottom': r.bottom,
-              })
-          .toList(),
+      'rects': rects.map(rectToMap).toList(),
+      'keepRects': keepRects.map(rectToMap).toList(),
       'padding': padding,
       'inpaintRadius': inpaintRadius,
     });

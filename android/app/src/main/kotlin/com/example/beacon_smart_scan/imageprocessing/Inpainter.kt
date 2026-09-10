@@ -36,6 +36,7 @@ object Inpainter {
         inputPath: String,
         outputPath: String,
         rects: List<Map<String, Any>>,
+        keepRects: List<Map<String, Any>>,
         padding: Double,
         inpaintRadius: Double,
     ): Map<String, Any> {
@@ -54,6 +55,17 @@ object Inpainter {
             rects.forEach { rectMap ->
                 val rect = ImageIO.mapToClippedRect(rectMap, src.width(), src.height(), padding)
                 paintInkMask(rect, gray, inkMask, labels, stats, numLabels, mask)
+            }
+            // A region explicitly classified as print — NOT selected for erase — carved back out
+            // of the mask, no matter how it got painted in. Verified: real handwriting directly
+            // touching a correctly-classified printed digit (their boxes literally overlapped)
+            // still eroded part of that digit, because nothing upstream of this point has any
+            // notion of "this pixel belongs to a DIFFERENT, kept region" — painting is driven
+            // entirely by proximity to the word being erased. This is the one place that can
+            // enforce it unconditionally, after everything else has already run.
+            keepRects.forEach { keepMap ->
+                val keepRect = ImageIO.mapToClippedRect(keepMap, src.width(), src.height(), 0.0)
+                Imgproc.rectangle(mask, keepRect.tl(), keepRect.br(), Scalar(0.0), -1)
             }
             Photo.inpaint(src, mask, dst, inpaintRadius, Photo.INPAINT_TELEA)
             ImageIO.writeOrThrow(dst, outputPath)
