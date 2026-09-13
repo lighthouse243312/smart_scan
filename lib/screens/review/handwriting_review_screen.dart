@@ -24,6 +24,7 @@ class HandwritingReviewScreen extends StatefulWidget {
 class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
   bool _drawMode = false;
   bool _savingDebugImage = false;
+  bool _savingOriginalImage = false;
 
   // Cached by source path rather than re-decoded on every build (the previous version called
   // _decodeImage directly inside FutureBuilder's `future:`, which re-decodes on every rebuild —
@@ -79,6 +80,21 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
               onPressed: _savingDebugImage
                   ? null
                   : () => _saveDebugImageToGallery(context, page.textRegions),
+            ),
+          // Saves the RAW capture straight out of the document scanner — before sharpen,
+          // shadow-removal, or erase touch it — so a bug report can tell "the classifier read
+          // this wrong" apart from "the photo itself was already blurry/warped/cropped oddly".
+          // Screenshots and re-shared photos lose that distinction; this is the exact bytes the
+          // native pipeline actually ran on.
+          if (kDebugMode && page != null)
+            IconButton(
+              tooltip: 'Lưu ảnh gốc vào Ảnh',
+              icon: _savingOriginalImage
+                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.image_outlined),
+              onPressed: _savingOriginalImage
+                  ? null
+                  : () => _saveOriginalImageToGallery(context, page.originalPath),
             ),
           IconButton(
             tooltip: 'Vẽ thêm vùng',
@@ -260,6 +276,32 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
       }
     } finally {
       if (mounted) setState(() => _savingDebugImage = false);
+    }
+  }
+
+  Future<void> _saveOriginalImageToGallery(BuildContext context, String originalPath) async {
+    setState(() => _savingOriginalImage = true);
+    try {
+      // Copied to a clearly-labeled temp name first — saving originalPath directly would carry
+      // the document scanner's own filename into Photos, indistinguishable there from any other
+      // pipeline stage once several debug photos pile up in the same album.
+      final tempDir = await getTemporaryDirectory();
+      final ext = originalPath.split('.').last;
+      final outPath = '${tempDir.path}/original_${DateTime.now().millisecondsSinceEpoch}.$ext';
+      await File(originalPath).copy(outPath);
+      await ExportService().saveToGallery(outPath);
+
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Đã lưu ảnh gốc vào Ảnh — gửi trực tiếp từ đó.')),
+        );
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Lưu thất bại: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _savingOriginalImage = false);
     }
   }
 }

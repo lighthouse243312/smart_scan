@@ -52,5 +52,5 @@ flutter {
 
 dependencies {
     implementation(project(":opencv"))
-    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
 }
