@@ -38,43 +38,48 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
                 error:(NSError **)error
     NS_SWIFT_NAME(rotate(atPath:outputPath:quarterTurnsClockwise:));
 
-/// ML Kit's text recognizer sometimes emits NO region at all for loosely-connected cursive
-/// handwriting — verified on a real photo where two lines of a handwritten note got zero boxes
-/// while a clearer third line was detected fine, an OCR-side "is this legible text" confidence
-/// gate that messy cursive can fall below. Finds ink NOT already covered by any of
-/// `existingBlocks`, merges nearby letters/words into phrase-level blobs (bridging normal
-/// within-line gaps), and returns them as extra candidate regions — the CNN classifier only
-/// needs a pixel crop, not a transcription, so it can still score what ML Kit never boxed.
-/// Entries are `{ "id": String, "left": Double, "top": Double, "right": Double, "bottom": Double }`.
-+ (nullable NSArray<NSDictionary<NSString *, id> *> *)detectOrphanRegionsAtPath:(NSString *)imagePath
-                                                                  existingBlocks:(NSArray<NSDictionary<NSString *, id> *> *)existingBlocks
-                                                                           error:(NSError **)error
-    NS_SWIFT_NAME(detectOrphanRegions(atPath:existingBlocks:));
+/// Mask files are BGRA PNGs the size of the page with two independent layers: alpha = handwriting
+/// (drawn semi-transparent red, so the file doubles as the review overlay), blue = printed ink
+/// (kept even where alpha is 0). A pixel can be both — handwriting written over print. The
+/// `...Mask` methods return the fraction of the page covered by handwriting.
 
-/// `textBlocks` / return entries are `{ "id": String, "left": Double, "top": Double, "right": Double, "bottom": Double }`.
-/// Returns `{ "id": String, "confidence": Double, "isLikelyHandwriting": Bool }` per input block.
-+ (nullable NSArray<NSDictionary<NSString *, id> *> *)detectHandwritingRegionsAtPath:(NSString *)imagePath
-                                                                           textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
-                                                                                error:(NSError **)error
-    NS_SWIFT_NAME(detectHandwritingRegions(atPath:textBlocks:));
+/// Colour-of-ink method: saturated (blue/red/green…) ink that is clearly darker than the paper.
+/// Fast and offline, but cannot see black ink or pencil, and also catches coloured print. The
+/// print layer is estimated (unsaturated ink, plus very dark pixels inside a coloured stroke).
+/// `minSaturation` is on OpenCV's 0-255 HSV saturation scale.
++ (nullable NSNumber *)inkColorMaskAtPath:(NSString *)inputPath
+                                  maskPath:(NSString *)maskPath
+                             minSaturation:(double)minSaturation
+                                     error:(NSError **)error
+    NS_SWIFT_NAME(inkColorMask(atPath:maskPath:minSaturation:));
 
-/// Crops+resizes each `textBlocks` region to the ML classifier's fixed 128x64 grayscale input
-/// size (must match ml/train.py's IMG_W/IMG_H) and returns the raw pixel bytes (row-major,
-/// 1 byte/pixel, 128*64 = 8192 bytes per entry) so Swift can feed them into Core ML without
-/// ever touching OpenCV types itself.
-+ (nullable NSArray<NSData *> *)handwritingCropsAtPath:(NSString *)imagePath
-                                              textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
-                                                   error:(NSError **)error
-    NS_SWIFT_NAME(handwritingCrops(atPath:textBlocks:));
+/// Segmentation method: the bundled InkSegmenter U-Net (see ml/train_ink_seg.py) predicts two
+/// independent per-pixel layers, print and handwriting; pixels whose handwriting probability
+/// exceeds `threshold` (and that are actual ink) form the handwriting layer.
++ (nullable NSNumber *)segmentationMaskAtPath:(NSString *)inputPath
+                                      maskPath:(NSString *)maskPath
+                                     threshold:(double)threshold
+                                         error:(NSError **)error
+    NS_SWIFT_NAME(segmentationMask(atPath:maskPath:threshold:));
 
-+ (BOOL)eraseRegionsAtPath:(NSString *)inputPath
-                 outputPath:(NSString *)outputPath
-                      rects:(NSArray<NSDictionary<NSString *, id> *> *)rects
-                  keepRects:(NSArray<NSDictionary<NSString *, id> *> *)keepRects
-                    padding:(double)padding
-              inpaintRadius:(double)inpaintRadius
-                      error:(NSError **)error
-    NS_SWIFT_NAME(eraseRegions(atPath:outputPath:rects:keepRects:padding:inpaintRadius:));
+/// Manual correction: paints (or, with `erase`, clears) brush strokes into the handwriting layer;
+/// the print layer is kept. Each stroke is
+/// `{ "points": [x0, y0, x1, y1, ...] (image px), "width": Double, "erase": Bool }`.
++ (nullable NSNumber *)applyMaskStrokesAtPath:(NSString *)maskPath
+                                    outputPath:(NSString *)outputPath
+                                       strokes:(NSArray<NSDictionary<NSString *, id> *> *)strokes
+                                         error:(NSError **)error
+    NS_SWIFT_NAME(applyMaskStrokes(atPath:outputPath:strokes:));
+
+/// Removes the handwriting by rebuilding it, not inpainting: handwriting pixels over print get the
+/// nearby print colour back, the rest get the paper colour. The handwriting layer is first grown
+/// by `dilatePx` onto non-print pixels to cover faint stroke rims.
++ (BOOL)eraseWithMaskAtPath:(NSString *)inputPath
+                    maskPath:(NSString *)maskPath
+                  outputPath:(NSString *)outputPath
+                    dilatePx:(double)dilatePx
+                       error:(NSError **)error
+    NS_SWIFT_NAME(eraseWithMask(atPath:maskPath:outputPath:dilatePx:));
 
 @end
 

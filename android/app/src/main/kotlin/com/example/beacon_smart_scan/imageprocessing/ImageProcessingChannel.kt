@@ -70,30 +70,31 @@ object ImageProcessingChannel {
                     requirePath(call, "outputPath"),
                     (call.argument<Any>("quarterTurnsClockwise") as? Number)?.toInt() ?: 1,
                 )
-            "detectOrphanRegions" ->
-                OrphanInkDetector.detect(
-                    requirePath(call, "imagePath"),
-                    requireMapList(call, "existingBlocks"),
-                )
-            "detectHandwritingRegions" ->
-                HandwritingDetector.detect(
-                    requirePath(call, "imagePath"),
-                    requireMapList(call, "textBlocks"),
-                )
-            "classifyHandwriting" ->
-                MlHandwritingClassifier.classify(
-                    appContext,
-                    requirePath(call, "imagePath"),
-                    requireMapList(call, "textBlocks"),
-                )
-            "eraseRegions" ->
-                Inpainter.erase(
+            "inkColorMask" ->
+                InkColorMasker.mask(
                     requirePath(call, "inputPath"),
+                    requirePath(call, "maskPath"),
+                    requireDouble(call, "minSaturation", 60.0),
+                )
+            "segmentationMask" ->
+                InkSegmenter.mask(
+                    appContext,
+                    requirePath(call, "inputPath"),
+                    requirePath(call, "maskPath"),
+                    requireDouble(call, "threshold", 0.5),
+                )
+            "applyMaskStrokes" ->
+                MaskEditor.applyStrokes(
+                    requirePath(call, "maskPath"),
                     requirePath(call, "outputPath"),
-                    requireMapList(call, "rects"),
-                    requireMapList(call, "keepRects"),
-                    requireDouble(call, "padding", 6.0),
-                    requireDouble(call, "inpaintRadius", 5.0),
+                    requireMapList(call, "strokes"),
+                )
+            "eraseWithMask" ->
+                MaskEraser.erase(
+                    requirePath(call, "inputPath"),
+                    requirePath(call, "maskPath"),
+                    requirePath(call, "outputPath"),
+                    requireDouble(call, "dilatePx", 2.0),
                 )
             else -> throw ImageProcessingException("INVALID_ARGUMENT", "Unknown method: ${call.method}")
         }

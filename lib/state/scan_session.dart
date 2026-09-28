@@ -1,29 +1,27 @@
-import 'dart:ui';
-
 import 'package:flutter/foundation.dart';
 
+import '../core/models/handwriting_method.dart';
 import '../core/models/scan_page.dart';
-import '../core/models/text_region.dart';
 import '../services/document_scanner_service.dart';
 import '../services/image_processing_service.dart';
-import '../services/text_recognition_service.dart';
 
 enum ScanStep { capture, processing, review, export }
 
 /// Owns the whole scan flow's state: pages, which step we're on, in-flight processing, and
-/// the handwriting-region selection for the page currently under review.
+/// the handwriting mask for the page currently under review.
 class ScanSession extends ChangeNotifier {
   ScanSession({
     DocumentScannerService? scannerService,
     ImageProcessingService? imageProcessingService,
-    TextRecognitionService? textRecognitionService,
   })  : _scannerService = scannerService ?? DocumentScannerService(),
-        _imageProcessingService = imageProcessingService ?? ImageProcessingService(),
-        _textRecognitionService = textRecognitionService ?? TextRecognitionService();
+        _imageProcessingService = imageProcessingService ?? ImageProcessingService();
 
   final DocumentScannerService _scannerService;
   final ImageProcessingService _imageProcessingService;
-  final TextRecognitionService _textRecognitionService;
+
+  /// Which detector builds the mask, and how aggressively (0-1, higher = erase more).
+  HandwritingMethod method = HandwritingMethod.segmentation;
+  double sensitivity = 0.6;
 
   final List<ScanPage> _pages = [];
   List<ScanPage> get pages => List.unmodifiable(_pages);
@@ -55,7 +53,10 @@ class ScanSession extends ChangeNotifier {
       return (sharpened: sharpened, shadowRemoved: shadowRemoved);
     });
     if (result == null) return;
-    _pages[currentPageIndex] = page.copyWith(
+    // A fresh ScanPage, not copyWith: any mask/erase result was computed from the previous
+    // processed image and no longer lines up with this one.
+    _pages[currentPageIndex] = ScanPage(
+      originalPath: page.originalPath,
       sharpenedPath: result.sharpened,
       shadowRemovedPath: result.shadowRemoved,
     );
@@ -78,59 +79,54 @@ class ScanSession extends ChangeNotifier {
     await processCurrentPage();
   }
 
-  /// Detects text regions then scores each for handwriting likelihood.
+  /// Builds the handwriting mask for the current page with [method] at [sensitivity]. Always
+  /// runs on the processed page from before any erase, and discards manual brush edits and any
+  /// previous erase result.
   Future<void> detectHandwriting() async {
     final page = currentPage;
     if (page == null) return;
-    final result = await _guarded(() async {
-      final regions = await _textRecognitionService.recognize(page.displayPath);
-      return _imageProcessingService.scoreHandwriting(page.displayPath, regions);
-    });
+    final result = await _guarded(
+      () => _imageProcessingService.detectHandwritingMask(
+        page.cleanPath,
+        method: method,
+        sensitivity: sensitivity,
+      ),
+    );
     if (result == null) return;
-    _pages[currentPageIndex] = page.copyWith(textRegions: result);
+    _pages[currentPageIndex] = ScanPage(
+      originalPath: page.originalPath,
+      sharpenedPath: page.sharpenedPath,
+      shadowRemovedPath: page.shadowRemovedPath,
+      maskPath: result.maskPath,
+      maskCoverage: result.coverage,
+    );
     step = ScanStep.review;
     notifyListeners();
   }
 
-  void toggleRegionSelection(String regionId) {
+  /// Switches detector (and/or sensitivity) and re-detects the current page.
+  Future<void> updateDetection({HandwritingMethod? method, double? sensitivity}) async {
+    if (method != null) this.method = method;
+    if (sensitivity != null) this.sensitivity = sensitivity;
+    await detectHandwriting();
+  }
+
+  /// Manual correction of the current mask with brush [strokes].
+  Future<void> applyMaskStrokes(List<MaskStroke> strokes) async {
     final page = currentPage;
-    if (page == null) return;
-    final updated = page.textRegions
-        .map((r) => r.id == regionId ? r.copyWith(selectedForErase: !r.selectedForErase) : r)
-        .toList();
-    _pages[currentPageIndex] = page.copyWith(textRegions: updated);
+    final maskPath = page?.maskPath;
+    if (page == null || maskPath == null || strokes.isEmpty) return;
+    final result = await _guarded(() => _imageProcessingService.applyMaskStrokes(maskPath, strokes));
+    if (result == null) return;
+    _pages[currentPageIndex] = page.copyWith(maskPath: result.maskPath, maskCoverage: result.coverage);
     notifyListeners();
   }
 
-  void addManualRegion(Rect rect) {
+  Future<void> eraseHandwriting() async {
     final page = currentPage;
-    if (page == null) return;
-    final region = TextRegion(
-      id: 'manual_${DateTime.now().microsecondsSinceEpoch}',
-      boundingBox: rect,
-      text: '',
-      isManual: true,
-      selectedForErase: true,
-    );
-    _pages[currentPageIndex] = page.copyWith(textRegions: [...page.textRegions, region]);
-    notifyListeners();
-  }
-
-  Future<void> eraseSelected() async {
-    final page = currentPage;
-    if (page == null) return;
-    final rects = page.textRegions.where((r) => r.selectedForErase).map((r) => r.boundingBox).toList();
-    if (rects.isEmpty) return;
-    // Regions explicitly NOT selected — i.e. already decided to be print — carved back out of
-    // whatever mask the erase step builds. Verified: a real handwritten word directly touching a
-    // correctly-classified printed digit (their boxes literally overlapped) still ate part of
-    // that digit, because the native erase step has no concept of "this pixel belongs to a
-    // DIFFERENT, kept region" — it only sees ink to fill in near the word it's erasing. Passing
-    // every kept box through means the final mask can never touch them, regardless of how it was
-    // built.
-    final keepRects = page.textRegions.where((r) => !r.selectedForErase).map((r) => r.boundingBox).toList();
-    final result =
-        await _guarded(() => _imageProcessingService.eraseRegions(page.displayPath, rects, keepRects: keepRects));
+    final maskPath = page?.maskPath;
+    if (page == null || maskPath == null) return;
+    final result = await _guarded(() => _imageProcessingService.eraseWithMask(page.cleanPath, maskPath));
     if (result == null) return;
     _pages[currentPageIndex] = page.copyWith(finalPath: result);
     step = ScanStep.export;
@@ -164,11 +160,5 @@ class ScanSession extends ChangeNotifier {
       isProcessing = false;
       notifyListeners();
     }
-  }
-
-  @override
-  void dispose() {
-    _textRecognitionService.dispose();
-    super.dispose();
   }
 }

@@ -49,29 +49,33 @@ enum ImageProcessingChannel {
                 try ImageProcessingOpenCV.rotate(atPath: inputPath, outputPath: outputPath, quarterTurnsClockwise: quarterTurns)
                 return ["outputPath": outputPath]
 
-            case "detectOrphanRegions":
-                let imagePath = try requireString(args, "imagePath")
-                let existingBlocks = (args["existingBlocks"] as? [[String: Any]]) ?? []
-                return try ImageProcessingOpenCV.detectOrphanRegions(atPath: imagePath, existingBlocks: existingBlocks)
-
-            case "detectHandwritingRegions":
-                let imagePath = try requireString(args, "imagePath")
-                let textBlocks = (args["textBlocks"] as? [[String: Any]]) ?? []
-                return try ImageProcessingOpenCV.detectHandwritingRegions(atPath: imagePath, textBlocks: textBlocks)
-
-            case "classifyHandwriting":
-                let imagePath = try requireString(args, "imagePath")
-                let textBlocks = (args["textBlocks"] as? [[String: Any]]) ?? []
-                return try MlHandwritingClassifier.classify(imagePath: imagePath, textBlocks: textBlocks)
-
-            case "eraseRegions":
+            case "inkColorMask":
                 let inputPath = try requireString(args, "inputPath")
+                let maskPath = try requireString(args, "maskPath")
+                let minSaturation = (args["minSaturation"] as? Double) ?? 60.0
+                let coverage = try ImageProcessingOpenCV.inkColorMask(atPath: inputPath, maskPath: maskPath, minSaturation: minSaturation)
+                return ["maskPath": maskPath, "coverage": coverage]
+
+            case "segmentationMask":
+                let inputPath = try requireString(args, "inputPath")
+                let maskPath = try requireString(args, "maskPath")
+                let threshold = (args["threshold"] as? Double) ?? 0.5
+                let coverage = try ImageProcessingOpenCV.segmentationMask(atPath: inputPath, maskPath: maskPath, threshold: threshold)
+                return ["maskPath": maskPath, "coverage": coverage]
+
+            case "applyMaskStrokes":
+                let maskPath = try requireString(args, "maskPath")
                 let outputPath = try requireString(args, "outputPath")
-                let rects = (args["rects"] as? [[String: Any]]) ?? []
-                let keepRects = (args["keepRects"] as? [[String: Any]]) ?? []
-                let padding = (args["padding"] as? Double) ?? 6.0
-                let inpaintRadius = (args["inpaintRadius"] as? Double) ?? 5.0
-                try ImageProcessingOpenCV.eraseRegions(atPath: inputPath, outputPath: outputPath, rects: rects, keepRects: keepRects, padding: padding, inpaintRadius: inpaintRadius)
+                let strokes = (args["strokes"] as? [[String: Any]]) ?? []
+                let coverage = try ImageProcessingOpenCV.applyMaskStrokes(atPath: maskPath, outputPath: outputPath, strokes: strokes)
+                return ["maskPath": outputPath, "coverage": coverage]
+
+            case "eraseWithMask":
+                let inputPath = try requireString(args, "inputPath")
+                let maskPath = try requireString(args, "maskPath")
+                let outputPath = try requireString(args, "outputPath")
+                let dilatePx = (args["dilatePx"] as? Double) ?? 2.0
+                try ImageProcessingOpenCV.eraseWithMask(atPath: inputPath, maskPath: maskPath, outputPath: outputPath, dilatePx: dilatePx)
                 return ["outputPath": outputPath]
 
             default:

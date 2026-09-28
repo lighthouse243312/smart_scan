@@ -1,60 +1,28 @@
 import 'package:flutter/services.dart';
 
-/// Raw per-word pixel measurements from the native side — a stroke-shape confidence (a weak
-/// fallback signal on its own), the word's average stroke width, and its average ink color
-/// (BGR). None of these are a handwriting verdict by themselves; see
-/// ImageProcessingService.scoreHandwriting for how they're compared against the page's own
-/// most-common values to reach one.
-class NativeWordStats {
-  const NativeWordStats({
-    required this.confidence,
-    required this.angleVariationScore,
-    required this.avgStrokeWidth,
-    required this.inkColorB,
-    required this.inkColorG,
-    required this.inkColorR,
-    required this.inkIntensityStdDev,
-    required this.hasWideUnderline,
-    required this.hasReliableAngleData,
-    required this.hasInk,
-  });
+import '../models/handwriting_method.dart';
 
-  final double confidence;
+/// A mask file written by the native side: a page-sized PNG with two independent layers — alpha =
+/// handwriting (drawn semi-transparent red, so the file doubles as the review overlay; magenta
+/// where it crosses print) and blue = printed ink, which the erase step restores.
+class HandwritingMaskResult {
+  const HandwritingMaskResult({required this.maskPath, required this.coverage});
 
-  /// Self-contained [0, 1] score: how much each letter's tilt varies from the next within this
-  /// one word — intrinsic to the ink shape, independent of position/color. A printed font
-  /// repeats the exact same glyph angle every time; a hand never repeats a stroke identically.
-  final double angleVariationScore;
-  final double avgStrokeWidth;
-  final double inkColorB;
-  final double inkColorG;
-  final double inkColorR;
+  final String maskPath;
 
-  /// Std-dev of pixel darkness within the word's own ink — printed ink/toner is near-uniform
-  /// (low value), pen ink varies with pressure/speed/flow (higher value).
-  final double inkIntensityStdDev;
+  /// Fraction of the page covered by the mask, 0-1.
+  final double coverage;
 
-  /// True when the word sits on a long, near-solid dark line spanning noticeably wider than the
-  /// word itself — a fill-in-the-blank answer written on its pre-printed blank line. A printed
-  /// word's own in-text underline (emphasis) hugs the word tightly instead, so it reads false.
-  /// The single strongest signal on a worksheet-style document.
-  final bool hasWideUnderline;
-
-  /// False when the native side had fewer than 2 measurable stroke components to compare angles
-  /// across (a tiny fragment — a single short stroke or curl, e.g. a split-off tail end of a
-  /// word) — [angleVariationScore] is then a meaningless 0.0 placeholder, NOT a measurement of
-  /// "this is dead straight." The straightness ceiling in ImageProcessingService must check this
-  /// before treating a low angleVariationScore as evidence of print — verified: a genuine
-  /// handwriting fragment this small got angle 0.0 purely from lacking enough data, and was
-  /// capped to a near-zero score as if confidently straight print.
-  final bool hasReliableAngleData;
-  final bool hasInk;
+  factory HandwritingMaskResult.fromMap(Map<String, dynamic> map) => HandwritingMaskResult(
+        maskPath: map['maskPath'] as String,
+        coverage: (map['coverage'] as num).toDouble(),
+      );
 }
 
 /// Thin typed wrapper over the native `beacon_smart_scan/image_processing` MethodChannel.
-/// The actual sharpen/shadow-removal/handwriting-detect/inpaint algorithms are implemented
-/// natively (Kotlin+OpenCV on Android, Obj-C++/OpenCV on iOS) — see
-/// android/app/src/main/kotlin/.../imageprocessing/ and ios/Runner/ImageProcessingOpenCV.mm.
+/// The algorithms are implemented natively and mirrored on both platforms — Kotlin + OpenCV +
+/// TFLite on Android (android/app/src/main/kotlin/.../imageprocessing/), Obj-C++ + OpenCV +
+/// Core ML on iOS (ios/Runner/ImageProcessingOpenCV.mm).
 class ImageProcessingChannel {
   ImageProcessingChannel._();
 
@@ -99,96 +67,61 @@ class ImageProcessingChannel {
     return result!['outputPath'] as String;
   }
 
-  /// ML Kit's text recognizer sometimes emits NO region at all for loosely-connected cursive
-  /// handwriting (verified on a real photo: two lines of a handwritten note got zero boxes,
-  /// while a third line in clearer, more separated letters was detected fine) — its OCR-based
-  /// detector has an implicit "is this legible text" confidence gate that messy cursive can
-  /// fall below. This finds ink not already covered by any of [existingBlocks], merges nearby
-  /// letters/words into phrase-level blobs, and returns them as extra candidate regions so the
-  /// classifier — which only needs a pixel crop, not a transcription — can still score them.
-  /// [existingBlocks] keys: left, top, right, bottom. Returns `{id, left, top, right, bottom}` maps.
-  static Future<List<Map<String, dynamic>>> detectOrphanRegions({
-    required String imagePath,
-    required List<Map<String, Object>> existingBlocks,
-  }) async {
-    final result = await _channel.invokeListMethod<Map<Object?, Object?>>(
-      'detectOrphanRegions',
-      {'imagePath': imagePath, 'existingBlocks': existingBlocks},
-    );
-    return (result ?? const []).map((e) => e.cast<String, dynamic>()).toList();
-  }
-
-  /// [textBlocks] keys: id, left, top, right, bottom, charCount (image pixel coordinates).
-  /// Returns raw per-word measurements keyed by region id — NOT a handwriting decision. Native
-  /// only measures; [ImageProcessingService.scoreHandwriting] decides by comparing each word
-  /// against the page's own most-common stroke width/ink color.
-  static Future<Map<String, NativeWordStats>> detectHandwritingRegions({
-    required String imagePath,
-    required List<Map<String, Object>> textBlocks,
-  }) async {
-    final result = await _channel.invokeListMethod<Map<Object?, Object?>>(
-      'detectHandwritingRegions',
-      {'imagePath': imagePath, 'textBlocks': textBlocks},
-    );
-    final map = <String, NativeWordStats>{};
-    for (final entry in result ?? const []) {
-      final id = entry['id'] as String;
-      map[id] = NativeWordStats(
-        confidence: (entry['confidence'] as num).toDouble(),
-        angleVariationScore: (entry['angleVariationScore'] as num).toDouble(),
-        avgStrokeWidth: (entry['avgStrokeWidth'] as num).toDouble(),
-        inkColorB: (entry['inkColorB'] as num).toDouble(),
-        inkColorG: (entry['inkColorG'] as num).toDouble(),
-        inkColorR: (entry['inkColorR'] as num).toDouble(),
-        inkIntensityStdDev: (entry['inkIntensityStdDev'] as num).toDouble(),
-        hasWideUnderline: entry['hasWideUnderline'] as bool,
-        hasReliableAngleData: entry['hasReliableAngleData'] as bool,
-        hasInk: entry['hasInk'] as bool,
-      );
-    }
-    return map;
-  }
-
-  /// Runs the trained CNN (see beacon_smart_scan/ml/) on each word crop — a real classifier,
-  /// not a heuristic. [textBlocks] keys: id, left, top, right, bottom (image pixel coordinates).
-  /// Returns each region's raw sigmoid output (1.0 == handwriting) keyed by id.
-  static Future<Map<String, double>> classifyHandwriting({
-    required String imagePath,
-    required List<Map<String, Object>> textBlocks,
-  }) async {
-    final result = await _channel.invokeListMethod<Map<Object?, Object?>>(
-      'classifyHandwriting',
-      {'imagePath': imagePath, 'textBlocks': textBlocks},
-    );
-    final map = <String, double>{};
-    for (final entry in result ?? const []) {
-      final id = entry['id'] as String;
-      map[id] = (entry['mlConfidence'] as num).toDouble();
-    }
-    return map;
-  }
-
-  static Future<String> eraseRegions({
+  /// Colour-of-ink mask. [minSaturation] is on OpenCV's 0-255 HSV saturation scale.
+  static Future<HandwritingMaskResult> inkColorMask({
     required String inputPath,
-    required String outputPath,
-    required List<Rect> rects,
-    List<Rect> keepRects = const [],
-    double padding = 6.0,
-    double inpaintRadius = 5.0,
+    required String maskPath,
+    required double minSaturation,
   }) async {
-    Map<String, double> rectToMap(Rect r) => {
-          'left': r.left,
-          'top': r.top,
-          'right': r.right,
-          'bottom': r.bottom,
-        };
-    final result = await _channel.invokeMapMethod<String, dynamic>('eraseRegions', {
+    final result = await _channel.invokeMapMethod<String, dynamic>('inkColorMask', {
       'inputPath': inputPath,
+      'maskPath': maskPath,
+      'minSaturation': minSaturation,
+    });
+    return HandwritingMaskResult.fromMap(result!);
+  }
+
+  /// Segmentation-model mask: pixels whose handwriting probability exceeds [threshold].
+  static Future<HandwritingMaskResult> segmentationMask({
+    required String inputPath,
+    required String maskPath,
+    required double threshold,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('segmentationMask', {
+      'inputPath': inputPath,
+      'maskPath': maskPath,
+      'threshold': threshold,
+    });
+    return HandwritingMaskResult.fromMap(result!);
+  }
+
+  /// Applies manual brush [strokes] to the mask at [maskPath], writing the result to [outputPath].
+  static Future<HandwritingMaskResult> applyMaskStrokes({
+    required String maskPath,
+    required String outputPath,
+    required List<MaskStroke> strokes,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('applyMaskStrokes', {
+      'maskPath': maskPath,
       'outputPath': outputPath,
-      'rects': rects.map(rectToMap).toList(),
-      'keepRects': keepRects.map(rectToMap).toList(),
-      'padding': padding,
-      'inpaintRadius': inpaintRadius,
+      'strokes': strokes.map((s) => s.toMap()).toList(),
+    });
+    return HandwritingMaskResult.fromMap(result!);
+  }
+
+  /// Rebuilds the page without the handwriting: handwriting pixels over print get the nearby print
+  /// colour back, the rest get the paper colour (no inpainting, so crossed-over print stays sharp).
+  static Future<String> eraseWithMask({
+    required String inputPath,
+    required String maskPath,
+    required String outputPath,
+    double dilatePx = 2.0,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('eraseWithMask', {
+      'inputPath': inputPath,
+      'maskPath': maskPath,
+      'outputPath': outputPath,
+      'dilatePx': dilatePx,
     });
     return result!['outputPath'] as String;
   }

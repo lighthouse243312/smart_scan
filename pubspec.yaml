@@ -38,7 +38,6 @@ dependencies:
   # Document scan feature
   cunning_document_scanner: ^3.0.2
   device_info_plus: ^11.2.0
-  google_mlkit_text_recognition: ^0.17.1
   gal: ^2.3.3
   path_provider: ^2.1.5
   provider: ^6.1.2

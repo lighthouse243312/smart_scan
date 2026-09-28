@@ -3,15 +3,14 @@
 // Using OpenCV 4.10.0 here (not 5.0.0, matching Android) — the official 5.0.0 iOS framework
 // ships a DNN module that references ONNX Runtime/MLAS symbols missing for the device arm64
 // slice, so any app linking it fails with "Undefined symbol: MlasGemmBatch" etc. on a real
-// device. 4.10.0 predates that DNN/ONNX backend and has no such issue. The algorithms used
-// here (GaussianBlur, threshold, distanceTransform, findContours, contourArea, arcLength,
-// inpaint, CLAHE...) are stable, unchanged APIs across 4.x/5.x.
+// device. 4.10.0 predates that DNN/ONNX backend and has no such issue.
 #import <opencv2/opencv.hpp>
 
 #import <algorithm>
-#import <set>
-#import <utility>
+#import <cmath>
+#import <vector>
 
+#import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
 #import "ImageProcessingOpenCV.h"
 
@@ -21,42 +20,6 @@ static NSError *MakeError(ImageProcessingErrorCode code, NSString *message) {
     return [NSError errorWithDomain:ImageProcessingErrorDomain
                                 code:code
                             userInfo:@{NSLocalizedDescriptionKey : message}];
-}
-
-static double NumberOrThrow(NSDictionary<NSString *, id> *map, NSString *key, BOOL *ok, NSError **error) {
-    id value = map[key];
-    if (![value isKindOfClass:[NSNumber class]]) {
-        *ok = NO;
-        *error = MakeError(ImageProcessingErrorInvalidArgument,
-                            [NSString stringWithFormat:@"Missing numeric field: %@", key]);
-        return 0.0;
-    }
-    *ok = YES;
-    return [(NSNumber *)value doubleValue];
-}
-
-/// Converts a Dart `{left, top, right, bottom}` map into a cv::Rect clipped to the image bounds.
-static BOOL MapToClippedRect(NSDictionary<NSString *, id> *map, int imageWidth, int imageHeight,
-                              double paddingPx, cv::Rect *outRect, NSError **error) {
-    BOOL ok = NO;
-    double left = NumberOrThrow(map, @"left", &ok, error) - paddingPx;
-    if (!ok) return NO;
-    double top = NumberOrThrow(map, @"top", &ok, error) - paddingPx;
-    if (!ok) return NO;
-    double right = NumberOrThrow(map, @"right", &ok, error) + paddingPx;
-    if (!ok) return NO;
-    double bottom = NumberOrThrow(map, @"bottom", &ok, error) + paddingPx;
-    if (!ok) return NO;
-
-    int clippedLeft = (int)MAX(0.0, left);
-    int clippedTop = (int)MAX(0.0, top);
-    int clippedRight = (int)MIN((double)imageWidth, right);
-    int clippedBottom = (int)MIN((double)imageHeight, bottom);
-
-    int width = MAX(1, clippedRight - clippedLeft);
-    int height = MAX(1, clippedBottom - clippedTop);
-    *outRect = cv::Rect(clippedLeft, clippedTop, width, height);
-    return YES;
 }
 
 static bool ReadOrFail(NSString *path, cv::Mat *outMat, NSError **error) {
@@ -78,236 +41,325 @@ static bool WriteOrFail(const cv::Mat &mat, NSString *path, NSError **error) {
     return true;
 }
 
-/// Raw per-word measurements — mirrors HandwritingDetector.kt's RegionStats on Android. This
-/// does NOT decide handwriting vs print itself; Dart (ImageProcessingService) makes that call
-/// by comparing every word's stats against the PAGE'S OWN most-common values (a self-calibrating
-/// "reference style/color" instead of a fixed threshold).
-struct RegionStats {
-    double strokeVariationScore = 0.0;
-    double componentRatioScore = 0.0;
-    double angleVariationScore = 0.0;
-    double avgStrokeWidth = 0.0;
-    double inkColorB = 0.0;
-    double inkColorG = 0.0;
-    double inkColorR = 0.0;
-    double inkIntensityStdDev = 0.0;
-    bool hasWideUnderline = false;
-    // False when there weren't even 2 qualifying stroke components to compare angles across (a
-    // tiny fragment — one short stroke, a single curl) — angleVariationScore is then a
-    // meaningless 0.0 placeholder, NOT a measurement of "this is dead straight." Dart's
-    // straightness ceiling must see this to avoid treating "no data" the same as "definitely
-    // print" — verified: a real handwriting fragment this small (the tail end of a word, split
-    // off during merging) got angle 0.0 from having only one stroke to look at, and was capped
-    // to a near-zero score as if it were confidently straight print.
-    bool hasReliableAngleData = false;
-    bool hasInk = false;
-};
+// MARK: - Handwriting mask helpers (mirror HandwritingMask.kt on Android)
+//
+// A mask file is a BGRA PNG the same size as the page holding two INDEPENDENT layers:
+//  - alpha > 0      → handwriting (drawn semi-transparent red, so the file doubles as the review
+//                     overlay);
+//  - blue  > 127    → printed ink, stored even where alpha is 0 (invisible in the overlay).
+// A pixel can be both — handwriting written over print — and then shows magenta in the overlay.
+// The erase step repaints handwriting pixels from these layers instead of inpainting, so print
+// crossed by a pen stroke is restored rather than smeared.
 
-/**
- * A fill-in-the-blank answer is written ON TOP of a pre-printed blank line — the ink usually
- * touches or overlaps it, not sitting cleanly above it with a gap — and that line is wider than
- * the answer itself (the blank was sized for a guessed-longer answer). A printed word's own
- * underline (used for in-text emphasis) hugs the word tightly instead. So: search a band spanning
- * from partway UP INSIDE the word's own box down through a generous margin below it (covering
- * both "line touches the ink" and "line has a small gap"), and look for a long, near-solid dark
- * horizontal run spanning noticeably wider than the word's own box. A fixed darkness threshold is
- * used instead of a fresh Otsu computation — Otsu on a thin, almost-entirely-blank strip (a few
- * dark line pixels among mostly paper) is not a reliable split.
- */
-static bool HasWideUnderlineBelow(const cv::Mat &gray, const cv::Rect &rect) {
-    const int kDarkPixelThreshold = 150;
+static const int kOverlayAlpha = 160;
+// "Ink" = noticeably darker than the local paper. The strict value seeds the colour method; the
+// loose one lets masks grow onto anti-aliased stroke edges and faint pencil without spilling
+// onto bare paper.
+static const int kInkContrastStrict = 18;
+static const int kInkContrastLoose = 8;
+// Colour method only: inside a coloured stroke, a pixel this dark is the stroke crossing black
+// print (a multiply of both inks), so it is counted as print to restore.
+static const int kPrintUnderMaxValue = 100;
 
-    int marginX = std::max(4, (int)(rect.width * 0.6));
-    int bandLeft = std::max(0, rect.x - marginX);
-    int bandRight = std::min(gray.cols, rect.x + rect.width + marginX);
-    int bandWidth = bandRight - bandLeft;
-    if (bandWidth <= 0) return false;
+// Segmentation model contract — must match ml/train_ink_seg.py / export_ink_seg.py: two
+// independent sigmoid channels.
+static const int kSegLongSide = 1536;
+static const int kSegTile = 256;
+static const int kSegOverlap = 32;
+static const int kSegPrintChannel = 0;
+static const int kSegHandwritingChannel = 1;
+static const int kSegChannelCount = 2;
+static const double kSegPrintThreshold = 0.5;
 
-    int bandTop = std::min(gray.rows - 1, rect.y + (int)(rect.height * 0.6));
-    int bandBottom = std::min(gray.rows, rect.y + (int)(rect.height * 1.6));
-    if (bandBottom <= bandTop) return false;
-
-    cv::Mat band = gray(cv::Rect(bandLeft, bandTop, bandWidth, bandBottom - bandTop));
-
-    double minRunLength = rect.width * 1.2;
-    int longestRun = 0;
-    int qualifyingRows = 0;
-    for (int y = 0; y < band.rows; y++) {
-        const uchar *row = band.ptr<uchar>(y);
-        int currentRun = 0;
-        int rowLongestRun = 0;
-        for (int x = 0; x < band.cols; x++) {
-            if (row[x] < kDarkPixelThreshold) {
-                currentRun++;
-                if (currentRun > rowLongestRun) rowLongestRun = currentRun;
-            } else {
-                currentRun = 0;
-            }
-        }
-        if (rowLongestRun > longestRun) longestRun = rowLongestRun;
-        if (rowLongestRun >= minRunLength) qualifyingRows++;
-    }
-    // A page-wide printed divider/rule (a header underline, a section separator) passes right
-    // through this local band exactly like a fill-in-blank's own underline would — verified: a
-    // calendar's title-divider rule forced a printed "2023 Calendar" header to a floor of 0.8
-    // this way. The distinguishing fact is absolute scale: a rule line spans nearly the whole
-    // page regardless of which word happens to sit near it; a real answer blank is sized for one
-    // answer and is always far short of that.
-    //
-    // A genuine ruled line is thin but SOLID — every row it passes through has the same long
-    // dark run, because it's one continuous stroke. A dense row of separate print glyphs (a
-    // calendar's date grid) can, on ONE lucky scanline through several characters' mid-bodies,
-    // coincidentally produce a single long run too — verified: an entire un-detected row of
-    // calendar dates, treated as one merged "orphan" blob and split into per-character chunks,
-    // had this fire on nearly every chunk purely because the row of digits below happened to
-    // align that way on one scanline, even though the chunks' own strokes were perfectly
-    // straight print. Requiring the long run to persist across MOST of the band's rows — not
-    // just its single best one — keeps the real ruled-line case (solid on every row) while
-    // rejecting a row of glyphs (long on at most a couple of coincidental rows).
-    bool sustained = qualifyingRows >= std::max(2.0, band.rows * 0.6);
-    return sustained && longestRun < gray.cols * 0.7;
+/// Paper brightness per pixel: a large median over a 4x-downscaled copy wipes out text strokes
+/// (thin relative to the kernel) and keeps shading, then is scaled back up.
+static cv::Mat EstimatePaper(const cv::Mat &gray) {
+    cv::Mat small;
+    cv::resize(gray, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+    int kernel = std::min(21, (std::min(small.cols, small.rows) - 1) | 1);
+    if (kernel >= 3) cv::medianBlur(small, small, kernel);
+    cv::Mat paper;
+    cv::resize(small, paper, gray.size(), 0, 0, cv::INTER_LINEAR);
+    return paper;
 }
 
-/**
- * How much each letter's own tilt varies from the next, WITHIN this one word — a signal
- * intrinsic to the ink shape itself, independent of position/underline/color, so it still fires
- * on handwriting that isn't sitting on a fill-in-blank line. A printed font renders the exact
- * same glyph outline every time a letter repeats, so every stroke sits at the same angle across
- * the whole word; a human hand never repeats a stroke at a perfectly identical angle twice.
- *
- * Deliberately NOT filtered to "tall" strokes only: the fill-in-blank answers on a real
- * worksheet are mostly short 2-4 letter words ("he", "it", "us", "they"...), which often have
- * zero or one component tall enough to pass a height filter — that filter silently starved this
- * signal on exactly the majority case. Using every component with a minimum area instead means
- * even a two-letter word usually has enough data points.
- */
-static std::pair<double, bool> ComponentAngleVariationScore(const cv::Mat &binaryInk) {
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(binaryInk, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    std::vector<double> angleDeviations;
-    for (auto &contour : contours) {
-        if (contour.size() >= 5 && cv::contourArea(contour) >= 3) {
-            double angle = cv::minAreaRect(contour).angle;
-            // minAreaRect's angle is ambiguous mod 90° (which side is "width" flips it); fold
-            // into "deviation from the nearest axis" in [0, 45] so that's comparable.
-            double mod90 = std::fmod(std::fmod(angle, 90.0) + 90.0, 90.0);
-            angleDeviations.push_back(std::min(mod90, 90.0 - mod90));
-        }
-    }
-    if (angleDeviations.size() < 2) return {0.0, false};
-
-    double sum = 0.0;
-    for (double a : angleDeviations) sum += a;
-    double mean = sum / angleDeviations.size();
-    double variance = 0.0;
-    for (double a : angleDeviations) variance += (a - mean) * (a - mean);
-    variance /= angleDeviations.size();
-    double stdDev = std::sqrt(variance);
-    // Degrees; not tuned against a labeled dataset yet.
-    return {std::min(1.0, std::max(0.0, stdDev / 12.0)), true};
+/// How much darker than the paper each pixel is (0 where lighter).
+static cv::Mat InkContrast(const cv::Mat &gray) {
+    cv::Mat contrast;
+    cv::subtract(EstimatePaper(gray), gray, contrast);
+    return contrast;
 }
 
-/// Stroke Width Transform-style measurement (Epshtein et al.) — printed fonts render every
-/// character with the same stroke width by design; handwriting's stroke width drifts with pen
-/// pressure/speed. The key point: aggregate stroke width PER CONNECTED COMPONENT (per character)
-/// first, then compare variance ACROSS components — pooling every ink pixel together (an earlier
-/// version of this function did that) mixes in each letter's own thick joints/corners and drowns
-/// out the real signal; verified empirically, that approach scored a clean printed line *higher*
-/// than actual handwriting.
-static RegionStats ScoreRegion(const cv::Mat &color, const cv::Mat &gray, const cv::Rect &rect, int charCount) {
-    cv::Mat colorCrop = color(rect);
-    cv::Mat crop = gray(rect);
-    cv::Mat binary;
-    cv::threshold(crop, binary, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
+/// Isolated specks (sensor noise, paper texture) are never worth erasing; scaled to the image
+/// so a 12 MP photo and a small scan drop roughly the same physical size.
+static int MinSpeckleArea(const cv::Mat &image) {
+    return std::max(12, (int)(image.total() * 0.000004));
+}
 
-    RegionStats result;
-    if (cv::countNonZero(binary) < 20) {
-        return result; // too little ink in this box to say anything meaningful (hasInk stays false)
-    }
-
+static void RemoveSmallComponents(cv::Mat &mask, int minArea) {
     cv::Mat labels, stats, centroids;
-    int numLabels = cv::connectedComponentsWithStats(binary, labels, stats, centroids, 8, CV_32S);
-
-    cv::Mat distance;
-    cv::distanceTransform(binary, distance, cv::DIST_L2, 3);
-
-    std::vector<double> sumByLabel(numLabels, 0.0);
-    std::vector<int> countByLabel(numLabels, 0);
-    for (int y = 0; y < binary.rows; y++) {
+    int count = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
+    std::vector<uchar> keep(count, 0);
+    for (int i = 1; i < count; i++) {
+        keep[i] = stats.at<int32_t>(i, cv::CC_STAT_AREA) >= minArea ? 255 : 0;
+    }
+    for (int y = 0; y < mask.rows; y++) {
         const int32_t *labelRow = labels.ptr<int32_t>(y);
-        const float *distRow = distance.ptr<float>(y);
-        for (int x = 0; x < binary.cols; x++) {
-            int label = labelRow[x];
-            if (label != 0) { // 0 == background
-                sumByLabel[label] += distRow[x];
-                countByLabel[label]++;
+        uchar *maskRow = mask.ptr<uchar>(y);
+        for (int x = 0; x < mask.cols; x++) maskRow[x] = keep[labelRow[x]];
+    }
+}
+
+/// `handwriting` / `print`: CV_8UC1, 255 = set.
+static bool WriteMaskFile(const cv::Mat &handwriting, const cv::Mat &print, NSString *path, NSError **error) {
+    cv::Mat file(handwriting.size(), CV_8UC4, cv::Scalar(0, 0, 0, 0));
+    std::vector<cv::Mat> channels;
+    cv::split(file, channels);
+    channels[0] = print.clone();                                   // B: print
+    channels[2].setTo(255, handwriting);                           // R: overlay colour
+    channels[3].setTo(kOverlayAlpha, handwriting);                 // A: handwriting
+    cv::merge(channels, file);
+    return WriteOrFail(file, path, error);
+}
+
+static bool ReadMaskFileOrFail(NSString *path, cv::Mat *outHandwriting, cv::Mat *outPrint, NSError **error) {
+    cv::Mat raw = cv::imread([path UTF8String], cv::IMREAD_UNCHANGED);
+    if (raw.empty() || raw.channels() != 4) {
+        *error = MakeError(ImageProcessingErrorFileNotFound,
+                            [NSString stringWithFormat:@"Không đọc được mask tại: %@", path]);
+        return false;
+    }
+    cv::Mat alpha, blue;
+    cv::extractChannel(raw, alpha, 3);
+    cv::extractChannel(raw, blue, 0);
+    cv::threshold(alpha, *outHandwriting, 0, 255, cv::THRESH_BINARY);
+    cv::threshold(blue, *outPrint, 127, 255, cv::THRESH_BINARY);
+    return true;
+}
+
+static NSNumber *Coverage(const cv::Mat &mask) {
+    return @((double)cv::countNonZero(mask) / (double)std::max<size_t>(1, mask.total()));
+}
+
+// MARK: - Segmentation model (Core ML)
+
+static MLModel *LoadSegmentationModel(NSError **error) {
+    static MLModel *model = nil;
+    static NSError *loadError = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURL *url = [[NSBundle mainBundle] URLForResource:@"InkSegmenter" withExtension:@"mlmodelc"];
+        if (url == nil) {
+            loadError = MakeError(ImageProcessingErrorProcessingFailed,
+                                   @"Chưa có model InkSegmenter trong app (chạy ml/export_ink_seg.py rồi build lại)");
+            return;
+        }
+        MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
+        config.computeUnits = MLComputeUnitsAll;
+        NSError *err = nil;
+        model = [MLModel modelWithContentsOfURL:url configuration:config error:&err];
+        if (model == nil) {
+            loadError = MakeError(ImageProcessingErrorProcessingFailed,
+                                   [NSString stringWithFormat:@"Không tải được model InkSegmenter: %@",
+                                                              err.localizedDescription]);
+        }
+    });
+    if (model == nil && error) *error = loadError;
+    return model;
+}
+
+/// Reads channel `channel` of an NHWC [1, H, W, C] output array into `out` (H x W, CV_32F),
+/// honouring the array's own strides and element type (Core ML may hand back float16).
+static bool ReadClassPlane(MLMultiArray *array, int channel, cv::Mat &out) {
+    if (array.shape.count != 4) return false;
+    NSInteger h = array.shape[1].integerValue, w = array.shape[2].integerValue;
+    NSInteger sy = array.strides[1].integerValue, sx = array.strides[2].integerValue,
+              sc = array.strides[3].integerValue;
+    out.create((int)h, (int)w, CV_32F);
+    if (array.dataType == MLMultiArrayDataTypeFloat32) {
+        const float *base = (const float *)array.dataPointer;
+        for (int y = 0; y < h; y++) {
+            float *row = out.ptr<float>(y);
+            for (int x = 0; x < w; x++) row[x] = base[y * sy + x * sx + channel * sc];
+        }
+        return true;
+    }
+    if (array.dataType == MLMultiArrayDataTypeFloat16) {
+        const __fp16 *base = (const __fp16 *)array.dataPointer;
+        for (int y = 0; y < h; y++) {
+            float *row = out.ptr<float>(y);
+            for (int x = 0; x < w; x++) row[x] = (float)base[y * sy + x * sx + channel * sc];
+        }
+        return true;
+    }
+    if (array.dataType == MLMultiArrayDataTypeDouble) {
+        const double *base = (const double *)array.dataPointer;
+        for (int y = 0; y < h; y++) {
+            float *row = out.ptr<float>(y);
+            for (int x = 0; x < w; x++) row[x] = (float)base[y * sy + x * sx + channel * sc];
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Tile blending weight: 1 in the tile's interior, tapering towards its edges across the overlap
+/// band, so each pixel is decided mostly by the tile that sees it with the most context.
+static cv::Mat TileWeights() {
+    cv::Mat weights(kSegTile, kSegTile, CV_32F);
+    for (int y = 0; y < kSegTile; y++) {
+        float wy = std::min({y + 1, kSegTile - y, kSegOverlap}) / (float)kSegOverlap;
+        for (int x = 0; x < kSegTile; x++) {
+            float wx = std::min({x + 1, kSegTile - x, kSegOverlap}) / (float)kSegOverlap;
+            weights.at<float>(y, x) = wy * wx;
+        }
+    }
+    return weights;
+}
+
+/// Runs the U-Net over the page in overlapping tiles at the model's working scale and returns the
+/// print and handwriting probability maps at the ORIGINAL image size.
+static bool SegmentPage(const cv::Mat &src, cv::Mat *outPrintProb, cv::Mat *outHandwritingProb, NSError **error) {
+    MLModel *model = LoadSegmentationModel(error);
+    if (model == nil) return false;
+
+    double scale = (double)kSegLongSide / (double)std::max(src.cols, src.rows);
+    cv::Mat work;
+    cv::resize(src, work, cv::Size(), scale, scale, scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC);
+    cv::cvtColor(work, work, cv::COLOR_BGR2RGB);
+
+    int step = kSegTile - kSegOverlap;
+    int paddedW = std::max(kSegTile, (int)std::ceil((work.cols - kSegTile) / (double)step) * step + kSegTile);
+    int paddedH = std::max(kSegTile, (int)std::ceil((work.rows - kSegTile) / (double)step) * step + kSegTile);
+    cv::Mat padded;
+    cv::copyMakeBorder(work, padded, 0, paddedH - work.rows, 0, paddedW - work.cols,
+                       cv::BORDER_CONSTANT, cv::Scalar(255, 255, 255));
+    cv::Mat paddedFloat;
+    padded.convertTo(paddedFloat, CV_32FC3);
+
+    NSError *arrayError = nil;
+    MLMultiArray *input = [[MLMultiArray alloc] initWithShape:@[ @1, @(kSegTile), @(kSegTile), @3 ]
+                                                     dataType:MLMultiArrayDataTypeFloat32
+                                                        error:&arrayError];
+    if (input == nil) {
+        if (error) *error = MakeError(ImageProcessingErrorProcessingFailed, arrayError.localizedDescription ?: @"MLMultiArray");
+        return false;
+    }
+
+    cv::Mat weights = TileWeights();
+    cv::Mat printSum = cv::Mat::zeros(paddedH, paddedW, CV_32F);
+    cv::Mat handwritingSum = cv::Mat::zeros(paddedH, paddedW, CV_32F);
+    cv::Mat weightSum = cv::Mat::zeros(paddedH, paddedW, CV_32F);
+    cv::Mat printPlane, handwritingPlane;
+    for (int y = 0; y + kSegTile <= paddedH; y += step) {
+        for (int x = 0; x + kSegTile <= paddedW; x += step) {
+            cv::Mat tile = paddedFloat(cv::Rect(x, y, kSegTile, kSegTile)).clone();
+            memcpy(input.dataPointer, tile.data, sizeof(float) * kSegTile * kSegTile * 3);
+
+            @autoreleasepool {
+                NSError *predictionError = nil;
+                MLDictionaryFeatureProvider *features =
+                    [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"input" : input} error:&predictionError];
+                id<MLFeatureProvider> output = features ? [model predictionFromFeatures:features error:&predictionError] : nil;
+                MLMultiArray *probs = [output featureValueForName:@"probs"].multiArrayValue;
+                if (probs == nil || probs.shape.count != 4 || probs.shape[3].integerValue != kSegChannelCount ||
+                    !ReadClassPlane(probs, kSegPrintChannel, printPlane) ||
+                    !ReadClassPlane(probs, kSegHandwritingChannel, handwritingPlane)) {
+                    if (error) {
+                        *error = MakeError(ImageProcessingErrorProcessingFailed,
+                                            predictionError.localizedDescription ?: @"Model trả về output không hợp lệ");
+                    }
+                    return false;
+                }
             }
+            cv::Rect roi(x, y, kSegTile, kSegTile);
+            cv::Mat printRoi = printSum(roi), handwritingRoi = handwritingSum(roi), weightRoi = weightSum(roi);
+            printRoi += printPlane.mul(weights);
+            handwritingRoi += handwritingPlane.mul(weights);
+            weightRoi += weights;
         }
     }
 
-    const int kMinComponentArea = 3;
-    std::vector<double> strokeWidthsPerComponent;
-    int componentCount = 0;
-    for (int label = 1; label < numLabels; label++) {
-        if (countByLabel[label] >= kMinComponentArea) {
-            componentCount++;
-            strokeWidthsPerComponent.push_back(2.0 * sumByLabel[label] / countByLabel[label]);
+    cv::Rect valid(0, 0, work.cols, work.rows);
+    cv::Mat printProb, handwritingProb;
+    cv::divide(printSum, weightSum, printProb);
+    cv::divide(handwritingSum, weightSum, handwritingProb);
+    cv::resize(printProb(valid), *outPrintProb, src.size(), 0, 0, cv::INTER_LINEAR);
+    cv::resize(handwritingProb(valid), *outHandwritingProb, src.size(), 0, 0, cv::INTER_LINEAR);
+    return true;
+}
+
+/// Per-pixel paper colour: a large median over a 4x-downscaled copy wipes out ink strokes.
+static cv::Mat EstimatePaperColor(const cv::Mat &src) {
+    cv::Mat small;
+    cv::resize(src, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+    int kernel = std::min(21, (std::min(small.cols, small.rows) - 1) | 1);
+    if (kernel >= 3) cv::medianBlur(small, small, kernel);
+    cv::Mat paper;
+    cv::resize(small, paper, src.size(), 0, 0, cv::INTER_LINEAR);
+    return paper;
+}
+
+/// Per-pixel colour of the NEARBY print (average over print pixels not covered by handwriting,
+/// within roughly a text line's reach), falling back to the page-wide print average where there
+/// is none — so a stroke crossing a blue heading restores blue, not black.
+static cv::Mat EstimatePrintColor(const cv::Mat &src, const cv::Mat &visiblePrint) {
+    // Only the dark core of print strokes: their anti-aliased edges are much lighter and would
+    // wash the restored colour out to grey.
+    cv::Mat gray;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat contrast = InkContrast(gray);
+    int histogram[256] = {0};
+    int printCount = 0;
+    for (int y = 0; y < contrast.rows; y++) {
+        const uchar *c = contrast.ptr<uchar>(y);
+        const uchar *m = visiblePrint.ptr<uchar>(y);
+        for (int x = 0; x < contrast.cols; x++) {
+            if (m[x]) { histogram[c[x]]++; printCount++; }
         }
     }
-
-    double strokeScore = 0.0;
-    if (strokeWidthsPerComponent.size() >= 2) {
-        double sum = 0.0;
-        for (double w : strokeWidthsPerComponent) sum += w;
-        double mean = sum / strokeWidthsPerComponent.size();
-        double variance = 0.0;
-        for (double w : strokeWidthsPerComponent) variance += (w - mean) * (w - mean);
-        variance /= strokeWidthsPerComponent.size();
-        double stdDev = std::sqrt(variance);
-        double variationRatio = stdDev / (mean + 1e-6);
-        strokeScore = std::min(1.0, std::max(0.0, variationRatio / 0.5));
+    int p95 = 0;
+    for (int v = 0, seen = 0; v < 256; v++) {
+        seen += histogram[v];
+        if (seen >= printCount * 0.95) { p95 = v; break; }
     }
+    cv::Mat core;
+    cv::compare(contrast, 0.85 * p95, core, cv::CMP_GE);
+    cv::bitwise_and(core, visiblePrint, core);
 
-    // Fewer components than characters (letters visually joined) suggests cursive handwriting.
-    double safeCharCount = std::max(1, charCount);
-    double ratio = componentCount / safeCharCount;
-    double ratioScore = std::min(1.0, std::max(0.0, 1.0 - ratio));
+    cv::Mat weight, srcFloat;
+    core.convertTo(weight, CV_32F, 1.0 / 255.0);
+    src.convertTo(srcFloat, CV_32FC3);
+    cv::Mat weighted;
+    cv::Mat weight3;
+    cv::merge(std::vector<cv::Mat>{weight, weight, weight}, weight3);
+    cv::multiply(srcFloat, weight3, weighted);
 
-    // Not `auto [a, b] = ...` (C++17 structured bindings) — this project compiles as gnu++0x
-    // (C++11); see kOrphanMergeDilate*'s doc comment for the same constraint hitting std::clamp.
-    std::pair<double, bool> angleResult = ComponentAngleVariationScore(binary);
-    double angleScore = angleResult.first;
-    bool hasReliableAngleData = angleResult.second;
+    const double f = 0.125;
+    cv::Mat smallWeighted, smallWeight;
+    cv::resize(weighted, smallWeighted, cv::Size(), f, f, cv::INTER_AREA);
+    cv::resize(weight, smallWeight, cv::Size(), f, f, cv::INTER_AREA);
+    cv::Size window(15, 15);
+    cv::boxFilter(smallWeighted, smallWeighted, -1, window);
+    cv::boxFilter(smallWeight, smallWeight, -1, window);
 
-    double avgStrokeWidth = 0.0;
-    if (!strokeWidthsPerComponent.empty()) {
-        double sum = 0.0;
-        for (double w : strokeWidthsPerComponent) sum += w;
-        avgStrokeWidth = sum / strokeWidthsPerComponent.size();
+    double total = cv::sum(weight)[0];
+    cv::Scalar globalColor = total > 0 ? cv::sum(weighted) / total : cv::Scalar(30, 30, 30);
+
+    cv::Mat smallColor(smallWeight.size(), CV_32FC3);
+    for (int y = 0; y < smallWeight.rows; y++) {
+        const float *w = smallWeight.ptr<float>(y);
+        const cv::Vec3f *c = smallWeighted.ptr<cv::Vec3f>(y);
+        cv::Vec3f *out = smallColor.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < smallWeight.cols; x++) {
+            out[x] = w[x] > 1e-3f ? c[x] / w[x]
+                                  : cv::Vec3f((float)globalColor[0], (float)globalColor[1], (float)globalColor[2]);
+        }
     }
-
-    // Mean BGR of the ink pixels (the actual glyph strokes, not the paper background).
-    cv::Scalar inkColor = cv::mean(colorCrop, binary);
-
-    // How much pixel darkness varies within the ink itself. Printed toner/ink lays down at a
-    // near-uniform density, so its ink pixels cluster tightly around one dark value; pen ink
-    // varies with pressure/speed/flow (skips, fades, presses darker), spreading that value out.
-    cv::Scalar intensityMean, intensityStdDev;
-    cv::meanStdDev(crop, intensityMean, intensityStdDev, binary);
-
-    result.strokeVariationScore = strokeScore;
-    result.componentRatioScore = ratioScore;
-    result.angleVariationScore = angleScore;
-    result.avgStrokeWidth = avgStrokeWidth;
-    result.inkColorB = inkColor[0];
-    result.inkColorG = inkColor[1];
-    result.inkColorR = inkColor[2];
-    result.inkIntensityStdDev = intensityStdDev[0];
-    result.hasWideUnderline = HasWideUnderlineBelow(gray, rect);
-    result.hasReliableAngleData = hasReliableAngleData;
-    result.hasInk = true;
-    return result;
+    cv::Mat color;
+    cv::resize(smallColor, color, src.size(), 0, 0, cv::INTER_LINEAR);
+    color.convertTo(color, CV_8UC3);
+    return color;
 }
 
 @implementation ImageProcessingOpenCV
@@ -385,375 +437,146 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     return WriteOrFail(bgr, outputPath, error);
 }
 
-// Bridges within-WORD letter gaps (cursive letters are usually touching or a few px apart)
-// without also bridging the larger word-to-word gap on the same line. Scaling this off the INK'S
-// OWN measured size (typical raw letter-fragment height, before any merging) rather than off the
-// image's pixel width self-calibrates to however the photo was actually framed — verified: a
-// photo of the whole page and a photo zoomed in tight on just the handwriting put the very same
-// real-world pen stroke at wildly different pixel widths, so a radius tied to overall image width
-// was still far too small to bridge cursive letters into words once zoomed in (each letter was
-// already many times wider than the old fixed 20px cap), leaving fragments too small and
-// shapeless for the classifier to read as a word at all. A radius tied to the ink's own on-page
-// size stays meaningful either way.
-static const double kOrphanMergeDilateHeightFraction = 0.4;
-static const int kOrphanMergeDilateMinPx = 8;
-static const int kOrphanMergeDilateMaxPx = 60;
-// Ignore pure noise/dust when measuring typical letter size, but keep the floor low — thin
-// stroke fragments are exactly the samples this measurement needs.
-static const int kOrphanGlyphStatMinArea = 20;
-static const int kOrphanMinGlyphSamples = 3;
-// Only used on a page with too few raw ink fragments to measure a reliable typical size (e.g. a
-// single short word) — the original width-based estimate, as a fallback only.
-static const double kOrphanFallbackMergeDilateFraction = 0.004;
-static const int kOrphanFallbackMergeDilateMinPx = 10;
-static const int kOrphanFallbackMergeDilateMaxPx = 20;
-// A single stray dot, JPEG artifact, or thin table/gridline segment can pass a small area
-// threshold on its own — require real letter-scale bulk in BOTH dimensions, not just total area
-// (a 3px-tall, 300px-long line has plenty of "area" but is not a word).
-static const int kOrphanMinArea = 800;
-static const int kOrphanMinDimensionPx = 15;
-static const double kOrphanExistingBlockPaddingPx = 6.0;
-// Even with a tighter merge radius, a run-on phrase can still end up wider than any single word
-// the classifier was trained on. Past this width:height ratio, slice it into roughly word-sized,
-// near-square chunks instead of handing the classifier one long, badly-squashed strip — the same
-// reasoning as not classifying whole LINES in the ML-Kit path.
-static const double kOrphanMaxAspectRatio = 2.5;
-// A real run-on handwritten phrase, even badly merged, is at most a handful of words — past this
-// many equal-width slices it's no longer plausibly one phrase at all. Verified: an entire
-// un-detected row of tightly-packed calendar digits (a whole week's dates, or a weekday-header
-// row like "S M T W T F S") merges into ONE wide blob just like a genuine phrase would, then
-// slices into 14-17 near-identical small chunks — each one individually ambiguous (uniform
-// uncropped height regardless of that slice's actual glyph, unlike a real per-word crop) and
-// collectively nothing like the classifier's actual training data. Above this count it's far
-// more likely one mis-merged row of separate print characters than anything resembling a phrase,
-// so skip the whole blob rather than manufacture chunks for it.
-static const int kOrphanMaxChunkCount = 6;
++ (nullable NSNumber *)inkColorMaskAtPath:(NSString *)inputPath
+                                  maskPath:(NSString *)maskPath
+                             minSaturation:(double)minSaturation
+                                     error:(NSError **)error {
+    cv::Mat src;
+    if (!ReadOrFail(inputPath, &src, error)) return nil;
 
-/// Derives the merge-dilation kernel size from the RAW (undilated) unclaimed ink's own measured
-/// letter-fragment height, so it self-calibrates to however the photo was framed — see the
-/// constants' doc comment above for why a width-based radius doesn't. Falls back to the old
-/// width-based estimate only when there's too little raw ink to measure a reliable typical size
-/// from.
-static int MeasureOrphanMergeDilatePx(const cv::Mat &unclaimed, int imageWidth) {
-    cv::Mat rawLabels, rawStats, rawCentroids;
-    int rawNumLabels = cv::connectedComponentsWithStats(unclaimed, rawLabels, rawStats, rawCentroids, 8, CV_32S);
-    std::vector<int> heights;
-    for (int label = 1; label < rawNumLabels; label++) {
-        int area = rawStats.at<int32_t>(label, 4);
-        if (area < kOrphanGlyphStatMinArea) continue;
-        heights.push_back(rawStats.at<int32_t>(label, 3));
-    }
-    if ((int)heights.size() >= kOrphanMinGlyphSamples) {
-        std::sort(heights.begin(), heights.end());
-        int medianHeight = heights[heights.size() / 2];
-        return MIN(kOrphanMergeDilateMaxPx, MAX(kOrphanMergeDilateMinPx, (int)(medianHeight * kOrphanMergeDilateHeightFraction)));
-    }
-    return MIN(kOrphanFallbackMergeDilateMaxPx,
-               MAX(kOrphanFallbackMergeDilateMinPx, (int)(imageWidth * kOrphanFallbackMergeDilateFraction)));
+    cv::Mat gray, hsv;
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(src, hsv, cv::COLOR_BGR2HSV);
+    cv::Mat saturation, value;
+    cv::extractChannel(hsv, saturation, 1);
+    cv::extractChannel(hsv, value, 2);
+    cv::Mat contrast = InkContrast(gray);
+
+    // Seed: saturated pixels that are also real ink (not a tinted paper area).
+    cv::Mat colored, inkStrict, inkLoose;
+    cv::compare(saturation, minSaturation, colored, cv::CMP_GT);
+    cv::compare(contrast, kInkContrastStrict, inkStrict, cv::CMP_GT);
+    cv::compare(contrast, kInkContrastLoose, inkLoose, cv::CMP_GT);
+    cv::bitwise_and(colored, inkStrict, colored);
+    RemoveSmallComponents(colored, MinSpeckleArea(src));
+
+    // A stroke's anti-aliased rim is less saturated than its core, so grow the seed a little —
+    // but only onto pixels that are ink, never onto paper.
+    cv::Mat grown;
+    cv::dilate(colored, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)), cv::Point(-1, -1), 2);
+    cv::bitwise_and(grown, inkLoose, grown);
+    cv::Mat handwriting;
+    cv::bitwise_or(colored, grown, handwriting);
+
+    // Print layer (no model here, so estimated): unsaturated ink OUTSIDE the strokes, plus pixels
+    // inside a stroke dark enough to be that stroke crossing black print. A stroke's own
+    // anti-aliased rim is unsaturated too, so unsaturated ink inside the stroke must not count —
+    // it would be "restored" as a grey outline of the erased stroke.
+    cv::Mat unsaturated, print, printUnder, notHandwriting;
+    cv::compare(saturation, minSaturation, unsaturated, cv::CMP_LE);
+    cv::bitwise_not(handwriting, notHandwriting);
+    cv::bitwise_and(inkStrict, unsaturated, print);
+    cv::bitwise_and(print, notHandwriting, print);
+    cv::compare(value, kPrintUnderMaxValue, printUnder, cv::CMP_LT);
+    cv::bitwise_and(printUnder, handwriting, printUnder);
+    cv::bitwise_or(print, printUnder, print);
+
+    if (!WriteMaskFile(handwriting, print, maskPath, error)) return nil;
+    return Coverage(handwriting);
 }
 
-+ (nullable NSArray<NSDictionary<NSString *, id> *> *)detectOrphanRegionsAtPath:(NSString *)imagePath
-                                                                  existingBlocks:(NSArray<NSDictionary<NSString *, id> *> *)existingBlocks
-                                                                           error:(NSError **)error {
++ (nullable NSNumber *)segmentationMaskAtPath:(NSString *)inputPath
+                                      maskPath:(NSString *)maskPath
+                                     threshold:(double)threshold
+                                         error:(NSError **)error {
     cv::Mat src;
-    if (!ReadOrFail(imagePath, &src, error)) return nil;
+    if (!ReadOrFail(inputPath, &src, error)) return nil;
 
-    cv::Mat gray, binary;
+    cv::Mat printProb, handwritingProb;
+    if (!SegmentPage(src, &printProb, &handwritingProb, error)) return nil;
+
+    // The model runs at a reduced scale, so its masks are soft at full resolution — snap both to
+    // the page's actual ink so erase touches strokes, not blobs of paper around them.
+    cv::Mat gray;
     cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
+    cv::Mat ink, handwriting, print;
+    cv::compare(InkContrast(gray), kInkContrastLoose, ink, cv::CMP_GT);
+    cv::compare(handwritingProb, threshold, handwriting, cv::CMP_GT);
+    cv::bitwise_and(handwriting, ink, handwriting);
+    RemoveSmallComponents(handwriting, MinSpeckleArea(src));
+    cv::compare(printProb, kSegPrintThreshold, print, cv::CMP_GT);
+    cv::bitwise_and(print, ink, print);
 
-    // Padded, not exact — an ML Kit box is accurate but not pixel-perfect down to the ink's own
-    // edge; anti-aliased/blurred stroke edges bleed a few px outside it. Verified: with zero
-    // padding, a row of tightly-spaced letters (a weekday header "W T F") left thin unclaimed
-    // slivers around several ALREADY-correctly-detected letters, which the merge step then
-    // fused into one phantom "orphan" blob of jagged edge fragments — scored as handwriting
-    // purely because it isn't a real letter shape, even though every character involved was
-    // ordinary straight print.
-    cv::Mat unclaimed = binary.clone();
-    for (NSDictionary<NSString *, id> *rectMap in existingBlocks) {
-        cv::Rect rect;
-        if (!MapToClippedRect(rectMap, src.cols, src.rows, kOrphanExistingBlockPaddingPx, &rect, error)) {
-            return nil;
+    if (!WriteMaskFile(handwriting, print, maskPath, error)) return nil;
+    return Coverage(handwriting);
+}
+
++ (nullable NSNumber *)applyMaskStrokesAtPath:(NSString *)maskPath
+                                    outputPath:(NSString *)outputPath
+                                       strokes:(NSArray<NSDictionary<NSString *, id> *> *)strokes
+                                         error:(NSError **)error {
+    // Only the handwriting layer is edited — the print layer stays, so print under a stroke the
+    // user brushes in is still restored on erase.
+    cv::Mat handwriting, print;
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, error)) return nil;
+
+    for (NSDictionary<NSString *, id> *stroke in strokes) {
+        NSArray<NSNumber *> *points = stroke[@"points"];
+        if (![points isKindOfClass:[NSArray class]] || points.count < 2) continue;
+        int thickness = std::max(1, (int)std::lround([stroke[@"width"] doubleValue]));
+        cv::Scalar value([stroke[@"erase"] boolValue] ? 0 : 255);
+        std::vector<cv::Point> polyline;
+        for (NSUInteger i = 0; i + 1 < points.count; i += 2) {
+            polyline.emplace_back((int)std::lround(points[i].doubleValue), (int)std::lround(points[i + 1].doubleValue));
         }
-        cv::rectangle(unclaimed, rect, cv::Scalar(0), -1);
-    }
-
-    int mergeDilatePx = MeasureOrphanMergeDilatePx(unclaimed, src.cols);
-    cv::Mat dilated;
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(mergeDilatePx, mergeDilatePx));
-    cv::dilate(unclaimed, dilated, kernel);
-
-    cv::Mat labels, stats, centroids;
-    int numLabels = cv::connectedComponentsWithStats(dilated, labels, stats, centroids, 8, CV_32S);
-
-    NSMutableArray<NSDictionary<NSString *, id> *> *results = [NSMutableArray array];
-    int w = src.cols, h = src.rows;
-    for (int label = 1; label < numLabels; label++) {
-        int area = stats.at<int32_t>(label, 4);
-        if (area < kOrphanMinArea) continue;
-        int lx = stats.at<int32_t>(label, 0);
-        int ly = stats.at<int32_t>(label, 1);
-        int lw = stats.at<int32_t>(label, 2);
-        int lh = stats.at<int32_t>(label, 3);
-        if (lw < kOrphanMinDimensionPx || lh < kOrphanMinDimensionPx) continue;
-        // Skip anything spanning half the page or more in either direction — a big scanned
-        // graphic/illustration or a merged run of unrelated table gridlines the OCR engine also
-        // skipped, not one line of handwriting.
-        if (lw > w * 0.5 || lh > h * 0.5) continue;
-
-        // Tighten the box back down to the ACTUAL unclaimed ink inside this dilated region, so
-        // the merge-dilation doesn't leave a bloated box around the real word.
-        cv::Rect regionRect(MAX(0, lx), MAX(0, ly), MIN(w - lx, lw), MIN(h - ly, lh));
-        cv::Mat inkInRegion = unclaimed(regionRect);
-        std::vector<cv::Point> nz;
-        cv::findNonZero(inkInRegion, nz);
-        if (nz.empty()) continue;
-        cv::Rect tight = cv::boundingRect(nz);
-        int absLeft = lx + tight.x;
-        int absTop = ly + tight.y;
-
-        // Still a run-on phrase (several words the merge step above couldn't cleanly separate)
-        // — split it into near-square chunks so each one resembles the single-word crops the
-        // classifier was actually trained on, rather than one long strip that gets squashed into
-        // an unrecognizable shape at the model's 128x64 input.
-        double aspectRatio = (double)tight.width / MAX(1, tight.height);
-        if (aspectRatio > kOrphanMaxAspectRatio) {
-            int chunkCount = MAX(2, (int)aspectRatio);
-            if (chunkCount > kOrphanMaxChunkCount) continue;
-            int chunkWidth = tight.width / chunkCount;
-            for (int i = 0; i < chunkCount; i++) {
-                int chunkLeft = absLeft + i * chunkWidth;
-                int chunkRight = (i == chunkCount - 1) ? absLeft + tight.width : chunkLeft + chunkWidth;
-                [results addObject:@{
-                    @"id" : [NSString stringWithFormat:@"orphan_%d_%d", label, i],
-                    @"left" : @(chunkLeft),
-                    @"top" : @(absTop),
-                    @"right" : @(chunkRight),
-                    @"bottom" : @(absTop + tight.height),
-                }];
-            }
+        if (polyline.size() == 1) {
+            cv::circle(handwriting, polyline[0], thickness / 2, value, -1);
         } else {
-            [results addObject:@{
-                @"id" : [NSString stringWithFormat:@"orphan_%d", label],
-                @"left" : @(absLeft),
-                @"top" : @(absTop),
-                @"right" : @(absLeft + tight.width),
-                @"bottom" : @(absTop + tight.height),
-            }];
-        }
-    }
-    return results;
-}
-
-+ (nullable NSArray<NSDictionary<NSString *, id> *> *)detectHandwritingRegionsAtPath:(NSString *)imagePath
-                                                                           textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
-                                                                                error:(NSError **)error {
-    cv::Mat src;
-    if (!ReadOrFail(imagePath, &src, error)) return nil;
-
-    cv::Mat gray;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-
-    NSMutableArray<NSDictionary<NSString *, id> *> *results = [NSMutableArray arrayWithCapacity:textBlocks.count];
-    for (NSDictionary<NSString *, id> *block in textBlocks) {
-        NSString *blockId = block[@"id"] ?: @"";
-        cv::Rect rect;
-        if (!MapToClippedRect(block, gray.cols, gray.rows, 0.0, &rect, error)) {
-            return nil;
-        }
-        NSNumber *charCountNumber = block[@"charCount"];
-        int charCount = [charCountNumber isKindOfClass:[NSNumber class]] ? charCountNumber.intValue : 1;
-        RegionStats stats = ScoreRegion(src, gray, rect, charCount);
-        // Native-only fallback confidence (stroke shape + component count), used if the
-        // page-relative signals in Dart have nothing to compare against.
-        double confidence = 0.5 * stats.strokeVariationScore + 0.5 * stats.componentRatioScore;
-        [results addObject:@{
-            @"id" : blockId,
-            @"confidence" : @(confidence),
-            @"angleVariationScore" : @(stats.angleVariationScore),
-            @"avgStrokeWidth" : @(stats.avgStrokeWidth),
-            @"inkColorB" : @(stats.inkColorB),
-            @"inkColorG" : @(stats.inkColorG),
-            @"inkColorR" : @(stats.inkColorR),
-            @"inkIntensityStdDev" : @(stats.inkIntensityStdDev),
-            @"hasWideUnderline" : @(stats.hasWideUnderline),
-            @"hasReliableAngleData" : @(stats.hasReliableAngleData),
-            @"hasInk" : @(stats.hasInk),
-        }];
-    }
-    return results;
-}
-
-+ (nullable NSArray<NSData *> *)handwritingCropsAtPath:(NSString *)imagePath
-                                              textBlocks:(NSArray<NSDictionary<NSString *, id> *> *)textBlocks
-                                                   error:(NSError **)error {
-    static const int kInputW = 128;
-    static const int kInputH = 64;
-    // Must match ml/generate_dataset.py's NATIVE_PADDING_PX exactly. A raw ML Kit word box
-    // resized straight to kInputW x kInputH makes the glyph fill ~100% of the frame — verified
-    // against a real photo, this alone (not stroke shape) made the model flag nearly every
-    // word, print included, as handwriting. Training now crops the same way this does.
-    static const double kPaddingPx = 5.0;
-
-    cv::Mat src;
-    if (!ReadOrFail(imagePath, &src, error)) return nil;
-
-    cv::Mat gray;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-
-    NSMutableArray<NSData *> *results = [NSMutableArray arrayWithCapacity:textBlocks.count];
-    for (NSDictionary<NSString *, id> *block in textBlocks) {
-        cv::Rect rect;
-        if (!MapToClippedRect(block, gray.cols, gray.rows, kPaddingPx, &rect, error)) {
-            return nil;
-        }
-        cv::Mat crop(gray, rect);
-        cv::Mat resized;
-        cv::resize(crop, resized, cv::Size(kInputW, kInputH));
-        if (!resized.isContinuous()) {
-            resized = resized.clone();
-        }
-        [results addObject:[NSData dataWithBytes:resized.data length:(NSUInteger)(kInputW * kInputH)]];
-    }
-    return results;
-}
-
-// Grading/pen ink is COLORED — red, blue, green, whatever pen was on hand — while printed text
-// is black/gray (R≈G≈B, near-zero saturation). A mask built from saturation, not plain darkness,
-// can never include a black-print pixel no matter how close or how it's grown — verified:
-// growing on plain darkness bridged into unrelated words only ~7px away on a dense worksheet,
-// but a color-gated mask left print untouched even where a stroke crosses directly over it.
-// Originally gated on "redness" specifically (this app's first real test photos all happened to
-// use red pen) — verified on a later real photo written in blue ink that redness-only growth
-// found nothing there at all, leaving only each word's own tight box erased. Saturation
-// generalizes to any ink color without needing to special-case each one.
-static const double kSaturationThreshold = 40.0;
-static const int kInkDilatePx = 5;
-// How close a colored-ink connected component must be to a flagged word's box to count as
-// "its" mark. Since inclusion is gated by color, not distance, there is no risk of ever
-// marking a black-print pixel this way — so the WHOLE component is taken once any part of it
-// is this close, however far the component itself runs (a long diagonal strike-through can
-// extend 100px+ from the word it crosses out; clipping the mask to a fixed-size window around
-// the word left such strokes half-erased).
-static const int kProximityPx = 20;
-
-/// Computes the whole-page colored-ink mask and its connected components ONCE, reused for every
-/// flagged word (cheaper than re-deriving a local mask per word, and is what lets a component's
-/// full extent be found regardless of which word ends up near which part of it).
-static int BuildInkComponents(const cv::Mat &colorSrc, const cv::Mat &graySrc, cv::Mat *inkMaskOut, cv::Mat *labelsOut, cv::Mat *statsOut) {
-    cv::Mat hsv;
-    cv::cvtColor(colorSrc, hsv, cv::COLOR_BGR2HSV);
-    std::vector<cv::Mat> hsvChannels;
-    cv::split(hsv, hsvChannels);
-    cv::Mat satMask, darkMask, dilated, centroids;
-    cv::compare(hsvChannels[1], kSaturationThreshold, satMask, cv::CMP_GT);
-    cv::compare(graySrc, 220, darkMask, cv::CMP_LT);
-    cv::bitwise_and(satMask, darkMask, *inkMaskOut);
-
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kInkDilatePx, kInkDilatePx));
-    cv::dilate(*inkMaskOut, dilated, kernel);
-    return cv::connectedComponentsWithStats(dilated, *labelsOut, *statsOut, centroids, 8, CV_32S);
-}
-
-/// Paints every colored-ink component near `seed` into `mask` in full (not clipped to a local
-/// window), plus `seed`'s own ink specifically — not the whole rectangle solid. A handwritten
-/// word's bounding box is axis-aligned but the writing itself rarely is (slanted, uneven letter
-/// heights), so a solid rectangle fill reaches into its own corners — verified: this erased a
-/// nearby PRINTED word that happened to sit inside a handwriting box's corner but was never
-/// actually part of the handwriting's own ink.
-///
-/// Within the seed itself, prefer the already-computed COLORED-ink mask over a fresh Otsu
-/// darkness threshold: Otsu just splits the crop's own pixels into "darker half" / "lighter
-/// half" with no idea which dark pixels are the handwriting and which are a printed word sharing
-/// the same crop — verified: a handwriting box that happened to reach right up against an
-/// adjacent printed word's edge had Otsu darken both, erasing part of the print. Color can't make
-/// that mistake (print isn't saturated). Only fall back to plain darkness when the seed has
-/// literally no colored ink at all — composed handwriting glyphs in a color that doesn't stand
-/// out from print (graphite pencil, a black pen), the one case color can't help with, which is
-/// the reason this fallback exists in the first place.
-static void PaintInkMask(const cv::Rect &seed, const cv::Mat &gray, const cv::Mat &inkMask, const cv::Mat &labels, const cv::Mat &stats, int numLabels, cv::Mat *mask) {
-    int sx0 = MAX(0, seed.x - kProximityPx);
-    int sy0 = MAX(0, seed.y - kProximityPx);
-    int sx1 = MIN(labels.cols, seed.x + seed.width + kProximityPx);
-    int sy1 = MIN(labels.rows, seed.y + seed.height + kProximityPx);
-    if (sx1 > sx0 && sy1 > sy0) {
-        cv::Mat window = labels(cv::Rect(sx0, sy0, sx1 - sx0, sy1 - sy0));
-        std::set<int> nearbyLabels;
-        for (int y = 0; y < window.rows; y++) {
-            const int32_t *row = window.ptr<int32_t>(y);
-            for (int x = 0; x < window.cols; x++) {
-                if (row[x] != 0) nearbyLabels.insert(row[x]);
-            }
-        }
-        for (int label : nearbyLabels) {
-            if (label < 1 || label >= numLabels) continue;
-            if (stats.at<int32_t>(label, 2) * stats.at<int32_t>(label, 3) < 4) continue;
-            cv::Mat componentMask;
-            cv::compare(labels, label, componentMask, cv::CMP_EQ);
-            cv::bitwise_or(*mask, componentMask, *mask);
+            cv::polylines(handwriting, polyline, false, value, thickness, cv::LINE_8);
         }
     }
 
-    cv::Rect clippedSeed = seed & cv::Rect(0, 0, gray.cols, gray.rows);
-    if (clippedSeed.width <= 0 || clippedSeed.height <= 0) return;
-
-    cv::Mat coloredInkCrop = inkMask(clippedSeed);
-    if (cv::countNonZero(coloredInkCrop) > 0) {
-        cv::Mat maskRoi = (*mask)(clippedSeed);
-        cv::bitwise_or(maskRoi, coloredInkCrop, maskRoi);
-        return;
-    }
-
-    cv::Mat seedCrop = gray(clippedSeed);
-    cv::Mat seedDark;
-    cv::threshold(seedCrop, seedDark, 0, 255, cv::THRESH_BINARY_INV + cv::THRESH_OTSU);
-    cv::Mat maskRoi = (*mask)(clippedSeed);
-    cv::bitwise_or(maskRoi, seedDark, maskRoi);
+    if (!WriteMaskFile(handwriting, print, outputPath, error)) return nil;
+    return Coverage(handwriting);
 }
 
-+ (BOOL)eraseRegionsAtPath:(NSString *)inputPath
-                 outputPath:(NSString *)outputPath
-                      rects:(NSArray<NSDictionary<NSString *, id> *> *)rects
-                  keepRects:(NSArray<NSDictionary<NSString *, id> *> *)keepRects
-                    padding:(double)padding
-              inpaintRadius:(double)inpaintRadius
-                      error:(NSError **)error {
-    cv::Mat src;
++ (BOOL)eraseWithMaskAtPath:(NSString *)inputPath
+                    maskPath:(NSString *)maskPath
+                  outputPath:(NSString *)outputPath
+                    dilatePx:(double)dilatePx
+                       error:(NSError **)error {
+    cv::Mat src, handwriting, print;
     if (!ReadOrFail(inputPath, &src, error)) return NO;
-
-    cv::Mat gray;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-
-    cv::Mat inkMask, labels, stats;
-    int numLabels = BuildInkComponents(src, gray, &inkMask, &labels, &stats);
-
-    cv::Mat mask = cv::Mat::zeros(src.size(), CV_8UC1);
-    for (NSDictionary<NSString *, id> *rectMap in rects) {
-        cv::Rect rect;
-        if (!MapToClippedRect(rectMap, src.cols, src.rows, padding, &rect, error)) {
-            return NO;
-        }
-        PaintInkMask(rect, gray, inkMask, labels, stats, numLabels, &mask);
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, error)) return NO;
+    if (handwriting.size() != src.size()) {
+        cv::resize(handwriting, handwriting, src.size(), 0, 0, cv::INTER_NEAREST);
+        cv::resize(print, print, src.size(), 0, 0, cv::INTER_NEAREST);
     }
 
-    // A region explicitly classified as print — NOT selected for erase — carved back out of the
-    // mask, no matter how it got painted in. Verified: real handwriting directly touching a
-    // correctly-classified printed digit (their boxes literally overlapped) still eroded part of
-    // that digit, because nothing upstream of this point has any notion of "this pixel belongs
-    // to a DIFFERENT, kept region" — painting is driven entirely by proximity to the word being
-    // erased. This is the one place that can enforce it unconditionally, after everything else
-    // has already run.
-    for (NSDictionary<NSString *, id> *keepMap in keepRects) {
-        cv::Rect keepRect;
-        if (!MapToClippedRect(keepMap, src.cols, src.rows, 0.0, &keepRect, error)) {
-            return NO;
-        }
-        cv::rectangle(mask, keepRect, cv::Scalar(0), -1);
+    // Grow over the stroke's faint rim — but only onto non-print pixels, so the growth can never
+    // eat into print the stroke merely passes next to.
+    cv::Mat area = handwriting.clone();
+    int grow = (int)std::lround(dilatePx);
+    if (grow > 0) {
+        cv::Mat grown, notPrint;
+        cv::dilate(handwriting, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * grow + 1, 2 * grow + 1)));
+        cv::bitwise_not(print, notPrint);
+        cv::bitwise_and(grown, notPrint, grown);
+        cv::bitwise_or(area, grown, area);
     }
 
-    cv::Mat dst;
-    cv::inpaint(src, mask, dst, inpaintRadius, cv::INPAINT_TELEA);
+    // Rebuild instead of inpainting: inside the erased area, print pixels get the colour of the
+    // surrounding print (so a pen stroke crossing a word leaves the word's strokes intact) and
+    // everything else gets the paper colour. Outside the area the page is untouched.
+    cv::Mat restorePrint, paperArea, visiblePrint, notArea;
+    cv::bitwise_and(area, print, restorePrint);
+    cv::bitwise_xor(area, restorePrint, paperArea);
+    cv::bitwise_not(area, notArea);
+    cv::bitwise_and(print, notArea, visiblePrint);
 
+    cv::Mat dst = src.clone();
+    EstimatePaperColor(src).copyTo(dst, paperArea);
+    EstimatePrintColor(src, visiblePrint).copyTo(dst, restorePrint);
     return WriteOrFail(dst, outputPath, error);
 }
 

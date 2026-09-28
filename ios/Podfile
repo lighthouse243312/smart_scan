@@ -1,5 +1,5 @@
 # Uncomment this line to define a global platform for your project
-# google_mlkit_text_recognition requires iOS 15.5+ (see its README) — do not lower this.
+# The InkSegmenter Core ML model (ml/export_ink_seg.py) targets iOS 15+ — do not lower below 15.
 platform :ios, '15.5'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
@@ -29,8 +29,8 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 flutter_ios_podfile_setup
 
 target 'Runner' do
-  # :static linkage (not the default dynamic) works around an "Undefined symbol: Mlas*"
-  # link error from google_mlkit_text_recognition's bundled ONNX Runtime on device builds.
+  # :static linkage (not the default dynamic) was originally needed for ML Kit's bundled ONNX
+  # Runtime (since removed); kept since the rest of the build has only been verified with it.
   use_frameworks! :linkage => :static
 
   # Vendored official OpenCV iOS framework (opencv.org release 5.0.0) — backs the
