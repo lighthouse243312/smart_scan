@@ -62,7 +62,7 @@ object InkSegmenter {
         }
     }
 
-    fun mask(context: Context, inputPath: String, maskPath: String, threshold: Double): Map<String, Any> {
+    fun mask(context: Context, inputPath: String, maskPath: String, threshold: Double, colorDelta: Double): Map<String, Any> {
         val model = ensureLoaded(context)
         val src = ImageIO.readOrThrow(inputPath)
         val printProb = Mat()
@@ -89,11 +89,29 @@ object InkSegmenter {
             print.convertTo(print, CvType.CV_8U)
             Core.bitwise_and(print, ink, print)
 
-            // the model's two layers are independent: where both are set, print lies under the pen
-            val overlap = Mat()
-            Core.bitwise_and(handwriting, print, overlap)
-            releasing(overlap) { HandwritingMask.write(handwriting, print, overlap, maskPath) }
-            HandwritingMask.result(maskPath, handwriting)
+            // combined with the ink-colour + layout method (see ios segmentationMaskAtPath): colour
+            // finds neat pen writing the model misses, the model finds pen ink the same colour as
+            // the print. A model pixel is dropped only where BOTH agree it is print.
+            val (colorHw, colorPrint, colorOverlap) = InkAnalysis.detectByInkColor(src, colorDelta)
+            val tmp = Mat(); val hw = Mat(); val overlap = Mat(); val outPrint = Mat(); val notHw = Mat(); val notColorHw = Mat()
+            releasing(colorHw, colorPrint, colorOverlap, tmp, hw, overlap, outPrint, notHw, notColorHw) {
+                Core.bitwise_and(colorPrint, print, tmp)
+                Core.bitwise_not(tmp, tmp)
+                Core.bitwise_and(handwriting, tmp, tmp)
+                Core.bitwise_or(colorHw, tmp, hw)
+                // print under the pen: colour's overlap, plus where the model's print layer is set
+                // under model-only handwriting
+                Core.bitwise_not(colorHw, notColorHw)
+                Core.bitwise_and(hw, print, tmp)
+                Core.bitwise_and(tmp, notColorHw, tmp)
+                Core.bitwise_or(colorOverlap, tmp, overlap)
+                Core.bitwise_or(colorPrint, print, outPrint)
+                Core.bitwise_not(hw, notHw)
+                Core.bitwise_and(outPrint, notHw, outPrint)
+                Core.bitwise_or(outPrint, overlap, outPrint)
+                HandwritingMask.write(hw, outPrint, overlap, maskPath)
+                HandwritingMask.result(maskPath, hw)
+            }
         }
     }
 

@@ -95,7 +95,7 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
                       ),
                       ButtonSegment(
                         value: HandwritingMethod.segmentation,
-                        label: Text('Model AI'),
+                        label: Text('Màu mực + AI'),
                         icon: Icon(Icons.auto_awesome_outlined),
                       ),
                     ],
@@ -186,7 +186,7 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
   String _hintText(HandwritingMethod method, double coverage) {
     if (coverage <= 0) {
       return method == HandwritingMethod.inkColor
-          ? 'Không thấy nét bút khác màu mực in — thử tăng độ nhạy; bút cùng màu mực in thì dùng "Model AI".'
+          ? 'Không thấy nét bút khác màu mực in — thử tăng độ nhạy; bút cùng màu mực in thì dùng "Màu mực + AI".'
           : 'Không thấy chữ viết tay — thử tăng độ nhạy hoặc tô thêm bằng cọ.';
     }
     final percent = (coverage * 100).toStringAsFixed(coverage < 0.01 ? 2 : 1);

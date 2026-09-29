@@ -82,6 +82,7 @@ object ImageProcessingChannel {
                     requirePath(call, "inputPath"),
                     requirePath(call, "maskPath"),
                     requireDouble(call, "threshold", 0.5),
+                    requireDouble(call, "colorDelta", 0.05),
                 )
             "applyMaskStrokes" ->
                 MaskEditor.applyStrokes(
