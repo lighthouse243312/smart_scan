@@ -23,7 +23,7 @@ from __future__ import annotations
 
 TILE = 256
 NUM_CHANNELS = 2
-WIDTHS = (24, 40, 64, 112, 192)
+WIDTHS = (16, 32, 64, 112, 192)
 BN_EPS = 1e-3
 
 

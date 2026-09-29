@@ -48,6 +48,7 @@ for root, dirs, files in os.walk(os.path.join(ML_DIR, "tfds_data", "downloads", 
         EMNIST_DIR = root
         break
 
+TAG = os.environ.get("INKSEG_TAG", "")  # optional dataset-name tag (for side-by-side experiments)
 TILE = 256
 OVERLAP = 32
 STRIDE = TILE - OVERLAP
@@ -395,15 +396,90 @@ XHEIGHT_LOWER = set("acemnorsuvwxz")
 DESC_LOWER = set("gjpqy")
 
 
-def emnist_word(text, cap_h, rng):
-    """Compose EMNIST glyphs into a word patch (float coverage). Returns (patch, baseline_y)."""
+def restroke(cov, target_w, rng):
+    """Normalise stroke width of a coverage patch to ~target_w px (EMNIST strokes are thick,
+    ~15% of the glyph height; real ballpoint is ~6-10%). Distance-transform based thinning /
+    thickening at 2x resolution."""
+    h, w = cov.shape
+    big = cv2.resize(cov, (w * 2, h * 2), interpolation=cv2.INTER_LINEAR)
+    m = (big > 0.5).astype(np.uint8)
+    if m.sum() < 10:
+        return cov
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    ridge = dist[(dist > 0) & (dist >= cv2.dilate(dist, np.ones((3, 3), np.uint8)) - 1e-3)]
+    half = float(np.median(ridge)) if len(ridge) else float(dist.max())
+    tgt_half = max(1.0, target_w)  # at 2x scale, half width in 2x px == width in 1x px
+    if tgt_half < half:
+        keep = dist > (half - tgt_half)
+        out = keep.astype(np.float32)
+    else:
+        k = int(round((tgt_half - half) * 2)) + 1
+        out = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(np.float32)
+    out = cv2.GaussianBlur(out, (0, 0), 0.7)
+    return np.clip(cv2.resize(out, (w, h), interpolation=cv2.INTER_AREA), 0, 1)
+
+
+VI_BASE_EXTRA = {"đ": ("d", ["bar"]), "Đ": ("D", ["bar"])}
+COMBINING = {"\u0301": "acute", "\u0300": "grave", "\u0309": "hook", "\u0303": "tilde", "\u0323": "dotbelow",
+             "\u0302": "circ", "\u0306": "breve", "\u031b": "horn"}
+
+
+def _decompose(ch):
+    import unicodedata
+    if ch in VI_BASE_EXTRA:
+        return VI_BASE_EXTRA[ch]
+    d = unicodedata.normalize("NFD", ch)
+    return d[0], [COMBINING[c] for c in d[1:] if c in COMBINING]
+
+
+def _draw_diacritics(canvas, marks, box, cap_h, t, rng):
+    x0, y0, x1, y1 = box
+    cx = (x0 + x1) / 2 + rng.uniform(-0.1, 0.1) * cap_h
+    top = y0 - cap_h * 0.12
+    s = cap_h * rng.uniform(0.18, 0.28)
+    J = lambda: rng.uniform(-0.05, 0.05) * cap_h
+    def ln(pts):
+        pts = np.array(pts, np.float32)
+        cv2.polylines(canvas, [np.round(pts).astype(np.int32)], False, 1.0, t, cv2.LINE_AA)
+    for mk in marks:
+        if mk == "circ":
+            ln([(cx - s, top), (cx, top - s + J()), (cx + s, top)])
+            top -= s * 1.1
+        elif mk == "breve":
+            ln([(cx - s, top - s), (cx - s * 0.3, top), (cx + s * 0.3, top), (cx + s, top - s)])
+            top -= s * 1.1
+    for mk in marks:
+        if mk == "acute":
+            ln([(cx - s * 0.2 + s * 0.6, top - s * 1.1 + J()), (cx + s * 0.1, top)])
+        elif mk == "grave":
+            ln([(cx - s * 0.6, top - s * 1.1 + J()), (cx, top)])
+        elif mk == "hook":
+            ln([(cx - s * 0.4, top - s), (cx + s * 0.1, top - s * 1.2), (cx + s * 0.3, top - s * 0.7), (cx, top - s * 0.3), (cx, top)])
+        elif mk == "tilde":
+            ln([(cx - s, top - s * 0.3), (cx - s * 0.4, top - s * 0.8), (cx + s * 0.3, top - s * 0.3), (cx + s, top - s * 0.8)])
+        elif mk == "dotbelow":
+            cv2.circle(canvas, (int(cx), int(y1 + cap_h * 0.18)), max(1, int(t * 0.8)), 1.0, -1, cv2.LINE_AA)
+        elif mk == "horn":
+            ln([(x1 - s * 0.3, y0 + s * 0.5), (x1 + s * 0.3, y0 - s * 0.1), (x1 + s * 0.2, y0 - s * 0.6)])
+        elif mk == "bar":
+            yb = y0 + (y1 - y0) * rng.uniform(0.25, 0.4)
+            ln([(x0 + (x1 - x0) * 0.3, yb), (x1 + s * 0.3, yb + J())])
+
+
+def emnist_word(text, cap_h, rng, stroke_w=None):
+    """Compose EMNIST glyphs into a word patch (float coverage). Returns (patch, baseline_y).
+    Vietnamese diacritics are drawn as extra pen strokes on the base glyph."""
     cap_h = max(8, cap_h)
     pad = int(cap_h * 0.8) + 4
     glyphs = []
+    marks_per = []
     for ch in text:
         if ch == " ":
             glyphs.append(None)
+            marks_per.append([])
             continue
+        ch, mk = _decompose(ch)
+        marks_per.append(mk)
         key = ch
         if key not in EMNIST:
             if key.upper() in EMNIST:
@@ -415,9 +491,10 @@ def emnist_word(text, cap_h, rng):
                 continue
         glyphs.append((key, rng.choice(EMNIST[key])))
     W = int(len(text) * cap_h * 1.1) + 2 * pad
-    H = int(cap_h * 2.2) + 2 * pad
+    H = int(cap_h * 2.6) + 2 * pad
     canvas = np.zeros((H, W), np.float32)
-    base = pad + int(cap_h * 1.3)
+    base = pad + int(cap_h * 1.7)
+    boxes = []
     x = pad
     wobble_amp = rng.uniform(0, 0.12) * cap_h
     wobble_ph = rng.uniform(0, 6.28)
@@ -465,8 +542,15 @@ def emnist_word(text, cap_h, rng):
         y0 = min(max(0, y0), H - gh2)
         x0 = min(x, W - gw2)
         np.maximum(canvas[y0:y0 + gh2, x0:x0 + gw2], gl, out=canvas[y0:y0 + gh2, x0:x0 + gw2])
+        boxes.append((i, (x0, y0, x0 + gw2, y0 + gh2)))
         x += int(gw2 * (1 + spacing) + cap_h * 0.05)
     canvas = canvas[:, : min(W, x + pad)]
+    if stroke_w is not None:
+        canvas = restroke(canvas, stroke_w, rng)
+    t = max(1, int(round(stroke_w if stroke_w is not None else cap_h * 0.1)))
+    for i, b in boxes:
+        if marks_per[i]:
+            _draw_diacritics(canvas, marks_per[i], b, cap_h, t, rng)
     return canvas, base
 
 
@@ -555,7 +639,7 @@ def cursive_word(n_letters, cap_h, width_px, rng, sc: StrokeCanvas | None = None
             bars.append(((x + 0.1 * wl + slant * 1.3 * xh, base - 1.3 * xh), (x + 0.8 * wl + slant * 1.3 * xh, base - 1.35 * xh)))
         x += wl
     c = StrokeCanvas(W, H)
-    width = max(0.8, cap_h * rng.uniform(0.07, 0.13))
+    width = width_px if width_px else max(0.8, cap_h * rng.uniform(0.07, 0.13))
     c.polyline(catmull_rom(pts, 6), width, rng)
     for d in dots:
         c.dot(d[0], d[1], width * 0.8)
@@ -583,6 +667,8 @@ class Page:
 
     def _dark_color(self):
         g = self.rng.randint(0, 70)
+        if self.rng.random() < 0.2:  # navy / blue-ish black print (colour must not be a shortcut)
+            return (g // 2, g // 2 + self.rng.randint(0, 8), g // 2 + self.rng.randint(8, 30))
         t = self.rng.randint(-8, 8)
         return (max(0, g + t), g, max(0, g - t))
 
@@ -673,7 +759,7 @@ class Page:
             x0 = x0 + max(0, (width - tw) / 2)
         self.text_line(x0, y, words, fc, size, col, max_x=x0 + width)
         y += size * 1.5
-        if self.rng.random() < 0.25:
+        if self.rng.random() < 0.4:  # section heading with a printed rule (CV / report style)
             self.hline(x0, x0 + width, y - size * 0.2, width=self.rng.randint(1, 3), color=col)
             y += size * 0.3
         return y
@@ -843,23 +929,102 @@ class Page:
         return y + s + base
 
     def block_image(self, x0, y, width, base):
-        """halftone-ish photo / figure: printed content, labelled print where dark."""
-        w = int(width * self.rng.uniform(0.3, 0.7))
+        """grayscale photo / figure (e.g. CV portrait): printed content -> must never be handwriting.
+        Labelled print where its ink alpha > 0.5, like any other printed ink."""
+        w = int(width * self.rng.uniform(0.2, 0.6))
+        if self.rng.random() < 0.5:
+            x0 = x0 + width - w
         h = int(min(self.h - y - base, w * self.rng.uniform(0.5, 0.9)))
         if h < base * 3:
             return y
-        noise = np.random.default_rng(self.rng.randrange(1 << 30)).random((max(2, h // 16), max(2, w // 16))).astype(np.float32)
-        img = cv2.resize(noise, (w, h), interpolation=cv2.INTER_CUBIC)
-        img = np.clip((img - img.min()) / (np.ptp(img) + 1e-6), 0, 1) * self.rng.uniform(0.4, 1.0)
+        img = photo_like(w, h, self.rng)
+        circ = self.rng.random() < 0.35
+        if circ:  # circular / rounded portrait crop
+            yy, xx = np.mgrid[0:h, 0:w]
+            img = img * ((((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2) <= 1)
         layer = self.print_layers.setdefault(self.dark, Image.new("L", (self.w, self.h), 0))
         arr = np.asarray(layer).copy()
         xi, yi = int(x0), int(y)
         sub = arr[yi:yi + h, xi:xi + w]
         np.maximum(sub, (img[: sub.shape[0], : sub.shape[1]] * 255).astype(np.uint8), out=sub)
         self.print_layers[self.dark] = Image.fromarray(arr)
-        self.rect((xi, yi, xi + w, yi + h))
+        if circ:
+            lw = self.rng.choice([0, 2, 3, 5])
+            if lw:
+                self.draw().ellipse((xi - lw, yi - lw, xi + w + lw, yi + h + lw), outline=255, width=lw)
+        elif self.rng.random() < 0.7:
+            self.rect((xi, yi, xi + w, yi + h))
         self.text_line(x0, y + h + base * 0.3, ["Fig."] + rand_words(self.rng, 8, self.vi), self.body_face, base * 0.8)
         return y + h + base * 2
+
+    def block_shapes(self, x0, y, width, base):
+        """printed vector graphics: circles/ellipses, rounded boxes, icons, smooth curves, arrows.
+        Hand-drawn marks are made of the same primitives, so the model must learn the regularity
+        (perfect geometry, constant width) rather than 'circle = handwriting'."""
+        rng = self.rng
+        col = self.accent if rng.random() < 0.4 else None
+        d = self.draw(col)
+        h = base * rng.uniform(2, 6)
+        cx = x0
+        while cx < x0 + width - base * 2:
+            k = rng.random()
+            s = base * rng.uniform(0.6, 4)
+            lw = rng.choice([1, 2, 2, 3, 4])
+            if k < 0.25:
+                d.ellipse((cx, y, cx + s * rng.uniform(1, 1.8), y + s), outline=255, width=lw)
+            elif k < 0.4:
+                d.rounded_rectangle((cx, y, cx + s * rng.uniform(1, 3), y + s), radius=s * 0.25, outline=255, width=lw)
+            elif k < 0.6:  # small filled icons next to text (CV contact lines, bullets)
+                r = base * rng.uniform(0.3, 0.6)
+                shape = rng.choice(["circle", "square", "tri", "pin"])
+                if shape == "circle":
+                    d.ellipse((cx, y, cx + r * 2, y + r * 2), fill=255)
+                elif shape == "square":
+                    d.rectangle((cx, y, cx + r * 2, y + r * 1.6), fill=255)
+                elif shape == "tri":
+                    d.polygon([(cx, y + r * 2), (cx + r, y), (cx + r * 2, y + r * 2)], fill=255)
+                else:
+                    d.ellipse((cx, y, cx + r * 2, y + r * 2), fill=255)
+                    d.polygon([(cx + r * 0.3, y + r * 1.4), (cx + r, y + r * 2.6), (cx + r * 1.7, y + r * 1.4)], fill=255)
+                self.text_line(cx + r * 2.8, y - r * 0.2, rand_words(rng, rng.randint(1, 4), self.vi), self.body_face, base, max_x=x0 + width)
+                s = base * 8
+            elif k < 0.8:  # smooth printed curve (template swoosh)
+                pts = catmull_rom([(cx, y + s * rng.uniform(0, 1)), (cx + width * 0.3, y + s * rng.uniform(0, 1)),
+                                   (cx + width * 0.6, y + s * rng.uniform(0, 1)), (x0 + width, y + s * rng.uniform(0, 1))], 20)
+                d.line([tuple(p) for p in pts], fill=255, width=lw, joint="curve")
+                s = width
+            else:  # printed arrow
+                L = s * 2
+                d.line([(cx, y + s / 2), (cx + L, y + s / 2)], fill=255, width=lw)
+                d.polygon([(cx + L, y + s / 2 - s * 0.25), (cx + L + s * 0.4, y + s / 2), (cx + L, y + s / 2 + s * 0.25)], fill=255)
+                s = L + s * 0.4
+            self.word_boxes.append((cx, y, cx + s, y + base))
+            cx += s + base * rng.uniform(1, 4)
+        return y + h
+
+    def block_cvheader(self, x0, y, width, base):
+        """CV-style header: circular portrait (+ printed ring), name, contact icons, rule/curve."""
+        rng = self.rng
+        s = int(base * rng.uniform(5, 9))
+        img = photo_like(s, s, rng)
+        yy, xx = np.mgrid[0:s, 0:s]
+        img = img * ((((xx - s / 2) / (s / 2)) ** 2 + ((yy - s / 2) / (s / 2)) ** 2) <= 1)
+        layer = self.print_layers.setdefault(self.dark, Image.new("L", (self.w, self.h), 0))
+        arr = np.asarray(layer).copy()
+        xi, yi = int(x0), int(y)
+        sub = arr[yi:yi + s, xi:xi + s]
+        np.maximum(sub, (img[: sub.shape[0], : sub.shape[1]] * 255).astype(np.uint8), out=sub)
+        self.print_layers[self.dark] = Image.fromarray(arr)
+        d = self.draw()
+        lw = rng.choice([2, 3, 4, 6])
+        d.ellipse((xi - lw, yi - lw, xi + s + lw, yi + s + lw), outline=255, width=lw)
+        tx = x0 + s * 1.2
+        self.text_line(tx, y + s * 0.2, rand_words(rng, 3, self.vi), self.face(), base * rng.uniform(1.4, 2.0), max_x=x0 + width)
+        if rng.random() < 0.7:
+            pts = catmull_rom([(xi + s, y + s * 0.45), (tx + width * 0.2, y + s * 0.42), (x0 + width, y + s * 0.4 + rng.uniform(-5, 5))], 20)
+            d.line([tuple(p) for p in pts], fill=255, width=rng.choice([1, 2, 3]), joint="curve")
+        self.block_shapes(tx, y + s * 0.55, width - s * 1.2, base * 0.8)
+        return y + s + base * 1.5
 
     def block_footnote(self, x0, y, width, base):
         size = max(9, base * self.rng.uniform(0.55, 0.75))
@@ -876,15 +1041,17 @@ def layout_flow(page: Page, base):
     page.body_face = page.face(mono=rng.random() < 0.08)
     kind = rng.random()
     if kind < 0.35:
-        weights = {"heading": 2, "paragraph": 5, "list": 2, "questions": 1, "form": 1, "table": 1.5, "logo": 0.4, "image": 0.6, "footnote": 0.4}
+        weights = {"heading": 2, "paragraph": 5, "list": 2, "questions": 1, "form": 1, "table": 1.5, "logo": 0.4, "image": 1.0, "footnote": 0.4, "shapes": 0.7}
     elif kind < 0.65:  # worksheet / exam
-        weights = {"heading": 1.5, "paragraph": 1, "list": 0.5, "questions": 6, "form": 1, "table": 0.8, "logo": 0.3, "image": 0.3, "footnote": 0.2}
+        weights = {"heading": 1.5, "paragraph": 1, "list": 0.5, "questions": 6, "form": 1, "table": 0.8, "logo": 0.3, "image": 0.3, "footnote": 0.2, "shapes": 0.5}
     elif kind < 0.85:  # form-ish
-        weights = {"heading": 1.5, "paragraph": 1, "list": 0.5, "questions": 0.5, "form": 5, "table": 2, "logo": 0.8, "image": 0.2, "footnote": 0.3}
+        weights = {"heading": 1.5, "paragraph": 1, "list": 0.5, "questions": 0.5, "form": 5, "table": 2, "logo": 0.8, "image": 0.6, "footnote": 0.3, "shapes": 0.6}
     else:  # table-heavy report
-        weights = {"heading": 1.5, "paragraph": 1.5, "list": 0.5, "questions": 0.3, "form": 0.5, "table": 5, "logo": 0.3, "image": 0.3, "footnote": 0.3}
+        weights = {"heading": 1.5, "paragraph": 1.5, "list": 0.5, "questions": 0.3, "form": 0.5, "table": 5, "logo": 0.3, "image": 0.3, "footnote": 0.3, "shapes": 0.6}
     keys, ws = list(weights), list(weights.values())
-    if rng.random() < 0.7:
+    if rng.random() < 0.18:
+        y = page.block_cvheader(x0, y, width, base)
+    elif rng.random() < 0.7:
         y = page.block_heading(x0, y, width, base)
     two_col = rng.random() < 0.15 and page.w > 900
     cols = [(x0, width)] if not two_col else [(x0, width / 2 - base), (x0 + width / 2 + base, width / 2 - base)]
@@ -972,12 +1139,14 @@ def layout_receipt(page: Page, base):
 PEN_COLORS = {
     "blue": [(20, 40, 160), (30, 60, 190), (10, 30, 110), (40, 80, 200), (25, 35, 90)],
     "black": [(15, 15, 20), (35, 35, 40), (25, 20, 30), (50, 50, 55)],
+    # dark blue-black ballpoint: nearly as dark as print, only slightly bluer (low saturation)
+    "blueblack": [(28, 30, 48), (20, 24, 40), (35, 38, 60), (24, 26, 34), (40, 42, 70), (30, 34, 55)],
     "pencil": [(95, 95, 100), (115, 115, 118), (80, 80, 85), (130, 128, 125)],
     "red": [(200, 25, 30), (170, 20, 40), (220, 50, 50), (150, 10, 20)],
     "green": [(20, 130, 60), (10, 100, 50)],
     "purple": [(100, 40, 150)],
 }
-PEN_P = {"blue": 0.33, "black": 0.25, "pencil": 0.15, "red": 0.17, "green": 0.05, "purple": 0.05}
+PEN_P = {"blue": 0.24, "blueblack": 0.22, "black": 0.2, "pencil": 0.12, "red": 0.14, "green": 0.04, "purple": 0.04}
 
 
 class Writer:
@@ -987,26 +1156,39 @@ class Writer:
         self.rng = rng
         self.kind = kind or rng.choices(list(PEN_P), list(PEN_P.values()))[0]
         self.color = rng.choice(PEN_COLORS[self.kind])
-        self.width_scale = rng.uniform(0.7, 1.5)
+        self.width_scale = rng.uniform(0.5, 1.4) if rng.random() < 0.7 else rng.uniform(1.2, 1.8)  # mostly thin ballpoint
         self.src_w = [rng.uniform(0.2, 1), rng.uniform(0.2, 1), rng.uniform(0.1, 0.6)]  # emnist, font, cursive
         self.slant = rng.uniform(-0.15, 0.35)
         self.opacity = rng.uniform(0.55, 0.9) if self.kind == "pencil" else rng.uniform(0.8, 1.0)
+        # "neat ballpoint" hand: upright, thin, near-black/blue-black, print-sized — the hard case
+        # (real photos: shape is the only cue, colour/darkness barely differ from print)
+        self.neat = kind is None and rng.random() < 0.4
+        if self.neat:
+            self.kind = rng.choice(["blueblack", "blueblack", "black", "blue"])
+            self.color = rng.choice(PEN_COLORS[self.kind][:4])
+            self.width_scale = rng.uniform(0.45, 0.95)
+            self.slant = rng.uniform(-0.06, 0.12)
+            self.src_w = [rng.uniform(0.4, 1), rng.uniform(0.3, 1), rng.uniform(0.1, 0.4)]
+            self.opacity = rng.uniform(0.85, 1.0)
 
 
 def hw_text_patch(text, cap_h, writer: Writer, rng, vi=False):
     src = rng.choices(["emnist", "font", "cursive"], writer.src_w)[0]
-    if vi and src == "emnist" and rng.random() < 0.5:
-        src = "font"
     if src == "emnist":
-        cov, base = emnist_word(text, cap_h, rng)
-        cov = thicken(cov, rng, rng.uniform(-0.6, 1.2) * writer.width_scale)
-        if rng.random() < 0.6:
-            cov = elastic(cov, rng)
+        sw = max(1.0, cap_h * rng.uniform(0.055, 0.12) * writer.width_scale) if rng.random() < 0.8 else None
+        cov, base = emnist_word(text, cap_h, rng, stroke_w=sw)
+        if sw is None:
+            cov = thicken(cov, rng, rng.uniform(-0.6, 1.0) * writer.width_scale)
+        if rng.random() < (0.35 if writer.neat else 0.6):
+            cov = elastic(cov, rng, alpha=rng.uniform(0.6, 1.5) if writer.neat else None)
     elif src == "font":
         cov, base = font_word(text, cap_h, rng, vi)
-        cov = thicken(cov, rng, rng.uniform(-0.3, 0.8) * writer.width_scale)
+        if writer.neat or rng.random() < 0.3:
+            cov = restroke(cov, max(1.0, cap_h * rng.uniform(0.055, 0.1) * writer.width_scale), rng)
+        else:
+            cov = thicken(cov, rng, rng.uniform(-0.3, 0.8) * writer.width_scale)
     else:
-        cov, base = cursive_word(max(2, len(text)), cap_h, None, rng)
+        cov, base = cursive_word(max(2, len(text)), cap_h, max(0.9, cap_h * rng.uniform(0.06, 0.12) * writer.width_scale), rng)
     if abs(writer.slant) > 0.03:
         cov = shear_patch(cov, writer.slant + rng.uniform(-0.05, 0.05))
     return cov, base
@@ -1040,7 +1222,7 @@ class HWLayer:
 
 
 def place_text_at(layer, page, writer, rng, x, baseline, cap_h, n_words=None, max_x=None):
-    n_words = n_words or rng.randint(1, 4)
+    n_words = n_words or rng.randint(1, 6)
     boxes = []
     for _ in range(n_words):
         r = rng.random()
@@ -1197,7 +1379,7 @@ def add_handwriting(page: Page, base, rng, split):
             b = rng.choice(page.mcq + page.checkboxes)
             kind = rng.choices(["circle", "tick", "cross"], [4, 3, 1.5])[0]
             draw_mark(layer, wr, rng, kind, b, base)
-        elif r < 0.73 and page.line_boxes:
+        elif r < 0.76 and page.line_boxes:
             # handwriting written over / squeezed between printed lines (heavy overlap)
             lb = rng.choice(page.line_boxes)
             x = rng.uniform(lb[0], max(lb[0] + 1, lb[2] - cap_h * 4))
@@ -1231,9 +1413,46 @@ def add_handwriting(page: Page, base, rng, split):
 # ----------------------------------------------------------------------------------------------
 # compositing + degradations
 # ----------------------------------------------------------------------------------------------
+def photo_like(w, h, rng):
+    """grayscale photo-ish texture: multi-octave noise, gradients, soft blobs (a 'head'), edges."""
+    nr = np.random.default_rng(rng.randrange(1 << 30))
+    img = np.zeros((h, w), np.float32)
+    for octave, amp in ((4, 1.0), (12, 0.5), (40, 0.25), (120, 0.12)):
+        n = nr.random((max(2, h * octave // max(h, w)), max(2, w * octave // max(h, w)))).astype(np.float32)
+        img += amp * cv2.resize(n, (w, h), interpolation=cv2.INTER_CUBIC)
+    gx, gy = np.meshgrid(np.linspace(0, 1, w, dtype=np.float32), np.linspace(0, 1, h, dtype=np.float32))
+    img += rng.uniform(-1, 1) * gx + rng.uniform(-1, 1) * gy
+    if rng.random() < 0.6:
+        cx, cy, rx, ry = w * rng.uniform(0.35, 0.65), h * rng.uniform(0.3, 0.5), w * rng.uniform(0.15, 0.3), h * rng.uniform(0.2, 0.35)
+        blob = (((gx * w - cx) / rx) ** 2 + ((gy * h - cy) / ry) ** 2 < 1).astype(np.float32)
+        img += rng.uniform(-1.2, 1.2) * cv2.GaussianBlur(blob, (0, 0), max(1, min(w, h) * 0.02))
+        body = ((gy * h > cy + ry * 0.9) & (np.abs(gx * w - cx) < rx * 2.2)).astype(np.float32)
+        img += rng.uniform(-1.2, 1.2) * cv2.GaussianBlur(body, (0, 0), max(1, min(w, h) * 0.02))
+    img = (img - img.min()) / (np.ptp(img) + 1e-6)
+    img = img ** rng.uniform(0.6, 1.6)
+    return np.clip(img * rng.uniform(0.6, 1.0), 0, 1)
+
+
+def add_show_through(img, page: Page, rng):
+    """faint mirrored text from the back of the sheet: visible but NOT ink (no label)."""
+    w, h = page.w, page.h
+    lim = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(lim)
+    fc = rng.choice(PRINT_FACES)
+    size = rng.uniform(16, 34)
+    f = font(fc, size)
+    y = rng.uniform(0, h * 0.2)
+    while y < h:
+        d.text((rng.uniform(w * 0.03, w * 0.12), y), " ".join(rand_words(rng, 25)), font=f, fill=255)
+        y += size * rng.uniform(1.2, 1.8)
+    a = np.asarray(lim, np.float32)[:, ::-1] / 255.0
+    a = cv2.GaussianBlur(a, (0, 0), rng.uniform(0.8, 2.5)) * rng.uniform(0.06, 0.28)
+    img *= (1.0 - a)[..., None]
+
+
 def make_paper(w, h, rng):
     nr = np.random.default_rng(rng.randrange(1 << 30))
-    lum = rng.uniform(228, 255)
+    lum = rng.uniform(228, 255) if rng.random() < 0.65 else rng.uniform(190, 232)  # white .. greyish photographed paper
     tint = rng.choice([(0, 0, 0), (0, 0, 0), (2, 1, -6), (3, 1, -8), (-3, -1, 2), (1, 1, -3)])  # white / cream / cool
     base = np.minimum(np.array([lum + tint[0], lum + tint[1], lum + tint[2]], np.float32), 255)
     paper = np.ones((h, w, 3), np.float32) * base
@@ -1257,6 +1476,8 @@ def composite(page: Page, layer: HWLayer, rng):
         img *= 1.0 - a[..., None] * (1.0 - col)
         np.maximum(print_alpha, a, out=print_alpha)
     print_mask = print_alpha > 0.5  # clean-document mask, includes ink later hidden under handwriting
+    if rng.random() < 0.3:
+        add_show_through(img, page, rng)
     hw_cov = np.zeros((h, w), np.float32)
     nr = np.random.default_rng(rng.randrange(1 << 30))
     for cov, x, y, wr in layer.items:
@@ -1300,7 +1521,7 @@ def degrade(img, masks, rng):
     # mild uneven illumination (the app removes shadows, so keep it gentle)
     if rng.random() < 0.6:
         lf = cv2.resize(nr.random((3, 3)).astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
-        img *= (1.0 - rng.uniform(0.02, 0.12) * np.clip(lf, 0, 1))[..., None]
+        img *= (1.0 - rng.uniform(0.02, 0.18) * np.clip(lf, 0, 1))[..., None]
     # white balance
     img *= np.array([rng.uniform(0.96, 1.04) for _ in range(3)], np.float32)
     # the app sharpens before inference
@@ -1369,7 +1590,7 @@ def pad_to_grid(img, masks):
     return pi, pm, nx, ny
 
 
-def tiles_from_page(img, masks, rng, n_hw_max=14, p_nohw=0.12, n_random=6):
+def tiles_from_page(img, masks, rng, n_hw_max=14, p_nohw=0.18, n_random=6):
     pi, pm, nx, ny = pad_to_grid(img, masks)
     cands = []
     for j in range(ny):
@@ -1429,15 +1650,15 @@ def build_split(name, n_pages, seed0, workers, keep_pages=0):
     Y = np.stack(ys)
     perm = np.random.default_rng(seed0).permutation(len(X))
     X, Y = X[perm], Y[perm]
-    np.savez_compressed(os.path.join(ML_DIR, f"inkseg_{name}.npz"), images=X, masks=Y)
+    np.savez_compressed(os.path.join(ML_DIR, f"inkseg{TAG}_{name}.npz"), images=X, masks=Y)
     hw_frac = ((Y & 2) > 0).mean()
     pr_frac = ((Y & 1) > 0).mean()
     ov_frac = ((Y & 3) == 3).mean()
     nohw_tiles = (((Y & 2) > 0).reshape(len(Y), -1).sum(1) < 40).mean()
-    print(f"saved inkseg_{name}.npz: {X.shape}  print px {pr_frac:.3%}  hw px {hw_frac:.3%}  overlap px {ov_frac:.3%}  "
+    print(f"saved inkseg{TAG}_{name}.npz: {X.shape}  print px {pr_frac:.3%}  hw px {hw_frac:.3%}  overlap px {ov_frac:.3%}  "
           f"tiles w/o hw {nohw_tiles:.1%}", flush=True)
     if pages:
-        np.savez_compressed(os.path.join(ML_DIR, f"inkseg_fullpages_{name}.npz"),
+        np.savez_compressed(os.path.join(ML_DIR, f"inkseg{TAG}_fullpages_{name}.npz"),
                             images=np.array([p[0] for p in pages], dtype=object),
                             masks=np.array([p[1] for p in pages], dtype=object))
 
