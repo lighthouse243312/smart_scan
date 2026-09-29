@@ -43,24 +43,27 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
 /// (kept even where alpha is 0). A pixel can be both — handwriting written over print. The
 /// `...Mask` methods return the fraction of the page covered by handwriting.
 
-/// Colour-of-ink method: saturated (blue/red/green…) ink that is clearly darker than the paper.
-/// Fast and offline, but cannot see black ink or pencil, and also catches coloured print. The
-/// print layer is estimated (unsaturated ink, plus very dark pixels inside a coloured stroke).
-/// `minSaturation` is on OpenCV's 0-255 HSV saturation scale.
+/// Ink-colour + layout method (see InkAnalysis.hpp): ink judged by its optical-density colour
+/// against the LOCAL print colour, backed by page layout (print forms regular lines). Works for
+/// pen ink that differs from the print even slightly (blue-black ballpoint), not for pen ink that
+/// is the same colour as the print. `colorDelta` = how much bluer than print (OD_B/OD_R) a stroke
+/// must be; smaller = more sensitive.
 + (nullable NSNumber *)inkColorMaskAtPath:(NSString *)inputPath
                                   maskPath:(NSString *)maskPath
-                             minSaturation:(double)minSaturation
+                                colorDelta:(double)colorDelta
                                      error:(NSError **)error
-    NS_SWIFT_NAME(inkColorMask(atPath:maskPath:minSaturation:));
+    NS_SWIFT_NAME(inkColorMask(atPath:maskPath:colorDelta:));
 
-/// Segmentation method: the bundled InkSegmenter U-Net (see ml/train_ink_seg.py) predicts two
+/// Model method, combined with the ink-colour method (union of both; print only where both agree):
+/// the bundled InkSegmenter U-Net (see ml/train_ink_seg.py) predicts two
 /// independent per-pixel layers, print and handwriting; pixels whose handwriting probability
 /// exceeds `threshold` (and that are actual ink) form the handwriting layer.
 + (nullable NSNumber *)segmentationMaskAtPath:(NSString *)inputPath
                                       maskPath:(NSString *)maskPath
                                      threshold:(double)threshold
+                                    colorDelta:(double)colorDelta
                                          error:(NSError **)error
-    NS_SWIFT_NAME(segmentationMask(atPath:maskPath:threshold:));
+    NS_SWIFT_NAME(segmentationMask(atPath:maskPath:threshold:colorDelta:));
 
 /// Manual correction: paints (or, with `erase`, clears) brush strokes into the handwriting layer;
 /// the print layer is kept. Each stroke is
@@ -71,15 +74,16 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
                                          error:(NSError **)error
     NS_SWIFT_NAME(applyMaskStrokes(atPath:outputPath:strokes:));
 
-/// Removes the handwriting by rebuilding it, not inpainting: handwriting pixels over print get the
-/// nearby print colour back, the rest get the paper colour. The handwriting layer is first grown
-/// by `dilatePx` onto non-print pixels to cover faint stroke rims.
+/// Removes the handwriting by rebuilding it, not blurring: pixels where a stroke crosses real print
+/// get the nearby print colour back, the rest is inpainted from the surrounding paper.
+/// `analysisPath` is the unprocessed page the mask was computed on; `inputPath` (same geometry)
+/// is the page to erase from.
 + (BOOL)eraseWithMaskAtPath:(NSString *)inputPath
+                analysisPath:(NSString *)analysisPath
                     maskPath:(NSString *)maskPath
                   outputPath:(NSString *)outputPath
-                    dilatePx:(double)dilatePx
                        error:(NSError **)error
-    NS_SWIFT_NAME(eraseWithMask(atPath:maskPath:outputPath:dilatePx:));
+    NS_SWIFT_NAME(eraseWithMask(atPath:analysisPath:maskPath:outputPath:));
 
 @end
 

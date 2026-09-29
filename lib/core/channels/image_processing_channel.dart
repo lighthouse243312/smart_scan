@@ -67,30 +67,34 @@ class ImageProcessingChannel {
     return result!['outputPath'] as String;
   }
 
-  /// Colour-of-ink mask. [minSaturation] is on OpenCV's 0-255 HSV saturation scale.
+  /// Ink-colour + layout mask. [colorDelta] = how much bluer than the local print (optical
+  /// density OD_B/OD_R) a stroke must be to count as pen; smaller = more sensitive.
   static Future<HandwritingMaskResult> inkColorMask({
     required String inputPath,
     required String maskPath,
-    required double minSaturation,
+    required double colorDelta,
   }) async {
     final result = await _channel.invokeMapMethod<String, dynamic>('inkColorMask', {
       'inputPath': inputPath,
       'maskPath': maskPath,
-      'minSaturation': minSaturation,
+      'colorDelta': colorDelta,
     });
     return HandwritingMaskResult.fromMap(result!);
   }
 
-  /// Segmentation-model mask: pixels whose handwriting probability exceeds [threshold].
+  /// Model mask combined with the ink-colour mask: handwriting where either finds it (model
+  /// probability above [threshold], or colour at [colorDelta]); print only where both agree.
   static Future<HandwritingMaskResult> segmentationMask({
     required String inputPath,
     required String maskPath,
     required double threshold,
+    required double colorDelta,
   }) async {
     final result = await _channel.invokeMapMethod<String, dynamic>('segmentationMask', {
       'inputPath': inputPath,
       'maskPath': maskPath,
       'threshold': threshold,
+      'colorDelta': colorDelta,
     });
     return HandwritingMaskResult.fromMap(result!);
   }
@@ -109,19 +113,20 @@ class ImageProcessingChannel {
     return HandwritingMaskResult.fromMap(result!);
   }
 
-  /// Rebuilds the page without the handwriting: handwriting pixels over print get the nearby print
-  /// colour back, the rest get the paper colour (no inpainting, so crossed-over print stays sharp).
+  /// Rebuilds [inputPath] without the handwriting: where a stroke crosses real print the print is
+  /// restored in its nearby colour, the rest is inpainted from the surrounding paper.
+  /// [analysisPath] is the unprocessed page the mask was computed on (same geometry).
   static Future<String> eraseWithMask({
     required String inputPath,
+    required String analysisPath,
     required String maskPath,
     required String outputPath,
-    double dilatePx = 2.0,
   }) async {
     final result = await _channel.invokeMapMethod<String, dynamic>('eraseWithMask', {
       'inputPath': inputPath,
+      'analysisPath': analysisPath,
       'maskPath': maskPath,
       'outputPath': outputPath,
-      'dilatePx': dilatePx,
     });
     return result!['outputPath'] as String;
   }

@@ -39,8 +39,8 @@ class ImageProcessingService {
       });
 
   /// Builds the handwriting mask for [inputPath] with [method]. [sensitivity] (0-1, higher =
-  /// erase more) is mapped onto each method's own knob: the colour method's minimum saturation,
-  /// the model's probability threshold.
+  /// erase more) is mapped onto each method's own knob: the colour method's required colour
+  /// difference from print, the model's probability threshold.
   Future<HandwritingMaskResult> detectHandwritingMask(
     String inputPath, {
     required HandwritingMethod method,
@@ -53,12 +53,13 @@ class ImageProcessingService {
           HandwritingMethod.inkColor => ImageProcessingChannel.inkColorMask(
               inputPath: inputPath,
               maskPath: maskPath,
-              minSaturation: 120 - 90 * s,
+              colorDelta: 0.08 - 0.06 * s,
             ),
           HandwritingMethod.segmentation => ImageProcessingChannel.segmentationMask(
               inputPath: inputPath,
               maskPath: maskPath,
               threshold: 0.8 - 0.6 * s,
+              colorDelta: 0.08 - 0.06 * s,
             ),
         };
       });
@@ -72,10 +73,14 @@ class ImageProcessingService {
         );
       });
 
-  Future<String> eraseWithMask(String inputPath, String maskPath) => _run(() async {
+  /// Erases the mask's handwriting from [inputPath]; [analysisPath] is the page the mask was
+  /// detected on.
+  Future<String> eraseWithMask(String inputPath, {required String analysisPath, required String maskPath}) =>
+      _run(() async {
         final outputPath = await TempPaths.next('erased.png');
         return ImageProcessingChannel.eraseWithMask(
           inputPath: inputPath,
+          analysisPath: analysisPath,
           maskPath: maskPath,
           outputPath: outputPath,
         );

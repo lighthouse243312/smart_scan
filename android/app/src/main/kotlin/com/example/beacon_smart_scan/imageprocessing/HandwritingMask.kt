@@ -25,15 +25,9 @@ import kotlin.math.min
 object HandwritingMask {
     private const val OVERLAY_ALPHA = 160.0
 
-    // "Ink" = noticeably darker than the local paper. The strict value seeds the colour method;
-    // the loose one lets masks grow onto anti-aliased stroke edges and faint pencil without
-    // spilling onto bare paper.
-    const val INK_CONTRAST_STRICT = 18.0
+    // "Ink" = noticeably darker than the local paper — used to snap the model's soft,
+    // reduced-scale masks onto the page's actual strokes.
     const val INK_CONTRAST_LOOSE = 8.0
-
-    // Colour method only: inside a coloured stroke, a pixel this dark is the stroke crossing black
-    // print (a multiply of both inks), so it is counted as print to restore.
-    const val PRINT_UNDER_MAX_VALUE = 100.0
 
     /** Releases every [mats] once [block] finishes, however it exits. */
     inline fun <T> releasing(vararg mats: Mat, block: () -> T): T {
@@ -87,23 +81,32 @@ object HandwritingMask {
         }
     }
 
-    /** The two layers of a mask file, each CV_8UC1 with 255 = set. Caller releases both. */
-    class Layers(val handwriting: Mat, val print: Mat) {
+    /**
+     * The layers of a mask file, each CV_8UC1 with 255 = set: handwriting (alpha), print (blue) and
+     * overlap = print hidden under handwriting, restored on erase (green — red + green shows it
+     * yellow in the overlay). Caller releases them.
+     */
+    class Layers(val handwriting: Mat, val print: Mat, val overlap: Mat) {
         fun release() {
             handwriting.release()
             print.release()
+            overlap.release()
         }
     }
 
-    fun write(handwriting: Mat, print: Mat, path: String) {
-        val zeros = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
+    fun write(handwriting: Mat, print: Mat, overlap: Mat, path: String) {
         val red = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
         val alpha = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
+        val blue = Mat()
+        val notOverlap = Mat()
         val file = Mat()
-        releasing(zeros, red, alpha, file) {
+        releasing(red, alpha, blue, notOverlap, file) {
             red.setTo(Scalar(255.0), handwriting)
             alpha.setTo(Scalar(OVERLAY_ALPHA), handwriting)
-            Core.merge(listOf(print, zeros, red, alpha), file)
+            // overlap kept apart from print so it shows yellow, not white
+            Core.bitwise_not(overlap, notOverlap)
+            Core.bitwise_and(print, notOverlap, blue)
+            Core.merge(listOf(blue, overlap, red, alpha), file)
             ImageIO.writeOrThrow(file, path)
         }
     }
@@ -116,14 +119,18 @@ object HandwritingMask {
         }
         val alpha = Mat()
         val blue = Mat()
-        return releasing(raw, alpha, blue) {
+        val green = Mat()
+        return releasing(raw, alpha, blue, green) {
             Core.extractChannel(raw, alpha, 3)
             Core.extractChannel(raw, blue, 0)
+            Core.extractChannel(raw, green, 1)
             val handwriting = Mat()
             val print = Mat()
+            val overlap = Mat()
             Imgproc.threshold(alpha, handwriting, 0.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.threshold(blue, print, 127.0, 255.0, Imgproc.THRESH_BINARY)
-            Layers(handwriting, print)
+            Imgproc.threshold(green, overlap, 127.0, 255.0, Imgproc.THRESH_BINARY)
+            Layers(handwriting, print, overlap)
         }
     }
 

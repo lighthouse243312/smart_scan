@@ -52,15 +52,16 @@ enum ImageProcessingChannel {
             case "inkColorMask":
                 let inputPath = try requireString(args, "inputPath")
                 let maskPath = try requireString(args, "maskPath")
-                let minSaturation = (args["minSaturation"] as? Double) ?? 60.0
-                let coverage = try ImageProcessingOpenCV.inkColorMask(atPath: inputPath, maskPath: maskPath, minSaturation: minSaturation)
+                let colorDelta = (args["colorDelta"] as? Double) ?? 0.05
+                let coverage = try ImageProcessingOpenCV.inkColorMask(atPath: inputPath, maskPath: maskPath, colorDelta: colorDelta)
                 return ["maskPath": maskPath, "coverage": coverage]
 
             case "segmentationMask":
                 let inputPath = try requireString(args, "inputPath")
                 let maskPath = try requireString(args, "maskPath")
                 let threshold = (args["threshold"] as? Double) ?? 0.5
-                let coverage = try ImageProcessingOpenCV.segmentationMask(atPath: inputPath, maskPath: maskPath, threshold: threshold)
+                let colorDelta = (args["colorDelta"] as? Double) ?? 0.05
+                let coverage = try ImageProcessingOpenCV.segmentationMask(atPath: inputPath, maskPath: maskPath, threshold: threshold, colorDelta: colorDelta)
                 return ["maskPath": maskPath, "coverage": coverage]
 
             case "applyMaskStrokes":
@@ -72,10 +73,10 @@ enum ImageProcessingChannel {
 
             case "eraseWithMask":
                 let inputPath = try requireString(args, "inputPath")
+                let analysisPath = try requireString(args, "analysisPath")
                 let maskPath = try requireString(args, "maskPath")
                 let outputPath = try requireString(args, "outputPath")
-                let dilatePx = (args["dilatePx"] as? Double) ?? 2.0
-                try ImageProcessingOpenCV.eraseWithMask(atPath: inputPath, maskPath: maskPath, outputPath: outputPath, dilatePx: dilatePx)
+                try ImageProcessingOpenCV.eraseWithMask(atPath: inputPath, analysisPath: analysisPath, maskPath: maskPath, outputPath: outputPath)
                 return ["outputPath": outputPath]
 
             default:

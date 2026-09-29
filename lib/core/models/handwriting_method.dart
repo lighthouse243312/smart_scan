@@ -1,12 +1,14 @@
 /// How the handwriting mask is detected. Both produce a per-pixel mask that the same erase step
 /// consumes, so they can be compared on the same page.
 enum HandwritingMethod {
-  /// Saturated (blue/red/green…) ink darker than the paper — fast and offline, but blind to black
-  /// ink and pencil, and also catches coloured print.
+  /// Ink colour (optical density) against the local print colour, backed by page layout (print
+  /// forms regular lines) — offline, works for pen ink that differs even slightly from the print
+  /// (e.g. blue-black ballpoint); cannot separate pen ink identical in colour to the print.
   inkColor,
 
-  /// The bundled InkSegmenter U-Net classifies every pixel as paper / print / handwriting —
-  /// handles black ink and pencil, costs a model run (still offline).
+  /// The bundled InkSegmenter U-Net COMBINED with [inkColor]: handwriting wherever either finds
+  /// it, print only where both agree — the model covers pen ink the same colour as the print
+  /// (black ballpoint), colour covers neat writing the model misses. Costs a model run (offline).
   segmentation,
 }
 

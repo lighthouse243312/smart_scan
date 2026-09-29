@@ -79,15 +79,17 @@ class ScanSession extends ChangeNotifier {
     await processCurrentPage();
   }
 
-  /// Builds the handwriting mask for the current page with [method] at [sensitivity]. Always
-  /// runs on the processed page from before any erase, and discards manual brush edits and any
-  /// previous erase result.
+  /// Builds the handwriting mask for the current page with [method] at [sensitivity], and
+  /// discards manual brush edits and any previous erase result. Detection reads the page as it
+  /// came out of the scanner: sharpening adds bright halos and shadow removal shifts the ink
+  /// colour, both of which the colour analysis relies on not happening. Pixel geometry is the
+  /// same, so the mask still lines up with the processed page it is erased from.
   Future<void> detectHandwriting() async {
     final page = currentPage;
     if (page == null) return;
     final result = await _guarded(
       () => _imageProcessingService.detectHandwritingMask(
-        page.cleanPath,
+        page.originalPath,
         method: method,
         sensitivity: sensitivity,
       ),
@@ -126,7 +128,9 @@ class ScanSession extends ChangeNotifier {
     final page = currentPage;
     final maskPath = page?.maskPath;
     if (page == null || maskPath == null) return;
-    final result = await _guarded(() => _imageProcessingService.eraseWithMask(page.cleanPath, maskPath));
+    final result = await _guarded(
+      () => _imageProcessingService.eraseWithMask(page.cleanPath, analysisPath: page.originalPath, maskPath: maskPath),
+    );
     if (result == null) return;
     _pages[currentPageIndex] = page.copyWith(finalPath: result);
     step = ScanStep.export;

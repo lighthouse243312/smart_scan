@@ -1,0 +1,566 @@
+package com.example.beacon_smart_scan.imageprocessing
+
+import com.example.beacon_smart_scan.imageprocessing.HandwritingMask.releasing
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Scalar
+import org.opencv.core.Size
+import org.opencv.geometry.Geometry
+import org.opencv.imgproc.Imgproc
+import org.opencv.photo.Photo
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+/**
+ * Handwriting vs print separation from ink colour + page layout, and the rebuild-erase that uses
+ * it. Kotlin port of ios/Runner/InkAnalysis.hpp — both must implement the same steps with the
+ * same constants; see that file for why these signals were chosen.
+ *
+ * Masks are handled as flat BooleanArrays / FloatArrays of width*height, which keeps the many
+ * per-pixel steps simple on the JVM; OpenCV is used for filters and components. Those arrays live
+ * on the Java heap, so analysis runs at a working resolution of at most [WORK_LONG_SIDE] px (a 12
+ * MP photo would need hundreds of MB); masks are scaled back to the page, and the erase's pixel
+ * work (print colour, inpaint) still happens at full resolution in native OpenCV memory.
+ */
+object InkAnalysis {
+    private const val INK_OD = 0.30f
+    private const val CLIPPED_OD = 1.6f
+    private const val FAINT_OD = 0.06f
+    private const val RIM_OD = 0.04f
+    private const val WORK_LONG_SIDE = 2400
+
+    class Page(val width: Int, val height: Int) {
+        val size = width * height
+    }
+
+    private class OpticalDensity(val odB: FloatArray, val odR: FloatArray, val mean: FloatArray, val ink: BooleanArray)
+
+    /** Stroke-scale unit (≈ a pen stroke's width) for this resolution. */
+    fun strokeUnit(width: Int, height: Int): Int = max(5, max(width, height) / 450) or 1
+
+    private fun odd(v: Double): Int = max(1, v.roundToInt()) or 1
+
+    // ---------------------------------------------------------------- Mat <-> array helpers
+
+    private fun toMat(mask: BooleanArray, page: Page): Mat {
+        val bytes = ByteArray(page.size) { if (mask[it]) 255.toByte() else 0 }
+        val mat = Mat(page.height, page.width, CvType.CV_8UC1)
+        mat.put(0, 0, bytes)
+        return mat
+    }
+
+    private fun toMask(mat: Mat): BooleanArray {
+        val bytes = ByteArray(mat.total().toInt())
+        mat.get(0, 0, bytes)
+        return BooleanArray(bytes.size) { bytes[it].toInt() != 0 }
+    }
+
+    private fun toFloatMat(values: FloatArray, page: Page): Mat {
+        val mat = Mat(page.height, page.width, CvType.CV_32F)
+        mat.put(0, 0, values)
+        return mat
+    }
+
+    private fun toFloats(mat: Mat): FloatArray {
+        val out = FloatArray(mat.total().toInt())
+        mat.get(0, 0, out)
+        return out
+    }
+
+    private fun boxFilter(values: FloatArray, page: Page, window: Int): FloatArray {
+        val src = toFloatMat(values, page)
+        val dst = Mat()
+        return releasing(src, dst) {
+            Imgproc.boxFilter(src, dst, -1, Size(window.toDouble(), window.toDouble()))
+            toFloats(dst)
+        }
+    }
+
+    private fun dilate(mask: BooleanArray, page: Page, diameter: Int, ellipse: Boolean): BooleanArray {
+        val src = toMat(mask, page)
+        val dst = Mat()
+        val d = odd(diameter.toDouble()).toDouble()
+        val kernel = Imgproc.getStructuringElement(if (ellipse) Imgproc.MORPH_ELLIPSE else Imgproc.MORPH_RECT, Size(d, d))
+        return releasing(src, dst, kernel) {
+            Imgproc.dilate(src, dst, kernel)
+            toMask(dst)
+        }
+    }
+
+    private class Components(
+        val count: Int,
+        val labels: IntArray,
+        val x: IntArray, val y: IntArray, val w: IntArray, val h: IntArray, val area: IntArray,
+    ) {
+        val cx = FloatArray(count) { x[it] + w[it] / 2f }
+        val bottom = FloatArray(count) { (y[it] + h[it]).toFloat() }
+    }
+
+    private fun components(mask: BooleanArray, page: Page): Components {
+        val src = toMat(mask, page)
+        val labels = Mat()
+        val stats = Mat()
+        val centroids = Mat()
+        return releasing(src, labels, stats, centroids) {
+            val count = Imgproc.connectedComponentsWithStats(src, labels, stats, centroids, 8, CvType.CV_32S)
+            val lab = IntArray(page.size)
+            labels.get(0, 0, lab)
+            val st = IntArray(count * 5)
+            stats.get(0, 0, st)
+            Components(
+                count, lab,
+                IntArray(count) { st[it * 5 + Imgproc.CC_STAT_LEFT] },
+                IntArray(count) { st[it * 5 + Imgproc.CC_STAT_TOP] },
+                IntArray(count) { st[it * 5 + Imgproc.CC_STAT_WIDTH] },
+                IntArray(count) { st[it * 5 + Imgproc.CC_STAT_HEIGHT] },
+                IntArray(count) { st[it * 5 + Imgproc.CC_STAT_AREA] },
+            )
+        }
+    }
+
+    private fun paint(labels: IntArray, flags: BooleanArray): BooleanArray = BooleanArray(labels.size) { flags[labels[it]] }
+
+    private fun fractionPerComponent(c: Components, mask: BooleanArray): FloatArray {
+        val sum = FloatArray(c.count)
+        for (i in mask.indices) if (mask[i]) sum[c.labels[i]] += 1f
+        for (i in 0 until c.count) sum[i] /= max(1, c.area[i]).toFloat()
+        return sum
+    }
+
+    private class UnionFind(n: Int) {
+        private val parent = IntArray(n) { it }
+        fun find(a0: Int): Int {
+            var a = a0
+            while (parent[a] != a) {
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            }
+            return a
+        }
+        fun join(a: Int, b: Int) {
+            parent[find(a)] = find(b)
+        }
+    }
+
+    private fun percentile(values: List<Float>, p: Float): Float {
+        if (values.isEmpty()) return 0f
+        val sorted = values.sorted()
+        val i = min(sorted.size - 1, (p / 100.0 * (sorted.size - 1)).roundToInt())
+        return sorted[i]
+    }
+
+    private fun percentile(values: FloatArray, count: Int, p: Float): Float {
+        if (count == 0) return 0f
+        val sorted = values.copyOf(count).also { it.sort() }
+        return sorted[min(count - 1, (p / 100.0 * (count - 1)).roundToInt())]
+    }
+
+    // ---------------------------------------------------------------- analysis steps
+
+    private fun opticalDensity(bgr: Mat, page: Page): OpticalDensity {
+        val small = Mat()
+        val paper = Mat()
+        val image = Mat()
+        val t = Mat()
+        val kernel = Mat.ones(9, 9, CvType.CV_8U)
+        return releasing(small, paper, image, t, kernel) {
+            Imgproc.resize(bgr, small, Size(), 0.125, 0.125, Imgproc.INTER_AREA)
+            Imgproc.medianBlur(small, small, 15)
+            Imgproc.dilate(small, small, kernel)
+            Imgproc.resize(small, paper, bgr.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            paper.convertTo(paper, CvType.CV_32FC3)
+            Imgproc.GaussianBlur(paper, paper, Size(0.0, 0.0), 8.0)
+            bgr.convertTo(image, CvType.CV_32FC3)
+            Core.add(image, Scalar(1.0, 1.0, 1.0), image)
+            Core.add(paper, Scalar(1.0, 1.0, 1.0), paper)
+            Core.divide(image, paper, t)
+            val v = FloatArray(page.size * 3)
+            t.get(0, 0, v)
+            val odB = FloatArray(page.size)
+            val odR = FloatArray(page.size)
+            val mean = FloatArray(page.size)
+            val ink = BooleanArray(page.size)
+            for (i in 0 until page.size) {
+                val b = -kotlin.math.ln(v[i * 3].coerceIn(1e-3f, 1f))
+                val g = -kotlin.math.ln(v[i * 3 + 1].coerceIn(1e-3f, 1f))
+                val r = -kotlin.math.ln(v[i * 3 + 2].coerceIn(1e-3f, 1f))
+                odB[i] = b; odR[i] = r
+                mean[i] = (b + g + r) / 3f
+                ink[i] = mean[i] > INK_OD
+            }
+            OpticalDensity(odB, odR, mean, ink)
+        }
+    }
+
+    /** Local OD_B / OD_R over ink in (minOD, maxOD]; NaN where there is too little ink. */
+    private fun inkColorRatio(d: OpticalDensity, page: Page, minOD: Float, maxOD: Float, window: Int, minFill: Float): FloatArray {
+        val w = FloatArray(page.size) { if (d.mean[it] > minOD && d.mean[it] <= maxOD) 1f else 0f }
+        val sb = boxFilter(FloatArray(page.size) { d.odB[it] * w[it] }, page, window)
+        val sr = boxFilter(FloatArray(page.size) { d.odR[it] * w[it] }, page, window)
+        val sw = boxFilter(w, page, window)
+        return FloatArray(page.size) { if (sw[it] > minFill) sb[it] / (sr[it] + 1e-3f) else Float.NaN }
+    }
+
+    private class TextLine(val members: IntArray, val medianHeight: Float)
+
+    private fun isGlyph(c: Components, i: Int, unit: Int, pageHeight: Int): Boolean =
+        c.area[i] >= unit * 2 && c.h[i] >= unit && c.h[i] <= pageHeight * 0.03 && c.w[i] <= c.h[i] * 4
+
+    private fun regularLines(c: Components, unit: Int, pageHeight: Int): List<TextLine> {
+        val glyphs = (1 until c.count).filter { isGlyph(c, it, unit, pageHeight) }.sortedBy { c.cx[it] }
+        val uf = UnionFind(c.count)
+        for (a in glyphs.indices) {
+            val i = glyphs[a]
+            var b = a + 1
+            while (b < glyphs.size && c.cx[glyphs[b]] - c.cx[i] < 3f * c.h[i]) {
+                val o = glyphs[b]
+                val hmax = max(c.h[i], c.h[o]).toFloat()
+                val ratio = c.h[o].toFloat() / c.h[i]
+                if (abs(c.bottom[o] - c.bottom[i]) < 0.18f * hmax && ratio > 0.6f && ratio < 1.67f) uf.join(o, i)
+                b++
+            }
+        }
+        val lines = ArrayList<TextLine>()
+        for (g in glyphs.groupBy { uf.find(it) }.values) {
+            if (g.size < 5) continue
+            var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+            for (i in g) { sx += c.cx[i]; sy += c.bottom[i]; sxx += c.cx[i].toDouble() * c.cx[i]; sxy += c.cx[i].toDouble() * c.bottom[i] }
+            val n = g.size.toDouble(); val den = n * sxx - sx * sx
+            val a = if (den != 0.0) (n * sxy - sx * sy) / den else 0.0
+            val b = (sy - a * sx) / n
+            val resid = g.map { abs(a * c.cx[it] + b - c.bottom[it]).toFloat() }
+            val heights = g.map { c.h[it].toFloat() }
+            val hm = percentile(heights, 50f)
+            if (percentile(resid, 70f) < 0.08f * hm && percentile(heights.map { abs(it - hm) }, 50f) < 0.2f * hm) {
+                lines.add(TextLine(g.toIntArray(), hm))
+            }
+        }
+        return lines
+    }
+
+    /** Print-colour reference per page region from the regular-line pixels' ink colour. */
+    private fun localPrintReference(ratio: FloatArray, regularPixels: BooleanArray, page: Page): FloatArray {
+        val cell = max(64, max(page.width, page.height) / 12)
+        val gh = (page.height + cell - 1) / cell
+        val gw = (page.width + cell - 1) / cell
+        val samples = Array(gh * gw) { FloatArray(256) }
+        val counts = IntArray(gh * gw)
+        for (y in 0 until page.height) {
+            val cellRow = (y / cell) * gw
+            for (x in 0 until page.width) {
+                val i = y * page.width + x
+                val r = ratio[i]
+                if (!regularPixels[i] || r.isNaN()) continue
+                val c = cellRow + x / cell
+                if (counts[c] == samples[c].size) samples[c] = samples[c].copyOf(samples[c].size * 2)
+                samples[c][counts[c]++] = r
+            }
+        }
+        val grid = FloatArray(gh * gw) { if (counts[it] >= 200) percentile(samples[it], counts[it], 50f) else Float.NaN }
+        val known = grid.filter { !it.isNaN() }
+        val global = if (known.isEmpty()) 1f else percentile(known, 50f)
+        var filled = FloatArray(gh * gw) { if (grid[it].isNaN()) global else grid[it] }
+        repeat(3) {
+            val next = filled.copyOf()
+            for (y in 0 until gh) for (x in 0 until gw) {
+                if (!grid[y * gw + x].isNaN()) continue
+                var sum = 0f; var cnt = 0
+                for (dy in -1..1) for (dx in -1..1) {
+                    val yy = y + dy; val xx = x + dx
+                    if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue
+                    val v = grid[yy * gw + xx]
+                    if (!v.isNaN()) { sum += v; cnt++ }
+                }
+                if (cnt > 0) next[y * gw + x] = sum / cnt
+            }
+            filled = next
+        }
+        val small = Mat(gh, gw, CvType.CV_32F)
+        val full = Mat()
+        return releasing(small, full) {
+            small.put(0, 0, filled)
+            Imgproc.GaussianBlur(small, small, Size(0.0, 0.0), 1.0)
+            Imgproc.resize(small, full, Size(page.width.toDouble(), page.height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            toFloats(full)
+        }
+    }
+
+    private fun growWithin(seeds: BooleanArray, allowed: BooleanArray, page: Page): BooleanArray {
+        val c = components(allowed, page)
+        val seeded = BooleanArray(c.count)
+        for (i in seeds.indices) if (seeds[i] && c.labels[i] > 0) seeded[c.labels[i]] = true
+        return paint(c.labels, seeded)
+    }
+
+    private fun removeSpecks(mask: BooleanArray, page: Page, minArea: Int): BooleanArray {
+        val c = components(mask, page)
+        val keep = BooleanArray(c.count) { it > 0 && c.area[it] >= minArea }
+        return paint(c.labels, keep)
+    }
+
+    /**
+     * Detects handwriting and the print layer the erase must protect/restore from colour +
+     * layout. Returns (handwriting, print) as CV_8UC1 Mats (255 = set); caller releases them.
+     * [colorDelta]: how much bluer than the local print a stroke must be (smaller = more sensitive).
+     */
+    /**
+     * Returns (handwriting, print, overlap) at [full]'s size: layout/colour context at working
+     * size, then per-pixel refinement at full resolution ([InkRefine.refine]) — downscaling blends
+     * thin strokes' edges and destroys the colour signal (measured 96% → 74% per-pixel accuracy).
+     */
+    fun detectByInkColor(full: Mat, colorDelta: Double): Triple<Mat, Mat, Mat> {
+        val src = toWorkingSize(full)
+        val r = try {
+            detectAtWorkingSize(src, colorDelta)
+        } finally {
+            if (src !== full) src.release()
+        }
+        val coarse = upscale(r.hw, full)
+        val coarsePrint = upscale(r.print, full)
+        val fragments = upscale(r.fragments, full)
+        val mixed = upscale(r.mixed, full)
+        return releasing(coarse, coarsePrint, r.ref, fragments, mixed) { InkRefine.refine(full, coarse, coarsePrint, r.ref, fragments, mixed) }
+    }
+
+    private fun toWorkingSize(full: Mat): Mat {
+        val longSide = max(full.cols(), full.rows())
+        if (longSide <= WORK_LONG_SIDE) return full
+        val scale = WORK_LONG_SIDE.toDouble() / longSide
+        val out = Mat()
+        Imgproc.resize(full, out, Size(), scale, scale, Imgproc.INTER_AREA)
+        return out
+    }
+
+    /** Scales a working-size mask to [like]'s size (nearest), releasing [mask] if it was scaled. */
+    private fun upscale(mask: Mat, like: Mat): Mat {
+        if (mask.size() == like.size()) return mask
+        val out = Mat()
+        Imgproc.resize(mask, out, like.size(), 0.0, 0.0, Imgproc.INTER_NEAREST)
+        mask.release()
+        return out
+    }
+
+    private class WorkResult(val hw: Mat, val print: Mat, val ref: Mat, val fragments: Mat, val mixed: Mat)
+
+    private fun detectAtWorkingSize(src: Mat, colorDelta: Double): WorkResult {
+        val page = Page(src.cols(), src.rows())
+        val k = strokeUnit(page.width, page.height)
+        val d = opticalDensity(src, page)
+        // colour window: wide enough to average out sensor noise (a stroke-width window was too
+        // noisy at the 2400 px working size — measured: whole printed words turned pen-coloured)
+        val colorWindow = max(k, max(page.width, page.height) / 270) or 1
+        val ratio = inkColorRatio(d, page, INK_OD, CLIPPED_OD, colorWindow, 0.05f)
+
+        // regular lines by geometry, then the local print-colour reference they give
+        val c = components(d.ink, page)
+        val lines = regularLines(c, k, page.height)
+        val regular = BooleanArray(c.count)
+        for (l in lines) for (i in l.members) regular[i] = true
+        val ref = localPrintReference(ratio, paint(c.labels, regular), page)
+
+        // pen candidates: ink noticeably bluer than the print around it
+        val delta = colorDelta.toFloat()
+        val relative = FloatArray(page.size) { if (ratio[it].isNaN()) Float.NaN else ratio[it] - ref[it] }
+        val cand = BooleanArray(page.size) { d.ink[it] && !relative[it].isNaN() && relative[it] < -delta }
+        val fracC = fractionPerComponent(c, cand)
+
+        // line vote: a regular line whose glyphs are mostly print-coloured is print, plus the
+        // dots/accents/punctuation inside its band
+        val printComp = BooleanArray(c.count)
+        val small = BooleanArray(c.count) { it > 0 && c.area[it] < k * k * 4 }
+        // line consensus per character: a glyph whose neighbours on its (loose) text line are all
+        // print is print too, unless it is itself strongly pen-coloured — merged letters can
+        // break a line's regularity, but not its colour context
+        run {
+            val ids = (1 until c.count).filter { isGlyph(c, it, k, page.height) }.sortedBy { c.cx[it] }
+            val uf = UnionFind(c.count)
+            for (a in ids.indices) {
+                val i = ids[a]
+                val reach = 2.5f * max(c.h[i], 3 * k)
+                var b = a + 1
+                while (b < ids.size && c.cx[ids[b]] - c.cx[i] < reach) {
+                    val o = ids[b]
+                    val ci = c.y[i] + c.h[i] / 2f
+                    val co = c.y[o] + c.h[o] / 2f
+                    val hr = c.h[o].toFloat() / c.h[i]
+                    if (abs(co - ci) < 0.5f * max(c.h[i], c.h[o]) && hr > 0.5f && hr < 2f) uf.join(o, i)
+                    b++
+                }
+            }
+            for (g in ids.groupBy { uf.find(it) }.values) {
+                if (g.size < 4) continue   // already sorted by cx (ids were)
+                for (p in g.indices) {
+                    var pen = 0.0; var total = 0.0
+                    for (q in max(0, p - 3)..min(g.size - 1, p + 3)) {
+                        if (q == p) continue
+                        pen += fracC[g[q]] * c.area[g[q]]; total += c.area[g[q]]
+                    }
+                    if (total > 0 && pen / total < 0.2 && fracC[g[p]] < 0.85f) printComp[g[p]] = true
+                }
+            }
+        }
+        for (l in lines) {
+            // regularity alone cannot tell (neat handwriting lines are just as straight —
+            // measured); the line's colour decides: pen lines ≈0.98 pen-coloured, print ≤0.45
+            if (percentile(l.members.map { fracC[it] }, 50f) >= 0.6f) continue
+            var x0 = Float.MAX_VALUE; var y0 = Float.MAX_VALUE; var x1 = -Float.MAX_VALUE; var y1 = -Float.MAX_VALUE
+            for (i in l.members) {
+                printComp[i] = true
+                x0 = min(x0, c.x[i].toFloat()); x1 = max(x1, (c.x[i] + c.w[i]).toFloat())
+                y0 = min(y0, c.y[i].toFloat()); y1 = max(y1, c.bottom[i])
+            }
+            y0 -= 0.6f * l.medianHeight; y1 += 0.3f * l.medianHeight
+            for (i in 1 until c.count) {
+                if (small[i] && c.cx[i] >= x0 && c.cx[i] <= x1 && c.y[i] >= y0 && c.y[i] + c.h[i] <= y1) printComp[i] = true
+            }
+        }
+        val printByLayout = paint(c.labels, printComp)
+
+        // stroke vote
+        val compHw = BooleanArray(c.count) { it > 0 && fracC[it] >= 0.35f && !printComp[it] }
+        val candFree = BooleanArray(page.size) { cand[it] && !printByLayout[it] }
+        val cb = components(candFree, page)
+        val big = BooleanArray(cb.count) { it > 0 && cb.area[it] >= (2 * k) * (2 * k) }
+        var hw = BooleanArray(page.size) { candFree[it] && (compHw[c.labels[it]] || big[cb.labels[it]]) }
+
+        // small pen marks (accents, dots, commas) right next to handwriting
+        val near = dilate(hw, page, 4 * k + 1, ellipse = true)
+        val smallPen = BooleanArray(c.count) { small[it] && !printComp[it] && fracC[it] >= 0.15f }
+        for (i in 0 until page.size) if (smallPen[c.labels[i]] && near[i] && d.ink[i]) hw[i] = true
+
+        // handwritten lines: in a loose line of non-print strokes that is mostly pen already,
+        // strokes only slightly bluer than print are pen too (pen colour varies with pressure)
+        run {
+            val ids = (1 until c.count).filter { isGlyph(c, it, k, page.height) && !printComp[it] }.sortedBy { c.cx[it] }
+            val uf = UnionFind(c.count)
+            for (a in ids.indices) {
+                val i = ids[a]
+                val reach = 2.5f * max(c.h[i], 3 * k)
+                var b = a + 1
+                while (b < ids.size && c.cx[ids[b]] - c.cx[i] < reach) {
+                    val o = ids[b]
+                    val ci = c.y[i] + c.h[i] / 2f
+                    val co = c.y[o] + c.h[o] / 2f
+                    if (abs(co - ci) < 0.6f * max(c.h[i], c.h[o])) uf.join(o, i)
+                    b++
+                }
+            }
+            val hwFrac = fractionPerComponent(c, hw)
+            val relSum = DoubleArray(c.count)
+            val relCnt = IntArray(c.count)
+            for (i in 0 until page.size) {
+                val l = c.labels[i]
+                if (l > 0 && !relative[i].isNaN()) { relSum[l] += relative[i].toDouble(); relCnt[l]++ }
+            }
+            val weakPen = BooleanArray(c.count)
+            for (g in ids.groupBy { uf.find(it) }.values) {
+                if (g.size < 2) continue
+                var pen = 0.0; var total = 0.0
+                for (i in g) { pen += hwFrac[i] * c.area[i]; total += c.area[i] }
+                if (pen < 0.5 * total) continue
+                for (i in g) if (relCnt[i] > 0 && relSum[i] / relCnt[i] < -0.015) weakPen[i] = true
+            }
+            for (i in 0 until page.size) if (weakPen[c.labels[i]] && d.ink[i]) hw[i] = true
+        }
+
+        // neighbourhood consensus: a pen stroke's darkness/colour is uneven, so single pixels
+        // flip; an ink pixel takes the majority label of the ink around it (≈3 stroke widths),
+        // both ways — holes inside handwriting close, isolated pen-coloured specks in print go
+        // back to print. Layout print (regular lines) keeps its label.
+        run {
+            val cwin = 3 * k + 1
+            val inkSum = boxFilter(FloatArray(page.size) { if (d.ink[it]) 1f else 0f }, page, cwin)
+            repeat(2) {
+                val hwSum = boxFilter(FloatArray(page.size) { if (hw[it] && d.ink[it]) 1f else 0f }, page, cwin)
+                for (i in 0 until page.size) {
+                    if (!d.ink[i]) continue
+                    hw[i] = !printByLayout[i] && hwSum[i] >= 0.5f * max(inkSum[i], 1e-6f)
+                }
+            }
+        }
+
+        // pen strokes merged INTO printed letters (an underline touching the word): mark their
+        // pen-coloured pixels for full-resolution refinement
+        val mixedMask = BooleanArray(page.size)
+        run {
+            val mixed = BooleanArray(c.count) { it > 0 && printComp[it] && fracC[it] >= 0.06f }
+            for (i in 0 until page.size) if (mixed[c.labels[i]] && cand[i]) mixedMask[i] = true
+        }
+        // strongly mixed AND shaped like a letter + underline (much wider than tall, a stroke's
+        // worth of pen colour): its pen-coloured pixels are handwriting, protected like fragments
+        val mixedPen = BooleanArray(page.size)
+        run {
+            val strong = BooleanArray(c.count) {
+                it > 0 && printComp[it] && fracC[it] >= 0.4f && c.w[it] >= 2.5f * c.h[it] && fracC[it] * c.area[it] >= 3f * k * k
+            }
+            for (i in 0 until page.size) if (strong[c.labels[i]] && cand[i]) { mixedPen[i] = true; hw[i] = true }
+        }
+
+        // small detached pen fragments (lead-in curl, colon, dash, accent): colour is unreliable
+        // on bits this thin, so their NEAREST neighbour decides — see ios InkAnalysis.hpp
+        val fragmentMask = BooleanArray(page.size)
+        run {
+            val tinyMax = (2 * k) * (2 * k)
+            val smallMax = (4 * k) * (4 * k)
+            val nonHwFrac = fractionPerComponent(c, BooleanArray(page.size) { d.ink[it] && !hw[it] })
+            val refComp = BooleanArray(c.count) { it > 0 && (printComp[it] || (c.area[it] > tinyMax && nonHwFrac[it] >= 0.5f)) }
+            val hwInkMat = toMat(BooleanArray(page.size) { hw[it] && d.ink[it] }, page)
+            val prRefMat = toMat(BooleanArray(page.size) { refComp[c.labels[it]] && d.ink[it] && !hw[it] }, page)
+            val notHw = Mat(); val notPr = Mat(); val distHw = Mat(); val distPr = Mat()
+            Core.bitwise_not(hwInkMat, notHw); Core.bitwise_not(prRefMat, notPr)
+            Imgproc.distanceTransform(notHw, distHw, Geometry.DIST_L2, 3)
+            Imgproc.distanceTransform(notPr, distPr, Geometry.DIST_L2, 3)
+            val dh = toFloats(distHw); val dp = toFloats(distPr)
+            releasing(hwInkMat, prRefMat, notHw, notPr, distHw, distPr) {}
+            val dHw = FloatArray(c.count) { 1e9f }; val dPr = FloatArray(c.count) { 1e9f }
+            for (i in 0 until page.size) {
+                val l = c.labels[i]
+                if (l == 0 || !d.ink[i]) continue
+                if (dh[i] < dHw[l]) dHw[l] = dh[i]
+                if (dp[i] < dPr[l]) dPr[l] = dp[i]
+            }
+            val fragment = BooleanArray(c.count) {
+                it > 0 && !printComp[it] && (
+                    (c.area[it] <= tinyMax && dHw[it] < dPr[it] && dHw[it] <= 8 * k) ||
+                        (c.area[it] <= smallMax && fracC[it] >= 0.25f && dHw[it] <= 2 * k)
+                    )
+            }
+            for (i in 0 until page.size) {
+                if ((fragment[c.labels[i]] && d.ink[i]) || mixedPen[i]) { fragmentMask[i] = true; hw[i] = true }
+            }
+        }
+
+        // pictures (photos, logos): ink dense over a wide area; text strokes never are
+        val win = odd(max(page.width, page.height) * 0.03)
+        val dens = boxFilter(FloatArray(page.size) { if (d.ink[it]) 1f else 0f }, page, win)
+        val cd = components(BooleanArray(page.size) { dens[it] > 0.5f }, page)
+        val bigDense = BooleanArray(cd.count) { it > 0 && cd.area[it] >= (2 * win) * (2 * win) }
+        val picture = dilate(paint(cd.labels, bigDense), page, win, ellipse = false)
+        for (i in 0 until page.size) if (picture[i]) hw[i] = false
+
+        // print to protect: print-coloured ink, layout print, pictures, faint print-coloured ink
+        val faintRatio = inkColorRatio(d, page, FAINT_OD, INK_OD, 2 * k + 1, 0.1f)
+        var print = BooleanArray(page.size) {
+            val m = d.mean[it]
+            (d.ink[it] && !relative[it].isNaN() && relative[it] > -0.02f) || printByLayout[it] || picture[it] ||
+                (m > FAINT_OD && m <= INK_OD && !hw[it] && !faintRatio[it].isNaN() && faintRatio[it] > ref[it] - 0.03f)
+        }
+        print = dilate(print, page, 3, ellipse = false)
+
+        // grow along the pen strokes into their faint parts, stopping at print
+        val allowed = BooleanArray(page.size) { d.mean[it] > FAINT_OD && !print[it] }
+        val grown = growWithin(BooleanArray(page.size) { hw[it] && allowed[it] }, allowed, page)
+        for (i in 0 until page.size) if (grown[i]) hw[i] = true
+        hw = removeSpecks(hw, page, max(12, k * k / 4))
+        // context-placed dots are not noise
+        for (i in 0 until page.size) if (fragmentMask[i] && !picture[i]) hw[i] = true
+        val fragmentsOut = BooleanArray(page.size) { fragmentMask[it] && !picture[it] }
+        val mixedOut = BooleanArray(page.size) { mixedMask[it] && !picture[it] }
+
+        return WorkResult(toMat(hw, page), toMat(print, page), toFloatMat(ref, page), toMat(fragmentsOut, page), toMat(mixedOut, page))
+    }
+
+}

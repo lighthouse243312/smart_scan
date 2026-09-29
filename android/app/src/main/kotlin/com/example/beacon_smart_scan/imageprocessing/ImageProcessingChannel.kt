@@ -74,7 +74,7 @@ object ImageProcessingChannel {
                 InkColorMasker.mask(
                     requirePath(call, "inputPath"),
                     requirePath(call, "maskPath"),
-                    requireDouble(call, "minSaturation", 60.0),
+                    requireDouble(call, "colorDelta", 0.05),
                 )
             "segmentationMask" ->
                 InkSegmenter.mask(
@@ -92,9 +92,9 @@ object ImageProcessingChannel {
             "eraseWithMask" ->
                 MaskEraser.erase(
                     requirePath(call, "inputPath"),
+                    requirePath(call, "analysisPath"),
                     requirePath(call, "maskPath"),
                     requirePath(call, "outputPath"),
-                    requireDouble(call, "dilatePx", 2.0),
                 )
             else -> throw ImageProcessingException("INVALID_ARGUMENT", "Unknown method: ${call.method}")
         }

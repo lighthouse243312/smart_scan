@@ -186,11 +186,11 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
   String _hintText(HandwritingMethod method, double coverage) {
     if (coverage <= 0) {
       return method == HandwritingMethod.inkColor
-          ? 'Không thấy mực màu — chữ viết bằng bút đen/bút chì cần dùng "Model AI".'
+          ? 'Không thấy nét bút khác màu mực in — thử tăng độ nhạy; bút cùng màu mực in thì dùng "Model AI".'
           : 'Không thấy chữ viết tay — thử tăng độ nhạy hoặc tô thêm bằng cọ.';
     }
     final percent = (coverage * 100).toStringAsFixed(coverage < 0.01 ? 2 : 1);
-    return 'Vùng đỏ ($percent% trang) sẽ bị xoá; chỗ tím là chữ in bị viết đè — sẽ được giữ lại. '
+    return 'Vùng đỏ ($percent% trang) sẽ bị xoá; chỗ vàng là chữ in bị viết đè — sẽ được dựng lại. '
         'Dùng cọ để thêm vùng hoặc giữ lại chữ bị tô nhầm; đổi cách/độ nhạy sẽ phát hiện lại từ đầu.';
   }
 

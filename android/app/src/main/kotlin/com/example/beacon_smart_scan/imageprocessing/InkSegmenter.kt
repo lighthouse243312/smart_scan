@@ -89,7 +89,10 @@ object InkSegmenter {
             print.convertTo(print, CvType.CV_8U)
             Core.bitwise_and(print, ink, print)
 
-            HandwritingMask.write(handwriting, print, maskPath)
+            // the model's two layers are independent: where both are set, print lies under the pen
+            val overlap = Mat()
+            Core.bitwise_and(handwriting, print, overlap)
+            releasing(overlap) { HandwritingMask.write(handwriting, print, overlap, maskPath) }
             HandwritingMask.result(maskPath, handwriting)
         }
     }

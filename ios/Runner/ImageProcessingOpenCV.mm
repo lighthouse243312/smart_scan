@@ -13,6 +13,7 @@
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
 #import "ImageProcessingOpenCV.h"
+#import "InkAnalysis.hpp"
 
 NSString *const ImageProcessingErrorDomain = @"ImageProcessingOpenCV";
 
@@ -52,14 +53,9 @@ static bool WriteOrFail(const cv::Mat &mat, NSString *path, NSError **error) {
 // crossed by a pen stroke is restored rather than smeared.
 
 static const int kOverlayAlpha = 160;
-// "Ink" = noticeably darker than the local paper. The strict value seeds the colour method; the
-// loose one lets masks grow onto anti-aliased stroke edges and faint pencil without spilling
-// onto bare paper.
-static const int kInkContrastStrict = 18;
+// "Ink" = noticeably darker than the local paper — used to snap the model's soft, reduced-scale
+// masks onto the page's actual strokes.
 static const int kInkContrastLoose = 8;
-// Colour method only: inside a coloured stroke, a pixel this dark is the stroke crossing black
-// print (a multiply of both inks), so it is counted as print to restore.
-static const int kPrintUnderMaxValue = 100;
 
 // Segmentation model contract — must match ml/train_ink_seg.py / export_ink_seg.py: two
 // independent sigmoid channels.
@@ -110,30 +106,36 @@ static void RemoveSmallComponents(cv::Mat &mask, int minArea) {
     }
 }
 
-/// `handwriting` / `print`: CV_8UC1, 255 = set.
-static bool WriteMaskFile(const cv::Mat &handwriting, const cv::Mat &print, NSString *path, NSError **error) {
+/// `handwriting` / `print` / `overlap`: CV_8UC1, 255 = set. Layers: A = handwriting (overlay
+/// alpha, drawn red), B = print, G = overlap (print hidden under handwriting — restored on erase;
+/// red + green shows it yellow in the overlay).
+static bool WriteMaskFile(const cv::Mat &handwriting, const cv::Mat &print, const cv::Mat &overlap, NSString *path, NSError **error) {
     cv::Mat file(handwriting.size(), CV_8UC4, cv::Scalar(0, 0, 0, 0));
     std::vector<cv::Mat> channels;
     cv::split(file, channels);
-    channels[0] = print.clone();                                   // B: print
+    channels[0] = print & ~overlap;                                // B: print (overlap kept apart
+                                                                   //    so it shows yellow, not white)
+    channels[1] = overlap.clone();                                 // G: overlap
     channels[2].setTo(255, handwriting);                           // R: overlay colour
     channels[3].setTo(kOverlayAlpha, handwriting);                 // A: handwriting
     cv::merge(channels, file);
     return WriteOrFail(file, path, error);
 }
 
-static bool ReadMaskFileOrFail(NSString *path, cv::Mat *outHandwriting, cv::Mat *outPrint, NSError **error) {
+static bool ReadMaskFileOrFail(NSString *path, cv::Mat *outHandwriting, cv::Mat *outPrint, cv::Mat *outOverlap, NSError **error) {
     cv::Mat raw = cv::imread([path UTF8String], cv::IMREAD_UNCHANGED);
     if (raw.empty() || raw.channels() != 4) {
         *error = MakeError(ImageProcessingErrorFileNotFound,
                             [NSString stringWithFormat:@"Không đọc được mask tại: %@", path]);
         return false;
     }
-    cv::Mat alpha, blue;
+    cv::Mat alpha, blue, green;
     cv::extractChannel(raw, alpha, 3);
     cv::extractChannel(raw, blue, 0);
+    cv::extractChannel(raw, green, 1);
     cv::threshold(alpha, *outHandwriting, 0, 255, cv::THRESH_BINARY);
     cv::threshold(blue, *outPrint, 127, 255, cv::THRESH_BINARY);
+    cv::threshold(green, *outOverlap, 127, 255, cv::THRESH_BINARY);
     return true;
 }
 
@@ -289,79 +291,6 @@ static bool SegmentPage(const cv::Mat &src, cv::Mat *outPrintProb, cv::Mat *outH
     return true;
 }
 
-/// Per-pixel paper colour: a large median over a 4x-downscaled copy wipes out ink strokes.
-static cv::Mat EstimatePaperColor(const cv::Mat &src) {
-    cv::Mat small;
-    cv::resize(src, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
-    int kernel = std::min(21, (std::min(small.cols, small.rows) - 1) | 1);
-    if (kernel >= 3) cv::medianBlur(small, small, kernel);
-    cv::Mat paper;
-    cv::resize(small, paper, src.size(), 0, 0, cv::INTER_LINEAR);
-    return paper;
-}
-
-/// Per-pixel colour of the NEARBY print (average over print pixels not covered by handwriting,
-/// within roughly a text line's reach), falling back to the page-wide print average where there
-/// is none — so a stroke crossing a blue heading restores blue, not black.
-static cv::Mat EstimatePrintColor(const cv::Mat &src, const cv::Mat &visiblePrint) {
-    // Only the dark core of print strokes: their anti-aliased edges are much lighter and would
-    // wash the restored colour out to grey.
-    cv::Mat gray;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::Mat contrast = InkContrast(gray);
-    int histogram[256] = {0};
-    int printCount = 0;
-    for (int y = 0; y < contrast.rows; y++) {
-        const uchar *c = contrast.ptr<uchar>(y);
-        const uchar *m = visiblePrint.ptr<uchar>(y);
-        for (int x = 0; x < contrast.cols; x++) {
-            if (m[x]) { histogram[c[x]]++; printCount++; }
-        }
-    }
-    int p95 = 0;
-    for (int v = 0, seen = 0; v < 256; v++) {
-        seen += histogram[v];
-        if (seen >= printCount * 0.95) { p95 = v; break; }
-    }
-    cv::Mat core;
-    cv::compare(contrast, 0.85 * p95, core, cv::CMP_GE);
-    cv::bitwise_and(core, visiblePrint, core);
-
-    cv::Mat weight, srcFloat;
-    core.convertTo(weight, CV_32F, 1.0 / 255.0);
-    src.convertTo(srcFloat, CV_32FC3);
-    cv::Mat weighted;
-    cv::Mat weight3;
-    cv::merge(std::vector<cv::Mat>{weight, weight, weight}, weight3);
-    cv::multiply(srcFloat, weight3, weighted);
-
-    const double f = 0.125;
-    cv::Mat smallWeighted, smallWeight;
-    cv::resize(weighted, smallWeighted, cv::Size(), f, f, cv::INTER_AREA);
-    cv::resize(weight, smallWeight, cv::Size(), f, f, cv::INTER_AREA);
-    cv::Size window(15, 15);
-    cv::boxFilter(smallWeighted, smallWeighted, -1, window);
-    cv::boxFilter(smallWeight, smallWeight, -1, window);
-
-    double total = cv::sum(weight)[0];
-    cv::Scalar globalColor = total > 0 ? cv::sum(weighted) / total : cv::Scalar(30, 30, 30);
-
-    cv::Mat smallColor(smallWeight.size(), CV_32FC3);
-    for (int y = 0; y < smallWeight.rows; y++) {
-        const float *w = smallWeight.ptr<float>(y);
-        const cv::Vec3f *c = smallWeighted.ptr<cv::Vec3f>(y);
-        cv::Vec3f *out = smallColor.ptr<cv::Vec3f>(y);
-        for (int x = 0; x < smallWeight.cols; x++) {
-            out[x] = w[x] > 1e-3f ? c[x] / w[x]
-                                  : cv::Vec3f((float)globalColor[0], (float)globalColor[1], (float)globalColor[2]);
-        }
-    }
-    cv::Mat color;
-    cv::resize(smallColor, color, src.size(), 0, 0, cv::INTER_LINEAR);
-    color.convertTo(color, CV_8UC3);
-    return color;
-}
-
 @implementation ImageProcessingOpenCV
 
 + (BOOL)sharpenAtPath:(NSString *)inputPath
@@ -439,55 +368,22 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
 
 + (nullable NSNumber *)inkColorMaskAtPath:(NSString *)inputPath
                                   maskPath:(NSString *)maskPath
-                             minSaturation:(double)minSaturation
+                                colorDelta:(double)colorDelta
                                      error:(NSError **)error {
     cv::Mat src;
     if (!ReadOrFail(inputPath, &src, error)) return nil;
 
-    cv::Mat gray, hsv;
-    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(src, hsv, cv::COLOR_BGR2HSV);
-    cv::Mat saturation, value;
-    cv::extractChannel(hsv, saturation, 1);
-    cv::extractChannel(hsv, value, 2);
-    cv::Mat contrast = InkContrast(gray);
+    cv::Mat handwriting, print, overlap;
+    inkanalysis::DetectByInkColor(src, colorDelta, &handwriting, &print, &overlap);
 
-    // Seed: saturated pixels that are also real ink (not a tinted paper area).
-    cv::Mat colored, inkStrict, inkLoose;
-    cv::compare(saturation, minSaturation, colored, cv::CMP_GT);
-    cv::compare(contrast, kInkContrastStrict, inkStrict, cv::CMP_GT);
-    cv::compare(contrast, kInkContrastLoose, inkLoose, cv::CMP_GT);
-    cv::bitwise_and(colored, inkStrict, colored);
-    RemoveSmallComponents(colored, MinSpeckleArea(src));
-
-    // A stroke's anti-aliased rim is less saturated than its core, so grow the seed a little —
-    // but only onto pixels that are ink, never onto paper.
-    cv::Mat grown;
-    cv::dilate(colored, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)), cv::Point(-1, -1), 2);
-    cv::bitwise_and(grown, inkLoose, grown);
-    cv::Mat handwriting;
-    cv::bitwise_or(colored, grown, handwriting);
-
-    // Print layer (no model here, so estimated): unsaturated ink OUTSIDE the strokes, plus pixels
-    // inside a stroke dark enough to be that stroke crossing black print. A stroke's own
-    // anti-aliased rim is unsaturated too, so unsaturated ink inside the stroke must not count —
-    // it would be "restored" as a grey outline of the erased stroke.
-    cv::Mat unsaturated, print, printUnder, notHandwriting;
-    cv::compare(saturation, minSaturation, unsaturated, cv::CMP_LE);
-    cv::bitwise_not(handwriting, notHandwriting);
-    cv::bitwise_and(inkStrict, unsaturated, print);
-    cv::bitwise_and(print, notHandwriting, print);
-    cv::compare(value, kPrintUnderMaxValue, printUnder, cv::CMP_LT);
-    cv::bitwise_and(printUnder, handwriting, printUnder);
-    cv::bitwise_or(print, printUnder, print);
-
-    if (!WriteMaskFile(handwriting, print, maskPath, error)) return nil;
+    if (!WriteMaskFile(handwriting, print, overlap, maskPath, error)) return nil;
     return Coverage(handwriting);
 }
 
 + (nullable NSNumber *)segmentationMaskAtPath:(NSString *)inputPath
                                       maskPath:(NSString *)maskPath
                                      threshold:(double)threshold
+                                    colorDelta:(double)colorDelta
                                          error:(NSError **)error {
     cv::Mat src;
     if (!ReadOrFail(inputPath, &src, error)) return nil;
@@ -506,9 +402,19 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     RemoveSmallComponents(handwriting, MinSpeckleArea(src));
     cv::compare(printProb, kSegPrintThreshold, print, cv::CMP_GT);
     cv::bitwise_and(print, ink, print);
+    // Combined with the ink-colour + layout method: each covers the other's blind spot — colour
+    // finds neat pen writing the model (trained on synthetic data) misses; the model finds pen ink
+    // the same colour as the print (black ballpoint), which colour cannot see.
+    cv::Mat colorHw, colorPrint, colorOverlap;
+    inkanalysis::DetectByInkColor(src, colorDelta, &colorHw, &colorPrint, &colorOverlap);
+    // a model pixel is dropped only where BOTH methods agree it is print
+    cv::Mat combinedHw = colorHw | (handwriting & ~(colorPrint & print));
+    // model's two layers are independent: where both are set, print lies under the pen
+    cv::Mat overlap = colorOverlap | (combinedHw & print & ~colorHw);
+    cv::Mat combinedPrint = ((colorPrint | print) & ~combinedHw) | overlap;
 
-    if (!WriteMaskFile(handwriting, print, maskPath, error)) return nil;
-    return Coverage(handwriting);
+    if (!WriteMaskFile(combinedHw, combinedPrint, overlap, maskPath, error)) return nil;
+    return Coverage(combinedHw);
 }
 
 + (nullable NSNumber *)applyMaskStrokesAtPath:(NSString *)maskPath
@@ -517,8 +423,8 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
                                          error:(NSError **)error {
     // Only the handwriting layer is edited — the print layer stays, so print under a stroke the
     // user brushes in is still restored on erase.
-    cv::Mat handwriting, print;
-    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, error)) return nil;
+    cv::Mat handwriting, print, overlap;
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error)) return nil;
 
     for (NSDictionary<NSString *, id> *stroke in strokes) {
         NSArray<NSNumber *> *points = stroke[@"points"];
@@ -529,54 +435,47 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
         for (NSUInteger i = 0; i + 1 < points.count; i += 2) {
             polyline.emplace_back((int)std::lround(points[i].doubleValue), (int)std::lround(points[i + 1].doubleValue));
         }
+        bool erase = [stroke[@"erase"] boolValue];
+        cv::Mat brush = cv::Mat::zeros(handwriting.size(), CV_8U);
         if (polyline.size() == 1) {
-            cv::circle(handwriting, polyline[0], thickness / 2, value, -1);
+            cv::circle(brush, polyline[0], thickness / 2, cv::Scalar(255), -1);
         } else {
-            cv::polylines(handwriting, polyline, false, value, thickness, cv::LINE_8);
+            cv::polylines(brush, polyline, false, cv::Scalar(255), thickness, cv::LINE_8);
         }
+        if (erase) {
+            handwriting.setTo(0, brush);
+            overlap.setTo(0, brush);
+        } else {
+            // "add to erase" never takes print: a wide brush over handwriting written on print
+            // erases the pen and keeps the print underneath
+            cv::Mat add = brush & ~print;
+            handwriting |= add;
+        }
+        (void)value;
     }
 
-    if (!WriteMaskFile(handwriting, print, outputPath, error)) return nil;
+    if (!WriteMaskFile(handwriting, print, overlap, outputPath, error)) return nil;
     return Coverage(handwriting);
 }
 
 + (BOOL)eraseWithMaskAtPath:(NSString *)inputPath
+                analysisPath:(NSString *)analysisPath
                     maskPath:(NSString *)maskPath
                   outputPath:(NSString *)outputPath
-                    dilatePx:(double)dilatePx
                        error:(NSError **)error {
-    cv::Mat src, handwriting, print;
-    if (!ReadOrFail(inputPath, &src, error)) return NO;
-    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, error)) return NO;
-    if (handwriting.size() != src.size()) {
-        cv::resize(handwriting, handwriting, src.size(), 0, 0, cv::INTER_NEAREST);
-        cv::resize(print, print, src.size(), 0, 0, cv::INTER_NEAREST);
+    cv::Mat target, analysis, handwriting, print, overlap;
+    if (!ReadOrFail(inputPath, &target, error)) return NO;
+    if (!ReadOrFail(analysisPath, &analysis, error)) return NO;
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error)) return NO;
+    if (analysis.size() != target.size()) {
+        cv::resize(analysis, analysis, target.size(), 0, 0, cv::INTER_AREA);
     }
-
-    // Grow over the stroke's faint rim — but only onto non-print pixels, so the growth can never
-    // eat into print the stroke merely passes next to.
-    cv::Mat area = handwriting.clone();
-    int grow = (int)std::lround(dilatePx);
-    if (grow > 0) {
-        cv::Mat grown, notPrint;
-        cv::dilate(handwriting, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * grow + 1, 2 * grow + 1)));
-        cv::bitwise_not(print, notPrint);
-        cv::bitwise_and(grown, notPrint, grown);
-        cv::bitwise_or(area, grown, area);
+    if (handwriting.size() != target.size()) {
+        cv::resize(handwriting, handwriting, target.size(), 0, 0, cv::INTER_NEAREST);
+        cv::resize(print, print, target.size(), 0, 0, cv::INTER_NEAREST);
+        cv::resize(overlap, overlap, target.size(), 0, 0, cv::INTER_NEAREST);
     }
-
-    // Rebuild instead of inpainting: inside the erased area, print pixels get the colour of the
-    // surrounding print (so a pen stroke crossing a word leaves the word's strokes intact) and
-    // everything else gets the paper colour. Outside the area the page is untouched.
-    cv::Mat restorePrint, paperArea, visiblePrint, notArea;
-    cv::bitwise_and(area, print, restorePrint);
-    cv::bitwise_xor(area, restorePrint, paperArea);
-    cv::bitwise_not(area, notArea);
-    cv::bitwise_and(print, notArea, visiblePrint);
-
-    cv::Mat dst = src.clone();
-    EstimatePaperColor(src).copyTo(dst, paperArea);
-    EstimatePrintColor(src, visiblePrint).copyTo(dst, restorePrint);
+    cv::Mat dst = inkanalysis::EraseHandwriting(target, analysis, handwriting, print, overlap);
     return WriteOrFail(dst, outputPath, error);
 }
 
