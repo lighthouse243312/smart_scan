@@ -95,24 +95,56 @@ inline OpticalDensity ComputeOpticalDensity(const cv::Mat &bgr) {
     return result;
 }
 
-/// Local ink colour OD_B / OD_R over a window of ink pixels in [minOD, maxOD]; NaN where there
-/// is too little ink to tell. Summing over a window (instead of per pixel) cancels the opposite
-/// colour fringes a lens leaves on either side of every stroke.
-inline cv::Mat InkColorRatio(const OpticalDensity &d, float minOD, float maxOD, int window, float minFill) {
+/// Local ink CHROMA over a window of ink pixels in (minOD, maxOD]: each channel's share of the
+/// optical density, (OD_B, OD_G, OD_R) / sum — density-independent like a ratio, but it sees every
+/// hue (a purple pen absorbs mostly green and has the same B/R as black toner — measured 0.99).
+/// NaN where there is too little ink to tell.
+inline void InkChroma(const OpticalDensity &d, float minOD, float maxOD, int window, float minFill, cv::Mat out[3]) {
     cv::Mat inRange = (d.mean > minOD) & (d.mean <= maxOD);
     cv::Mat w;
     inRange.convertTo(w, CV_32F, 1.0 / 255.0);
-    cv::Mat sb, sr, sw;
-    cv::boxFilter(d.od[0].mul(w), sb, -1, cv::Size(window, window));
-    cv::boxFilter(d.od[2].mul(w), sr, -1, cv::Size(window, window));
+    cv::Mat s[3], sw;
+    for (int c = 0; c < 3; c++) cv::boxFilter(d.od[c].mul(w), s[c], -1, cv::Size(window, window));
     cv::boxFilter(w, sw, -1, cv::Size(window, window));
-    cv::Mat ratio(d.mean.size(), CV_32F);
-    for (int y = 0; y < ratio.rows; y++) {
-        const float *b = sb.ptr<float>(y), *r = sr.ptr<float>(y), *c = sw.ptr<float>(y);
-        float *out = ratio.ptr<float>(y);
-        for (int x = 0; x < ratio.cols; x++) out[x] = c[x] > minFill ? b[x] / (r[x] + 1e-3f) : NAN;
+    for (int c = 0; c < 3; c++) out[c].create(d.mean.size(), CV_32F);
+    for (int y = 0; y < sw.rows; y++) {
+        const float *b = s[0].ptr<float>(y), *g = s[1].ptr<float>(y), *r = s[2].ptr<float>(y), *c = sw.ptr<float>(y);
+        float *ob = out[0].ptr<float>(y), *og = out[1].ptr<float>(y), *orr = out[2].ptr<float>(y);
+        for (int x = 0; x < sw.cols; x++) {
+            float sum = b[x] + g[x] + r[x];
+            if (c[x] > minFill && sum > 1e-3f) { ob[x] = b[x] / sum; og[x] = g[x] / sum; orr[x] = r[x] / sum; }
+            else { ob[x] = og[x] = orr[x] = NAN; }
+        }
     }
-    return ratio;
+}
+
+/// How the page's pen differs in colour from its print: `ref` = local print chroma (3 planes),
+/// `dir` = unit direction of the pen's chroma deviation from it (found per page, so blue, purple,
+/// red… pens all work).
+struct PenColor {
+    cv::Mat ref[3];
+    cv::Vec3f dir{-0.7071f, 0.f, 0.7071f};   // fallback only (no clearly other ink on the page)
+    // chroma distance -> score units (the units every threshold downstream was tuned in; a unit
+    // conversion only, not tied to any ink colour)
+    float scale = 4.0f;
+};
+
+/// Pen-likeness as a pseudo "ratio" in the units the rest of the pipeline was tuned in (measured
+/// on blue ballpoint, where it equals the old OD_B/OD_R ratio relative to print): 1 = print colour,
+/// lower = further towards the pen colour. `ref` planes must be at `chroma`'s size.
+inline cv::Mat PenScore(const cv::Mat chroma[3], const cv::Mat ref[3], const cv::Vec3f &dir, float scale) {
+    cv::Mat score(chroma[0].size(), CV_32F);
+    for (int y = 0; y < score.rows; y++) {
+        const float *c0 = chroma[0].ptr<float>(y), *c1 = chroma[1].ptr<float>(y), *c2 = chroma[2].ptr<float>(y);
+        const float *r0 = ref[0].ptr<float>(y), *r1 = ref[1].ptr<float>(y), *r2 = ref[2].ptr<float>(y);
+        float *o = score.ptr<float>(y);
+        for (int x = 0; x < score.cols; x++) {
+            if (std::isnan(c0[x])) { o[x] = NAN; continue; }
+            float proj = (c0[x] - r0[x]) * dir[0] + (c1[x] - r1[x]) * dir[1] + (c2[x] - r2[x]) * dir[2];
+            o[x] = 1.0f - scale * proj;
+        }
+    }
+    return score;
 }
 
 struct Components {
@@ -299,24 +331,82 @@ inline void RemoveSpecks(cv::Mat &mask, int minArea) {
 }
 
 /// Detects handwriting (`outHandwriting`) and the print layer the erase must protect/restore
-/// (`outPrint`) from colour + layout. `colorDelta`: how much bluer than the local print an ink
-/// must be to count as pen (smaller = more sensitive).
-inline void DetectAtWorkingSize(const cv::Mat &src, double colorDelta, cv::Mat *outHandwriting, cv::Mat *outPrint, cv::Mat *outPrintRef, cv::Mat *outFragments, cv::Mat *outMixed) {
+/// (`outPrint`) from colour + layout. The print's own colour is measured from the page's regular
+/// text lines and the pen's hue is found as the dominant colour deviation of the other ink — no ink
+/// colour is assumed. `colorDelta`: how far towards that hue (in score units) an ink must be to
+/// count as pen (smaller = more sensitive).
+inline void DetectAtWorkingSize(const cv::Mat &src, double colorDelta, cv::Mat *outHandwriting, cv::Mat *outPrint, PenColor *outPen, cv::Mat *outFragments, cv::Mat *outMixed) {
     const int H = src.rows, W = src.cols, longSide = std::max(H, W);
     const int k = StrokeUnit(src);
     OpticalDensity d = ComputeOpticalDensity(src);
     // colour window: wide enough to average out sensor noise (a stroke-width window was too noisy
     // at the 2400 px working size — measured: whole printed words turned pen-coloured)
     const int colorWindow = std::max(k, longSide / 270) | 1;
-    cv::Mat ratio = InkColorRatio(d, kInkOD, kClippedOD, colorWindow, 0.05f);
+    cv::Mat chroma[3];
+    InkChroma(d, kInkOD, kClippedOD, colorWindow, 0.05f, chroma);
 
     // --- regular lines by geometry, then the local print-colour reference they give
     Components c = FindComponents(d.ink);
     std::vector<TextLine> lines = FindRegularLines(c, k, H);
     std::vector<char> regular(c.count, 0);
     for (auto &l : lines) for (int i : l.members) regular[i] = 1;
-    float globalRef = 1.0f;
-    cv::Mat ref = LocalPrintReference(ratio, PaintComponents(c.labels, regular), &globalRef);
+    cv::Mat regularMask = PaintComponents(c.labels, regular);
+    PenColor pen;
+    float unusedGlobal = 0.f;
+    for (int ch = 0; ch < 3; ch++) pen.ref[ch] = LocalPrintReference(chroma[ch], regularMask, &unusedGlobal);
+    // Other ink: how does ink OUTSIDE regular print lines differ in colour from the print? Its
+    // deviations are binned by hue direction (angle in the chroma plane); the pen shows up as the
+    // dominant direction, while lens fringes, photo and paper noise spread over all directions.
+    // No ink colour is assumed.
+    {
+        const int bins = 72;
+        std::vector<double> hist(bins, 0.0);
+        const cv::Vec3d e1(0.7071, 0.0, -0.7071), e2(-0.4082, 0.8165, -0.4082);  // basis of the chroma plane
+        // judged per ink STROKE (connected component), not per pixel: a lens shifts colour in
+        // opposite directions on either edge of every stroke, which cancels over the stroke while the
+        // ink's own hue does not (measured: per-pixel peaks landed ~40° off the real pen hue)
+        std::vector<cv::Vec3d> devSum(c.count, cv::Vec3d(0, 0, 0));
+        std::vector<int> devCnt(c.count, 0);
+        for (int y = 0; y < H; y++) {
+            const int *l = c.labels.ptr<int>(y);
+            const uchar *ink = d.ink.ptr<uchar>(y);
+            const float *c0 = chroma[0].ptr<float>(y), *c1 = chroma[1].ptr<float>(y), *c2 = chroma[2].ptr<float>(y);
+            const float *r0 = pen.ref[0].ptr<float>(y), *r1 = pen.ref[1].ptr<float>(y), *r2 = pen.ref[2].ptr<float>(y);
+            for (int x = 0; x < W; x++) {
+                if (!ink[x] || l[x] == 0 || regular[l[x]] || std::isnan(c0[x])) continue;
+                devSum[l[x]] += cv::Vec3d(c0[x] - r0[x], c1[x] - r1[x], c2[x] - r2[x]);
+                devCnt[l[x]]++;
+            }
+        }
+        const int maxArea = (int)(0.002 * H * W);   // photos, logos, page edges are not strokes
+        for (int i = 1; i < c.count; i++) {
+            if (devCnt[i] < 2 * k || c.area[i] > maxArea) continue;
+            cv::Vec3d dv = devSum[i] / devCnt[i];
+            double u = dv.dot(e1), v = dv.dot(e2), m = std::sqrt(u * u + v * v);
+            if (m < 0.006) continue;
+            int bin = ((int)std::floor((std::atan2(v, u) + CV_PI) / (2 * CV_PI) * bins)) % bins;
+            hist[bin] += devCnt[i] * std::min(m, 0.05);
+        }
+        int best = -1;
+        double bestVal = 0.0;
+        for (int i = 0; i < bins; i++) {
+            double v = 0;
+            for (int o = -2; o <= 2; o++) v += hist[(i + o + bins) % bins];   // smooth over ±12°
+            if (v > bestVal) { bestVal = v; best = i; }
+        }
+        if (best >= 0 && bestVal > 0.5) {
+            double ang = (best + 0.5) / bins * 2 * CV_PI - CV_PI;
+            cv::Vec3d dirv = e1 * std::cos(ang) + e2 * std::sin(ang);
+            pen.dir = cv::Vec3f((float)dirv[0], (float)dirv[1], (float)dirv[2]);
+        }
+#ifdef INK_DEBUG
+        fprintf(stderr, "pen dir B,G,R = %.3f %.3f %.3f scale %.2f (best bin %d val %.1f)\n", pen.dir[0], pen.dir[1], pen.dir[2], pen.scale, best, bestVal);
+        for (int i = 0; i < bins; i += 6) fprintf(stderr, "%d:%.0f ", i, hist[i] + hist[(i+1)%bins] + hist[(i+2)%bins] + hist[(i+3)%bins] + hist[(i+4)%bins] + hist[(i+5)%bins]);
+        fprintf(stderr, "\n");
+#endif
+    }
+    cv::Mat ratio = PenScore(chroma, pen.ref, pen.dir, pen.scale);
+    cv::Mat ref(src.size(), CV_32F, cv::Scalar(1.0f));
 
     // --- pen candidates: ink noticeably bluer than the print around it
     cv::Mat cand(src.size(), CV_8U, cv::Scalar(0)), relative(src.size(), CV_32F);
@@ -553,7 +643,9 @@ inline void DetectAtWorkingSize(const cv::Mat &src, double colorDelta, cv::Mat *
         for (int x = 0; x < W; x++) o[x] = (ink[x] && !std::isnan(rel[x]) && rel[x] > -0.02f) ? 255 : 0;
     }
     cv::Mat print = printColored | printByLayout | picture;
-    cv::Mat faintRatio = InkColorRatio(d, kFaintOD, kInkOD, 2 * k + 1, 0.1f);
+    cv::Mat faintChroma[3];
+    InkChroma(d, kFaintOD, kInkOD, 2 * k + 1, 0.1f, faintChroma);
+    cv::Mat faintRatio = PenScore(faintChroma, pen.ref, pen.dir, pen.scale);
     cv::Mat faintPrint(src.size(), CV_8U);
     for (int y = 0; y < H; y++) {
         const float *fr = faintRatio.ptr<float>(y), *rf = ref.ptr<float>(y), *m = d.mean.ptr<float>(y);
@@ -575,7 +667,7 @@ inline void DetectAtWorkingSize(const cv::Mat &src, double colorDelta, cv::Mat *
 
     *outHandwriting = hw;
     *outPrint = print;
-    *outPrintRef = ref;
+    *outPen = pen;
     *outFragments = fragmentMask & ~picture;
     *outMixed = mixedMask & ~picture;
 }
@@ -714,13 +806,16 @@ inline std::vector<cv::Rect> RegionsOf(const cv::Mat &mask, int pad) {
 }
 
 /// Refines one region: returns handwriting and overlap (print under pen) at full resolution.
-inline void RefineRoi(const OpticalDensity &d, const cv::Mat &coarse, const cv::Mat &fragments, const cv::Mat &mixed, const cv::Mat &printRef, int k,
+inline void RefineRoi(const OpticalDensity &d, const cv::Mat &coarse, const cv::Mat &fragments, const cv::Mat &mixed, const PenColor &pen, int k,
                       cv::Mat *outHw, cv::Mat *outOverlap, cv::Mat *outPrintStrong) {
     cv::Mat zone;
     cv::dilate(coarse, zone, Ellipse(4 * k + 1));
 
     // own colour: 3x3 window only (larger windows smear pen colour onto adjacent print)
-    cv::Mat ratio = InkColorRatio(d, kInkOD, kClippedOD, 3, 0.3f);
+    cv::Mat roiChroma[3];
+    InkChroma(d, kInkOD, kClippedOD, 3, 0.3f, roiChroma);
+    cv::Mat ratio = PenScore(roiChroma, pen.ref, pen.dir, pen.scale);
+    cv::Mat printRef(ratio.size(), CV_32F, cv::Scalar(1.0f));
     cv::Mat core;
     cv::erode(coarse, core, cv::Mat::ones(3, 3, CV_8U));
     std::vector<float> penSamples;
@@ -891,8 +986,9 @@ inline void RefineRoi(const OpticalDensity &d, const cv::Mat &coarse, const cv::
 /// all at full resolution: layout/colour context at working size, then per-pixel refinement.
 inline void DetectByInkColor(const cv::Mat &full, double colorDelta, cv::Mat *outHandwriting, cv::Mat *outPrint, cv::Mat *outOverlap) {
     cv::Mat work = ToWorkingSize(full);
-    cv::Mat coarseHw, coarsePrint, refWork, fragWork, mixedWork;
-    DetectAtWorkingSize(work, colorDelta, &coarseHw, &coarsePrint, &refWork, &fragWork, &mixedWork);
+    cv::Mat coarseHw, coarsePrint, fragWork, mixedWork;
+    PenColor penWork;
+    DetectAtWorkingSize(work, colorDelta, &coarseHw, &coarsePrint, &penWork, &fragWork, &mixedWork);
     cv::Mat coarse = ScaleMaskTo(coarseHw, full.size());
     cv::Mat fragments = ScaleMaskTo(fragWork, full.size());
     cv::Mat mixed = ScaleMaskTo(mixedWork, full.size());
@@ -903,14 +999,16 @@ inline void DetectByInkColor(const cv::Mat &full, double colorDelta, cv::Mat *ou
     cv::Mat paperSmall = PaperLowRes(full);
     for (const cv::Rect &roi : RegionsOf(coarse | mixed, 8 * k)) {
         OpticalDensity d = DensityInRoi(full, paperSmall, roi);
-        cv::Mat ref;
-        // print colour reference for this region, from the working-size map
+        // print-colour reference for this region, from the working-size maps
         cv::Rect workRoi((int)(roi.x * (double)work.cols / full.cols), (int)(roi.y * (double)work.rows / full.rows), 0, 0);
         workRoi.width = std::max(1, std::min(work.cols, (int)std::ceil((roi.x + roi.width) * (double)work.cols / full.cols)) - workRoi.x);
         workRoi.height = std::max(1, std::min(work.rows, (int)std::ceil((roi.y + roi.height) * (double)work.rows / full.rows)) - workRoi.y);
-        cv::resize(refWork(workRoi), ref, roi.size(), 0, 0, cv::INTER_LINEAR);
+        PenColor penRoi;
+        penRoi.dir = penWork.dir;
+        penRoi.scale = penWork.scale;
+        for (int ch = 0; ch < 3; ch++) cv::resize(penWork.ref[ch](workRoi), penRoi.ref[ch], roi.size(), 0, 0, cv::INTER_LINEAR);
         cv::Mat roiHw, roiOverlap, roiPrintStrong;
-        RefineRoi(d, coarse(roi), fragments(roi), mixed(roi), ref, k, &roiHw, &roiOverlap, &roiPrintStrong);
+        RefineRoi(d, coarse(roi), fragments(roi), mixed(roi), penRoi, k, &roiHw, &roiOverlap, &roiPrintStrong);
         roiHw.copyTo(hw(roi));
         roiOverlap.copyTo(overlap(roi));
         // inside the refined region only CONFIDENT print is protected: pen pixels merely left out

@@ -31,12 +31,14 @@ object InkAnalysis {
     private const val FAINT_OD = 0.06f
     private const val RIM_OD = 0.04f
     private const val WORK_LONG_SIDE = 2400
+    /** Chroma distance -> score units (a unit conversion, not tied to any ink colour). */
+    const val PEN_SCALE = 4f
 
     class Page(val width: Int, val height: Int) {
         val size = width * height
     }
 
-    private class OpticalDensity(val odB: FloatArray, val odR: FloatArray, val mean: FloatArray, val ink: BooleanArray)
+    private class OpticalDensity(val odB: FloatArray, val odG: FloatArray, val odR: FloatArray, val mean: FloatArray, val ink: BooleanArray)
 
     /** Stroke-scale unit (≈ a pen stroke's width) for this resolution. */
     fun strokeUnit(width: Int, height: Int): Int = max(5, max(width, height) / 450) or 1
@@ -180,6 +182,7 @@ object InkAnalysis {
             val v = FloatArray(page.size * 3)
             t.get(0, 0, v)
             val odB = FloatArray(page.size)
+            val odG = FloatArray(page.size)
             val odR = FloatArray(page.size)
             val mean = FloatArray(page.size)
             val ink = BooleanArray(page.size)
@@ -187,21 +190,78 @@ object InkAnalysis {
                 val b = -kotlin.math.ln(v[i * 3].coerceIn(1e-3f, 1f))
                 val g = -kotlin.math.ln(v[i * 3 + 1].coerceIn(1e-3f, 1f))
                 val r = -kotlin.math.ln(v[i * 3 + 2].coerceIn(1e-3f, 1f))
-                odB[i] = b; odR[i] = r
+                odB[i] = b; odG[i] = g; odR[i] = r
                 mean[i] = (b + g + r) / 3f
                 ink[i] = mean[i] > INK_OD
             }
-            OpticalDensity(odB, odR, mean, ink)
+            OpticalDensity(odB, odG, odR, mean, ink)
         }
     }
 
-    /** Local OD_B / OD_R over ink in (minOD, maxOD]; NaN where there is too little ink. */
-    private fun inkColorRatio(d: OpticalDensity, page: Page, minOD: Float, maxOD: Float, window: Int, minFill: Float): FloatArray {
+    /**
+     * Local ink CHROMA (OD_B, OD_G, OD_R) / sum over ink in (minOD, maxOD] — sees every hue (a
+     * purple pen has the same B/R as black toner). NaN where there is too little ink.
+     */
+    private fun inkChroma(d: OpticalDensity, page: Page, minOD: Float, maxOD: Float, window: Int, minFill: Float): Array<FloatArray> {
         val w = FloatArray(page.size) { if (d.mean[it] > minOD && d.mean[it] <= maxOD) 1f else 0f }
         val sb = boxFilter(FloatArray(page.size) { d.odB[it] * w[it] }, page, window)
+        val sg = boxFilter(FloatArray(page.size) { d.odG[it] * w[it] }, page, window)
         val sr = boxFilter(FloatArray(page.size) { d.odR[it] * w[it] }, page, window)
         val sw = boxFilter(w, page, window)
-        return FloatArray(page.size) { if (sw[it] > minFill) sb[it] / (sr[it] + 1e-3f) else Float.NaN }
+        val cb = FloatArray(page.size); val cg = FloatArray(page.size); val cr = FloatArray(page.size)
+        for (i in 0 until page.size) {
+            val sum = sb[i] + sg[i] + sr[i]
+            if (sw[i] > minFill && sum > 1e-3f) { cb[i] = sb[i] / sum; cg[i] = sg[i] / sum; cr[i] = sr[i] / sum }
+            else { cb[i] = Float.NaN; cg[i] = Float.NaN; cr[i] = Float.NaN }
+        }
+        return arrayOf(cb, cg, cr)
+    }
+
+    /** Pen-likeness in the pipeline's score units: 1 = print colour, lower = towards the pen hue. */
+    private fun penScore(chroma: Array<FloatArray>, ref: Array<FloatArray>, dir: FloatArray): FloatArray =
+        FloatArray(chroma[0].size) {
+            if (chroma[0][it].isNaN()) Float.NaN
+            else 1f - PEN_SCALE * ((chroma[0][it] - ref[0][it]) * dir[0] + (chroma[1][it] - ref[1][it]) * dir[1] + (chroma[2][it] - ref[2][it]) * dir[2])
+        }
+
+    /**
+     * The page's pen hue: direction of other ink's chroma deviation from the local print, judged
+     * per ink stroke (lens fringes cancel over a stroke; the ink's own hue does not) and taken as
+     * the dominant direction of a hue histogram. No ink colour is assumed. See ios InkAnalysis.hpp.
+     */
+    private fun penDirection(c: Components, regular: BooleanArray, d: OpticalDensity, chroma: Array<FloatArray>, ref: Array<FloatArray>, page: Page, k: Int): FloatArray {
+        val bins = 72
+        val hist = DoubleArray(bins)
+        val e1 = doubleArrayOf(0.7071, 0.0, -0.7071)
+        val e2 = doubleArrayOf(-0.4082, 0.8165, -0.4082)
+        val sum = Array(3) { DoubleArray(c.count) }
+        val cnt = IntArray(c.count)
+        for (i in 0 until page.size) {
+            val l = c.labels[i]
+            if (!d.ink[i] || l == 0 || regular[l] || chroma[0][i].isNaN()) continue
+            for (ch in 0 until 3) sum[ch][l] += (chroma[ch][i] - ref[ch][i]).toDouble()
+            cnt[l]++
+        }
+        val maxArea = (0.002 * page.size).toInt()
+        for (l in 1 until c.count) {
+            if (cnt[l] < 2 * k || c.area[l] > maxArea) continue
+            val dv = DoubleArray(3) { sum[it][l] / cnt[l] }
+            val u = dv[0] * e1[0] + dv[1] * e1[1] + dv[2] * e1[2]
+            val v = dv[0] * e2[0] + dv[1] * e2[1] + dv[2] * e2[2]
+            val m = kotlin.math.sqrt(u * u + v * v)
+            if (m < 0.006) continue
+            val bin = (kotlin.math.floor((kotlin.math.atan2(v, u) + Math.PI) / (2 * Math.PI) * bins).toInt()) % bins
+            hist[bin] += cnt[l] * min(m, 0.05)
+        }
+        var best = -1; var bestVal = 0.0
+        for (i in 0 until bins) {
+            var v = 0.0
+            for (o in -2..2) v += hist[(i + o + bins) % bins]
+            if (v > bestVal) { bestVal = v; best = i }
+        }
+        if (best < 0 || bestVal <= 0.5) return floatArrayOf(-0.7071f, 0f, 0.7071f)   // fallback only
+        val ang = (best + 0.5) / bins * 2 * Math.PI - Math.PI
+        return FloatArray(3) { (e1[it] * kotlin.math.cos(ang) + e2[it] * kotlin.math.sin(ang)).toFloat() }
     }
 
     private class TextLine(val members: IntArray, val medianHeight: Float)
@@ -322,7 +382,7 @@ object InkAnalysis {
         val coarsePrint = upscale(r.print, full)
         val fragments = upscale(r.fragments, full)
         val mixed = upscale(r.mixed, full)
-        return releasing(coarse, coarsePrint, r.ref, fragments, mixed) { InkRefine.refine(full, coarse, coarsePrint, r.ref, fragments, mixed) }
+        return releasing(coarse, coarsePrint, r.ref, fragments, mixed) { InkRefine.refine(full, coarse, coarsePrint, r.ref, r.penDir, fragments, mixed) }
     }
 
     private fun toWorkingSize(full: Mat): Mat {
@@ -343,7 +403,7 @@ object InkAnalysis {
         return out
     }
 
-    private class WorkResult(val hw: Mat, val print: Mat, val ref: Mat, val fragments: Mat, val mixed: Mat)
+    private class WorkResult(val hw: Mat, val print: Mat, val ref: Mat, val penDir: FloatArray, val fragments: Mat, val mixed: Mat)
 
     private fun detectAtWorkingSize(src: Mat, colorDelta: Double): WorkResult {
         val page = Page(src.cols(), src.rows())
@@ -352,14 +412,19 @@ object InkAnalysis {
         // colour window: wide enough to average out sensor noise (a stroke-width window was too
         // noisy at the 2400 px working size — measured: whole printed words turned pen-coloured)
         val colorWindow = max(k, max(page.width, page.height) / 270) or 1
-        val ratio = inkColorRatio(d, page, INK_OD, CLIPPED_OD, colorWindow, 0.05f)
+        val chroma = inkChroma(d, page, INK_OD, CLIPPED_OD, colorWindow, 0.05f)
 
-        // regular lines by geometry, then the local print-colour reference they give
+        // regular lines by geometry, then the local print-colour (chroma) reference they give, and
+        // the hue direction of the page's other ink (the pen)
         val c = components(d.ink, page)
         val lines = regularLines(c, k, page.height)
         val regular = BooleanArray(c.count)
         for (l in lines) for (i in l.members) regular[i] = true
-        val ref = localPrintReference(ratio, paint(c.labels, regular), page)
+        val regularMask = paint(c.labels, regular)
+        val refChroma = Array(3) { localPrintReference(chroma[it], regularMask, page) }
+        val penDir = penDirection(c, regular, d, chroma, refChroma, page, k)
+        val ratio = penScore(chroma, refChroma, penDir)
+        val ref = FloatArray(page.size) { 1f }
 
         // pen candidates: ink noticeably bluer than the print around it
         val delta = colorDelta.toFloat()
@@ -542,7 +607,7 @@ object InkAnalysis {
         for (i in 0 until page.size) if (picture[i]) hw[i] = false
 
         // print to protect: print-coloured ink, layout print, pictures, faint print-coloured ink
-        val faintRatio = inkColorRatio(d, page, FAINT_OD, INK_OD, 2 * k + 1, 0.1f)
+        val faintRatio = penScore(inkChroma(d, page, FAINT_OD, INK_OD, 2 * k + 1, 0.1f), refChroma, penDir)
         var print = BooleanArray(page.size) {
             val m = d.mean[it]
             (d.ink[it] && !relative[it].isNaN() && relative[it] > -0.02f) || printByLayout[it] || picture[it] ||
@@ -560,7 +625,11 @@ object InkAnalysis {
         val fragmentsOut = BooleanArray(page.size) { fragmentMask[it] && !picture[it] }
         val mixedOut = BooleanArray(page.size) { mixedMask[it] && !picture[it] }
 
-        return WorkResult(toMat(hw, page), toMat(print, page), toFloatMat(ref, page), toMat(fragmentsOut, page), toMat(mixedOut, page))
+        val refPlanes = refChroma.map { toFloatMat(it, page) }
+        val refMat = Mat()
+        Core.merge(refPlanes, refMat)
+        refPlanes.forEach { it.release() }
+        return WorkResult(toMat(hw, page), toMat(print, page), refMat, penDir, toMat(fragmentsOut, page), toMat(mixedOut, page))
     }
 
 }

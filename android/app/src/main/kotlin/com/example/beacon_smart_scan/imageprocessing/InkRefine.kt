@@ -87,8 +87,8 @@ object InkRefine {
         }
     }
 
-    class Density(val odB: Mat, val odR: Mat, val mean: Mat, val ink: Mat) {
-        fun release() { odB.release(); odR.release(); mean.release(); ink.release() }
+    class Density(val odB: Mat, val odG: Mat, val odR: Mat, val mean: Mat, val ink: Mat) {
+        fun release() { odB.release(); odG.release(); odR.release(); mean.release(); ink.release() }
     }
 
     /** Paper colour at 1/8 scale (brightest nearby — ink only darkens it). */
@@ -144,9 +144,8 @@ object InkRefine {
         Core.add(ch[0], ch[1], mean)
         Core.add(mean, ch[2], mean)
         Core.multiply(mean, Scalar(1.0 / 3.0), mean)
-        ch[1].release()
         val ink = cmp(mean, INK_OD, Core.CMP_GT)
-        return Density(ch[0], ch[2], mean, ink)
+        return Density(ch[0], ch[1], ch[2], mean, ink)
     }
 
     /** Padded bounding boxes of `mask`'s regions, found on a 1/8 copy and merged where they overlap. */
@@ -200,21 +199,35 @@ object InkRefine {
     }
 
     /** Refines one region: returns (handwriting, overlap) masks at full resolution. */
-    private fun refineRoi(d: Density, coarse: Mat, fragments: Mat, mixed: Mat, printRef: Mat, k: Int): Triple<Mat, Mat, Mat> {
+    private fun refineRoi(d: Density, coarse: Mat, fragments: Mat, mixed: Mat, printRefChroma: Mat, penDir: FloatArray, k: Int): Triple<Mat, Mat, Mat> {
         val zone = dilate(coarse, ellipse(4.0 * k + 1))
 
-        // own colour: 3x3 window over ink in (INK_OD, CLIPPED_OD]
+        // own colour: 3x3 window chroma over ink in (INK_OD, CLIPPED_OD], scored along the page's
+        // pen hue against the local print chroma (see InkAnalysis.penScore)
         val inRange = and(d.ink, cmp(d.mean, CLIPPED_OD, Core.CMP_LE))
         val w = toFloat(inRange)
-        val sb = Mat(); val sr = Mat(); val sw = Mat()
-        val tb = Mat(); val tr = Mat()
-        Core.multiply(d.odB, w, tb); Core.multiply(d.odR, w, tr)
-        Imgproc.boxFilter(tb, sb, -1, Size(3.0, 3.0)); Imgproc.boxFilter(tr, sr, -1, Size(3.0, 3.0)); Imgproc.boxFilter(w, sw, -1, Size(3.0, 3.0))
+        val sw = Mat(); Imgproc.boxFilter(w, sw, -1, Size(3.0, 3.0))
+        val sums = listOf(d.odB, d.odG, d.odR).map { od ->
+            val t = Mat(); Core.multiply(od, w, t)
+            val b = Mat(); Imgproc.boxFilter(t, b, -1, Size(3.0, 3.0)); t.release(); b
+        }
+        val total = Mat(); Core.add(sums[0], sums[1], total); Core.add(total, sums[2], total)
+        val decided = and(cmp(sw, 0.3, Core.CMP_GT), cmp(total, 1e-3, Core.CMP_GT))
+        Core.max(total, Scalar(1e-6), total)
+        val refPlanes = ArrayList<Mat>(); Core.split(printRefChroma, refPlanes)
+        val proj = Mat.zeros(total.size(), CvType.CV_32F)
+        for (ch in 0 until 3) {
+            val cc = Mat(); Core.divide(sums[ch], total, cc)
+            Core.subtract(cc, refPlanes[ch], cc)
+            Core.scaleAdd(cc, penDir[ch].toDouble(), proj, proj)
+            cc.release()
+        }
         val ratio = Mat()
-        Core.add(sr, Scalar(1e-3), sr)
-        Core.divide(sb, sr, ratio)
-        val decided = cmp(sw, 0.3, Core.CMP_GT)
-        releasing(inRange, w, sb, sr, sw, tb, tr) {}
+        Core.multiply(proj, Scalar(-InkAnalysis.PEN_SCALE.toDouble()), ratio)
+        Core.add(ratio, Scalar(1.0), ratio)
+        val printRef = Mat(ratio.size(), CvType.CV_32F, Scalar(1.0))
+        (sums + refPlanes).forEach { it.release() }
+        releasing(inRange, w, sw, total, proj) {}
 
         val core = Mat()
         Imgproc.erode(coarse, core, Mat.ones(3, 3, CvType.CV_8U))
@@ -380,7 +393,7 @@ object InkRefine {
      * Full-resolution refinement of the working-size result: returns (handwriting, print, overlap).
      * [coarse], [coarsePrint] are at full size; [refWork] is the working-size print-colour map.
      */
-    fun refine(full: Mat, coarse: Mat, coarsePrint: Mat, refWork: Mat, fragments: Mat, mixed: Mat): Triple<Mat, Mat, Mat> {
+    fun refine(full: Mat, coarse: Mat, coarsePrint: Mat, refWork: Mat, penDir: FloatArray, fragments: Mat, mixed: Mat): Triple<Mat, Mat, Mat> {
         val k = InkAnalysis.strokeUnit(full.cols(), full.rows())
         val hw = Mat.zeros(full.size(), CvType.CV_8U)
         val overlap = Mat.zeros(full.size(), CvType.CV_8U)
@@ -399,7 +412,7 @@ object InkRefine {
                 val coarseRoi = coarse.submat(roi)
                 val fragRoi = fragments.submat(roi)
                 val mixedRoi = mixed.submat(roi)
-                val (roiHw, roiOverlap, roiPrintStrong) = refineRoi(d, coarseRoi, fragRoi, mixedRoi, ref, k)
+                val (roiHw, roiOverlap, roiPrintStrong) = refineRoi(d, coarseRoi, fragRoi, mixedRoi, ref, penDir, k)
                 fragRoi.release()
                 val hwView = hw.submat(roi); roiHw.copyTo(hwView); hwView.release()
                 val ovView = overlap.submat(roi); roiOverlap.copyTo(ovView); ovView.release()
