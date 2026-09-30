@@ -69,7 +69,7 @@ class ImageProcessingChannel {
 
   /// Brings a picture from outside the app (photo library / files) into the pipeline's format:
   /// decoded by the platform (HEIC too), turned upright by its EXIF orientation, flattened onto
-  /// white, capped at 4000 px on the long side and written as JPEG to [outputPath].
+  /// white, capped at 4000 px on the long side and written as PNG (lossless) to [outputPath].
   static Future<String> importImage({
     required String inputPath,
     required String outputPath,

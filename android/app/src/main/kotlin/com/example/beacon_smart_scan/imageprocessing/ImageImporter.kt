@@ -18,7 +18,8 @@ import kotlin.math.roundToInt
  * only as an EXIF tag, be transparent (a PNG screenshot) or be huge. Decoded with the platform
  * decoder (HEIF on Android 9+), turned upright, flattened onto white, capped at [MAX_LONG_SIDE]
  * (processing time grows with the pixel count; this is well above what text needs) and written as
- * JPEG, which OpenCV reads everywhere.
+ * PNG: lossless, because a second JPEG pass smears the ink colours the handwriting detection
+ * separates pen from print by.
  */
 object ImageImporter {
     private const val MAX_LONG_SIDE = 4000
@@ -60,7 +61,7 @@ object ImageImporter {
         }
         try {
             FileOutputStream(outputPath).use { stream ->
-                if (!out.compress(Bitmap.CompressFormat.JPEG, 95, stream)) {
+                if (!out.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
                     throw ImageProcessingException("PROCESSING_FAILED", "Không ghi được ảnh")
                 }
             }

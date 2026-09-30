@@ -106,7 +106,9 @@ enum ImageProcessingChannel {
     /// The document scanner hands over upright JPEGs; an arbitrary picture may instead be HEIC
     /// (which OpenCV cannot read), carry its rotation only as an EXIF orientation, be transparent
     /// (a PNG screenshot) or be huge. Decoded by UIKit, redrawn upright onto white at <= 4000 px
-    /// and written as JPEG.
+    /// and written as PNG: lossless, because a second JPEG pass smears the ink colours the handwriting
+    /// detection separates pen from print by (measured: a pen-crossed word the PNG kept whole came
+    /// out broken after re-encoding at quality 0.95).
     private static func importImage(inputPath: String, outputPath: String) throws -> (width: Int, height: Int) {
         guard FileManager.default.fileExists(atPath: inputPath) else {
             throw NSError(domain: ImageProcessingErrorDomain, code: ImageProcessingErrorCode.fileNotFound.rawValue,
@@ -127,7 +129,7 @@ enum ImageProcessingChannel {
             ctx.fill(CGRect(origin: .zero, size: target))
             image.draw(in: CGRect(origin: .zero, size: target))   // draws with its orientation applied
         }
-        guard let data = upright.jpegData(compressionQuality: 0.95) else {
+        guard let data = upright.pngData() else {
             throw ArgumentError(message: "Không ghi được ảnh")
         }
         try data.write(to: URL(fileURLWithPath: outputPath))

@@ -26,9 +26,10 @@ class ImageProcessingService {
         return ImageProcessingChannel.removeShadow(inputPath: inputPath, outputPath: outputPath);
       });
 
-  /// Converts a picture picked from outside the app into the pipeline's upright JPEG.
+  /// Converts a picture picked from outside the app into the pipeline's upright PNG (lossless: no
+  /// second JPEG pass over the ink colours).
   Future<String> importImage(String inputPath) => _run(() async {
-        final outputPath = await TempPaths.next('imported.jpg');
+        final outputPath = await TempPaths.next('imported.png');
         return ImageProcessingChannel.importImage(inputPath: inputPath, outputPath: outputPath);
       });
 
