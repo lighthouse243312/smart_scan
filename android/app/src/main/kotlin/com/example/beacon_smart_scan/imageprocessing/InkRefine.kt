@@ -1019,6 +1019,16 @@ object InkRefine {
                 Imgproc.cvtColor(changed, changed, Imgproc.COLOR_BGR2GRAY)
                 val protect = cmp(changed, 30.0, Core.CMP_GT)
                 Core.bitwise_or(protect, restoredAll, protect)
+                // print the mask is sure of (PenComponentVote settles it by the ink's own colour) is
+                // not stray either: a printed blank "_" under a pen letter has no untouched twin
+                // on a worksheet, since every blank got written on
+                run {
+                    val hwRim = dilate(handwriting, Mat.ones(3, 3, CvType.CV_8U))
+                    val notRim = not(hwRim)
+                    val surePrint = and(print, notRim)
+                    Core.bitwise_or(protect, surePrint, protect)
+                    releasing(hwRim, notRim, surePrint) {}
+                }
                 Imgproc.dilate(protect, protect, Mat.ones(3, 3, CvType.CV_8U))
                 val bright = Mat(); Imgproc.resize(targetPaperSmallBright, bright, dst.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
                 Imgproc.GaussianBlur(bright, bright, Size(0.0, 0.0), 8.0)

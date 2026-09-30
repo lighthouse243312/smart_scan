@@ -35,8 +35,9 @@ object PenComponentVote {
     private const val PEN_DEV = 0.03
     /** ...and below which it is confidently print-coloured. */
     private const val NEUTRAL_DEV = 0.015
-    /** A thin horizontal run counts as a printed rule only if it is not even slightly pen-coloured. */
-    private const val RULE_MAX_DEV = 0.025
+    /** A thin horizontal run is a printed rule when enough of its measurable pixels are neutral. */
+    private const val RULE_MIN_NEUTRAL = 10
+    private const val RULE_NEUTRAL_SHARE = 0.08
     private const val HIST_BINS = 1000
 
     /**
@@ -191,24 +192,43 @@ object PenComponentVote {
             Core.bitwise_not(penSeed, tmp); Imgproc.distanceTransform(tmp, dPen, Geometry.DIST_L2, 3)
             Core.bitwise_not(neutSeed, tmp); Imgproc.distanceTransform(tmp, dNeu, Geometry.DIST_L2, 3)
             Core.compare(dPen, dNeu, penSide, Core.CMP_LT)
-            releasing(dPen, dNeu, neutSeed) {}
+            releasing(dPen, dNeu) {}
         }
-        // printed rules / blank underscores fused with pen strokes: thin horizontal runs of ink that
-        // is not even slightly pen-coloured (a pen stroke drawn along the rule is, so it stays pen)
+        // printed rules / blank underscores fused with pen strokes: thin horizontal runs, decided per
+        // run — a printed rule shows neutral rims somewhere along it (its core is usually clipped,
+        // and where letters sit on it the rims take their colour), a pen stroke along the line (a
+        // strike-through, an underline) is pen-coloured wherever its colour can be measured
         val rule = Mat()
         run {
-            val nonPen = Mat(); val runs = Mat(); val thick = Mat()
-            Imgproc.threshold(mag, tmp, RULE_MAX_DEV, 255.0, Imgproc.THRESH_BINARY)
-            tmp.convertTo(tmp, CvType.CV_8U); Core.bitwise_and(tmp, valid, tmp)
-            Core.bitwise_not(tmp, tmp); Core.bitwise_and(ink, tmp, nonPen)
-            Imgproc.morphologyEx(nonPen, runs, Imgproc.MORPH_OPEN, Mat.ones(1, 2 * k + 1, CvType.CV_8U))
+            val runs = Mat(); val thick = Mat(); val segLabels = Mat()
+            Imgproc.morphologyEx(ink, runs, Imgproc.MORPH_OPEN, Mat.ones(1, 2 * k + 1, CvType.CV_8U))
             Imgproc.morphologyEx(runs, thick, Imgproc.MORPH_OPEN, Mat.ones(k or 1, 1, CvType.CV_8U))
             Imgproc.dilate(thick, thick, Mat.ones(3, 3, CvType.CV_8U))
-            Core.bitwise_not(thick, thick); Core.bitwise_and(runs, thick, rule)
+            Core.bitwise_not(thick, thick); Core.bitwise_and(runs, thick, runs)
+            val segs = Imgproc.connectedComponents(runs, segLabels, 8, CvType.CV_32S)
+            val measured = IntArray(segs); val neutral = IntArray(segs)
+            val lab = IntArray(w); val vRow = ByteArray(w); val nRow = ByteArray(w)
+            for (y in 0 until h) {
+                segLabels.get(y, 0, lab); valid.get(y, 0, vRow); neutSeed.get(y, 0, nRow)
+                for (x in 0 until w) {
+                    val l = lab[x]; if (l == 0) continue
+                    if (vRow[x].toInt() != 0) measured[l]++
+                    if (nRow[x].toInt() != 0) neutral[l]++
+                }
+            }
+            val printed = BooleanArray(segs) { it > 0 && neutral[it] >= RULE_MIN_NEUTRAL && neutral[it] >= RULE_NEUTRAL_SHARE * measured[it] }
+            val out = ByteArray(w)
+            rule.create(h, w, CvType.CV_8U)
+            for (y in 0 until h) {
+                segLabels.get(y, 0, lab)
+                for (x in 0 until w) out[x] = if (printed[lab[x]]) 255.toByte() else 0
+                rule.put(y, 0, out)
+            }
             Imgproc.dilate(rule, rule, Mat.ones(3, 1, CvType.CV_8U))
-            Core.bitwise_and(rule, nonPen, rule)
+            Core.bitwise_and(rule, ink, rule)
+            Core.bitwise_not(penSeed, tmp); Core.bitwise_and(rule, tmp, rule)
             Core.bitwise_not(rule, tmp); Core.bitwise_and(penSide, tmp, penSide)
-            releasing(nonPen, runs, thick) {}
+            releasing(runs, thick, segLabels, neutSeed) {}
         }
         tmp.release()
 
