@@ -21,6 +21,8 @@
 #include <climits>
 #include <cmath>
 #include <array>
+#include <functional>
+#include <string>
 #include <map>
 #include <numeric>
 #include <vector>
@@ -224,13 +226,13 @@ struct TextLine {
 /// Regular text lines by GEOMETRY alone: glyph-sized components that follow each other on a
 /// shared baseline with near-equal heights, fitted to a straight line. Printed text always forms
 /// these; handwriting only occasionally does, which the colour vote in the caller resolves.
+inline bool GlyphSized(const Components &c, int i, int unit, int imageHeight) {
+    return c.area[i] >= unit * 2 && c.h[i] >= unit && c.h[i] <= imageHeight * 0.03 && c.w[i] <= c.h[i] * 4;
+}
+
 inline std::vector<TextLine> FindRegularLines(const Components &c, int unit, int imageHeight) {
     std::vector<int> glyphs;
-    for (int i = 1; i < c.count; i++) {
-        if (c.area[i] >= unit * 2 && c.h[i] >= unit && c.h[i] <= imageHeight * 0.03 && c.w[i] <= c.h[i] * 4) {
-            glyphs.push_back(i);
-        }
-    }
+    for (int i = 1; i < c.count; i++) if (GlyphSized(c, i, unit, imageHeight)) glyphs.push_back(i);
     std::sort(glyphs.begin(), glyphs.end(), [&](int a, int b) { return c.cx[a] < c.cx[b]; });
     UnionFind uf(c.count);
     for (size_t a = 0; a < glyphs.size(); a++) {
@@ -606,6 +608,79 @@ inline void DetectAtWorkingSize(const cv::Mat &src, double colorDelta, cv::Mat *
         std::vector<TextLine> kept;
         for (size_t li = 0; li < lines.size(); li++) if (keep[li]) kept.push_back(lines[li]);
         lines.swap(kept);
+    }
+    // a printed line the pen wrote across breaks into pieces: its letters fused with the pen no
+    // longer sit on the baseline, and the clean glyphs left between them are too few to chain into a
+    // line of their own ("…hạng thứ nhất kém tổng 234 đơn vị và…" over a formula — then the whole
+    // stretch passed for colourless handwriting). Two pieces on ONE baseline with the same text height
+    // are that line: the glyphs between them on the baseline join it — only those with a twin among
+    // the printed glyphs, so an answer written in a blank of the line stays out (handwritten digits
+    // <= 0.56 IoU to their best twin)
+    {
+        struct Fit { double a, b; int x0, x1; float h; };
+        std::vector<Fit> fits;
+        std::vector<char> inLine(c.count, 0);
+        std::vector<int> pool;
+        for (const TextLine &L : lines) {
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            int x0 = INT_MAX, x1 = INT_MIN;
+            for (int i : L.members) {
+                sx += c.cx[i]; sy += c.bottom[i]; sxx += c.cx[i] * c.cx[i]; sxy += c.cx[i] * c.bottom[i];
+                x0 = std::min(x0, c.x[i]); x1 = std::max(x1, c.x[i] + c.w[i]);
+                inLine[i] = 1;
+                pool.push_back(i);
+            }
+            const double n = (double)L.members.size(), den = n * sxx - sx * sx;
+            const double a = den != 0 ? (n * sxy - sx * sy) / den : 0;
+            fits.push_back({a, (sy - a * sx) / n, x0, x1, L.medianHeight});
+        }
+        std::sort(pool.begin(), pool.end(), [&](int a, int b) { return c.h[a] < c.h[b]; });
+        std::vector<cv::Mat> shapes(c.count);
+        auto shape = [&](int i) -> const cv::Mat & {
+            if (shapes[i].empty()) shapes[i] = c.labels(cv::Rect(c.x[i], c.y[i], c.w[i], c.h[i])) == i;
+            return shapes[i];
+        };
+        auto hasTwin = [&](int i) {
+            const cv::Mat &B = shape(i);
+            auto lo = std::lower_bound(pool.begin(), pool.end(), (int)std::floor(c.h[i] * 0.88f), [&](int a, int v) { return c.h[a] < v; });
+            for (auto it = lo; it != pool.end() && c.h[*it] <= c.h[i] * 1.14f; ++it) {
+                const float rw = (float)c.w[*it] / c.w[i];
+                if (rw < 0.85f || rw > 1.18f) continue;
+                cv::Mat G;
+                cv::resize(shape(*it), G, B.size(), 0, 0, cv::INTER_NEAREST);
+                int inter = cv::countNonZero(G & B), uni = cv::countNonZero(G | B);
+                if (uni > 0 && inter >= 0.7f * uni) return true;
+            }
+            return false;
+        };
+        std::vector<int> loose;
+        for (int i = 1; i < c.count; i++) if (!inLine[i] && GlyphSized(c, i, k, H)) loose.push_back(i);
+        for (size_t p = 0; p < fits.size(); p++) {
+            const Fit &P = fits[p];
+            // the nearest piece to its right on the same baseline, of the same text height
+            int best = -1;
+            for (size_t q = 0; q < fits.size(); q++) {
+                const Fit &Q = fits[q];
+                if (q == p || Q.x0 <= P.x1 || std::fabs(Q.h - P.h) > 0.2f * std::max(Q.h, P.h)) continue;
+                // (compared where the pieces end, not extrapolated: a fitted slope is noisy)
+                const double hm = std::max(P.h, Q.h);
+                if (std::fabs((P.a * P.x1 + P.b) - (Q.a * Q.x0 + Q.b)) >= 0.18 * hm) continue;
+                if (best < 0 || Q.x0 < fits[best].x0) best = (int)q;
+            }
+            if (best < 0) continue;
+            const Fit &Q = fits[best];
+            const float hm = std::max(P.h, Q.h);
+            for (int i : loose) {
+                if (inLine[i] || c.cx[i] <= P.x1 || c.cx[i] >= Q.x0) continue;
+                // (the baseline straight from one piece's end to the other's)
+                const double f = (c.cx[i] - P.x1) / (double)(Q.x0 - P.x1);
+                const double base = (1 - f) * (P.a * P.x1 + P.b) + f * (Q.a * Q.x0 + Q.b);
+                const float ratio = c.h[i] / hm;
+                if (std::fabs(c.bottom[i] - base) >= 0.18 * hm || ratio <= 0.6f || ratio >= 1.67f || !hasTwin(i)) continue;
+                lines[p].members.push_back(i);
+                inLine[i] = 1;
+            }
+        }
     }
     std::vector<char> regular(c.count, 0);
     for (auto &l : lines) for (int i : l.members) regular[i] = 1;
@@ -1284,6 +1359,24 @@ inline void RefineRoi(const OpticalDensity &d, const cv::Mat &coarse, const cv::
         cv::boxFilter(farF, farSum, -1, cv::Size(W, W), cv::Point(-1, -1), false);
         cv::max(inkSum, 1.0, inkSum);
         cv::Mat farShare = farSum / inkSum;
+        // (never a letter that shows the print's own colour itself: a printed word the pen passes
+        // just below — "của" over "1600:2" — is surrounded by pen, yet its measured colour is
+        // print's. Only groups of such pixels, a letter's part, not a lone pixel on a pen stroke)
+        cv::Mat printOwn;
+        {
+            cv::Mat byColour = cv::Mat::zeros(ratio.size(), CV_8U);
+            for (int y = 0; y < ratio.rows; y++) {
+                const float *r = ratio.ptr<float>(y), *rf = printRef.ptr<float>(y);
+                const uchar *ink = d.ink.ptr<uchar>(y);
+                uchar *o = byColour.ptr<uchar>(y);
+                for (int x = 0; x < ratio.cols; x++) o[x] = (ink[x] && !std::isnan(r[x]) && r[x] >= rf[x] - 0.02f) ? 255 : 0;
+            }
+            byColour &= ~coarse;
+            Components cp = FindComponents(byColour);
+            std::vector<char> part(cp.count, 0);
+            for (int i = 1; i < cp.count; i++) part[i] = cp.area[i] >= k;
+            printOwn = PaintComponents(cp.labels, part);
+        }
         for (int pass = 0; pass < 2; pass++) {
             cv::Mat hwF, hwSum;
             cv::Mat hi = hw & d.ink;
@@ -1292,7 +1385,7 @@ inline void RefineRoi(const OpticalDensity &d, const cv::Mat &coarse, const cv::
             cv::Mat share = hwSum / inkSum;
             // and enough pen mass around (a stray speck on a printed letter must not spread)
             cv::Mat enoughPen = hwSum >= (float)(6 * k * k);
-            hw |= zone & d.ink & (share >= 0.55f) & (farShare < 0.15f) & enoughPen;
+            hw |= zone & d.ink & (share >= 0.55f) & (farShare < 0.15f) & enoughPen & ~printOwn;
         }
         printStrong &= ~hw;
     }
@@ -1714,8 +1807,9 @@ inline void DetectByInkColor(const cv::Mat &full, double colorDelta, cv::Mat *ou
 /// gap). A printed page repeats the same glyphs, so for each erased spot next to visible print, the
 /// visible surroundings (≈6 stroke widths) are matched against the whole page; where another place
 /// matches them closely (same letter, same font and size), its pixels fill the erased part. A spot
-/// without a convincing match is left as it is.
-inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, int k) {
+/// without a convincing match is left as it is. `original`: the page before the erase (same
+/// geometry) — a fill only ever goes where it had ink.
+inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, const cv::Mat &original, int k) {
     if (cv::countNonZero(erased) == 0) return;
     cv::Mat gray;
     cv::cvtColor(dst, gray, cv::COLOR_BGR2GRAY);
@@ -1727,6 +1821,20 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, int k) {
     cv::subtract(paper, gray, inkLevel);
     cv::Mat ink = inkLevel > 60;
     cv::Mat visiblePrint = ink & ~erased;
+    // ink in the page before the erase (same measure), and within 1 px of it
+    cv::Mat wasInk, wasNear;
+    {
+        cv::Mat og, osmall, opaper, olevel;
+        cv::cvtColor(original, og, cv::COLOR_BGR2GRAY);
+        cv::resize(og, osmall, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        cv::medianBlur(osmall, osmall, std::min(21, (std::min(osmall.cols, osmall.rows) - 1) | 1));
+        cv::resize(osmall, opaper, og.size(), 0, 0, cv::INTER_LINEAR);
+        cv::subtract(opaper, og, olevel);
+        wasInk = olevel > 60;
+        // (a twin sits on the page's pixel grid, the damaged letter may be half a pixel off it — on
+        // 1-2 px strokes that alone halved the overlap: judged within 1 px)
+        cv::dilate(wasInk, wasNear, cv::Mat::ones(3, 3, CV_8U));
+    }
 
     // erased pixels right next to visible print = where print was cut
     cv::Mat seeds, nearPrint;
@@ -1735,6 +1843,25 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, int k) {
     if (cv::countNonZero(seeds) == 0) return;
 
     const int T = std::max(15, 6 * k) | 1;   // patch size
+    // visible print that is not a rule, nor a flat line piece (what the erase left of a slightly
+    // sloped pen underline matched other sloped lines and was "repaired" longer); and the lines the
+    // visible rules run along
+    cv::Mat visibleText, ruleLines;
+    {
+        cv::Mat hR, vR, near;
+        cv::morphologyEx(visiblePrint, hR, cv::MORPH_OPEN, cv::Mat::ones(1, T, CV_8U));
+        cv::morphologyEx(visiblePrint, vR, cv::MORPH_OPEN, cv::Mat::ones(T, 1, CV_8U));
+        cv::Mat hL, vL;
+        cv::dilate(hR, hL, cv::Mat::ones(3, 2 * T + 1, CV_8U));
+        cv::dilate(vR, vL, cv::Mat::ones(2 * T + 1, 3, CV_8U));
+        ruleLines = hL | vL;
+        cv::dilate(hR | vR, near, cv::Mat::ones(3, 3, CV_8U));
+        visibleText = visiblePrint & ~near;
+        Components ct = FindComponents(visibleText);
+        std::vector<char> flat(ct.count, 0);
+        for (int i = 1; i < ct.count; i++) flat[i] = ct.w[i] >= T / 2 && ct.w[i] >= 4 * ct.h[i];
+        visibleText &= ~PaintComponents(ct.labels, flat);
+    }
     // matched on SHAPE, not grey level: ink amount 0..1, lightly blurred so sub-pixel shifts and
     // anti-aliasing do not dominate the score
     cv::Mat inkF;
@@ -1769,6 +1896,7 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, int k) {
     // each window finds its twin independently (in parallel); the fills are applied afterwards in
     // window order, so the result does not depend on the thread count
     std::vector<cv::Point> twinOf(windows.size(), cv::Point(-1, -1));
+    std::vector<char> ruleOnly(windows.size(), 0);
     cv::parallel_for_(cv::Range(0, (int)windows.size()), [&](const cv::Range &range) {
         for (int w = range.start; w < range.end; w++) {
             const int x0 = windows[w].x, y0 = windows[w].y;
@@ -1784,6 +1912,10 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, int k) {
                 for (int y = 0; y < rowsWithInk.rows; y++) if (rowsWithInk.at<uchar>(y)) { if (top < 0) top = y; bottom = y; }
                 if (top < 0 || bottom - top + 1 <= k) continue;
             }
+            // otherwise only printed rules in view (a vertical table line beside a pen answer in its
+            // cell): all a twin can tell is how the rule goes on — what lies beside a twin rule (a
+            // question number next to the table's border) says nothing about this cell
+            if (cv::countNonZero(visibleText(R)) < 2 * k * k) ruleOnly[w] = 1;
 
             // coarse search
             cv::Rect RH(x0 / sc, y0 / sc, TH, TH);
@@ -1843,24 +1975,36 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, int k) {
             int inter = cv::countNonZero(f0 & f1), uni = cv::countNonZero(f0 | f1);
             double agree = uni == 0 ? 1.0 : (double)inter / uni;
             if (scores[0] > 0.06 || scores[1] > 0.10 || agree < 0.6) continue;
+            // ...and on what was really there: print under the pen was ink in the original (the
+            // pen's or its own), so a twin that puts its ink where the original shows paper is a
+            // lookalike context, not the same text ("đầu." followed by a pen "76" matched "762. Tính"
+            // and pasted a "T" into the blank beside it: 70% of it on ink, a pen-crossed "thứ" 100%)
+            {
+                int fill = cv::countNonZero(f0), under = cv::countNonZero(f0 & wasNear(R));
+                if (under < 0.9 * fill) continue;
+            }
             twinOf[w] = twins[0];
         }
     });
-    // fill only the erased pixels, and only with the twin's INK (paper is already paper)
+    // fill only the erased pixels that were ink in the original, and only with the twin's INK
+    // (paper is already paper)
     const cv::Mat source = dst.clone();
     cv::Mat done = cv::Mat::zeros(dst.size(), CV_8U);
     for (size_t w = 0; w < windows.size(); w++) {
         if (twinOf[w].x < 0) continue;
+        const bool alongRule = ruleOnly[w];
         const int x0 = windows[w].x, y0 = windows[w].y;
         const cv::Rect Rs(twinOf[w].x, twinOf[w].y, T, T);
         for (int y = 0; y < T; y++) {
             const uchar *e = erased.ptr<uchar>(y0 + y) + x0;
             const uchar *srcInk = ink.ptr<uchar>(Rs.y + y) + Rs.x;
+            const uchar *was = wasInk.ptr<uchar>(y0 + y) + x0;
+            const uchar *line = ruleLines.ptr<uchar>(y0 + y) + x0;
             const cv::Vec3b *src = source.ptr<cv::Vec3b>(Rs.y + y) + Rs.x;
             cv::Vec3b *out = dst.ptr<cv::Vec3b>(y0 + y) + x0;
             uchar *dn = done.ptr<uchar>(y0 + y) + x0;
             for (int x = 0; x < T; x++) {
-                if (!e[x] || !srcInk[x] || dn[x]) continue;
+                if (!e[x] || !srcInk[x] || !was[x] || dn[x] || (alongRule && !line[x])) continue;
                 out[x] = src[x];
                 dn[x] = 255;
             }
@@ -2297,6 +2441,464 @@ inline void RetypesetPrint(cv::Mat &dst, const cv::Mat &analysis, const cv::Mat 
 }
 
 
+// MARK: - Restore by recognition
+
+/// One word read by the text recogniser: its graphemes (user-perceived characters, UTF-8 — "ổ" is
+/// one) and its box in the page. Recognisers box words, not characters.
+struct OcrWord { std::vector<std::string> graphemes; cv::Rect box; };
+/// One text line: its alternative readings (best first), each split into words.
+struct OcrLine { std::vector<std::vector<OcrWord>> readings; cv::Rect box; };
+/// Reads the text of a BGR page. Supplied by the platform (Vision on iOS, ML Kit on Android); the
+/// analysis here stays pure OpenCV.
+using TextRecognizer = std::function<std::vector<OcrLine>(const cv::Mat &bgr)>;
+
+/// Candidate spellings of a damaged word from two readings of it: each alone, and every mix of the
+/// two where they disagree (the erased page read "Tìnt" where the pen had crossed an "m", the
+/// original read the pen-covered word as "Tim": "Tìm" is a mix). Aligned by edit distance.
+inline int EditDistance(const std::vector<std::string> &a, const std::vector<std::string> &b) {
+    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+    std::iota(prev.begin(), prev.end(), 0);
+    for (size_t i = 1; i <= a.size(); i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); j++) cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+        prev.swap(cur);
+    }
+    return prev[b.size()];
+}
+
+inline std::vector<std::vector<std::string>> MixedSpellings(const std::vector<std::string> &a, const std::vector<std::string> &b) {
+    const int n = (int)a.size(), m = (int)b.size();
+    std::vector<std::vector<int>> D(n + 1, std::vector<int>(m + 1, 0));
+    for (int i = 0; i <= n; i++) D[i][0] = i;
+    for (int j = 0; j <= m; j++) D[0][j] = j;
+    for (int i = 1; i <= n; i++)
+        for (int j = 1; j <= m; j++)
+            D[i][j] = std::min({D[i - 1][j] + 1, D[i][j - 1] + 1, D[i - 1][j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+    std::vector<std::vector<std::string>> out;
+    // (both ways of breaking ties in the alignment: "Tìnt" / "Tim" aligns n-m + t-nothing as well as
+    // n-nothing + t-m, and only the first gives "Tìm")
+    for (int order = 0; order < 2; order++) {
+    // aligned pairs, back to front; "" = nothing on that side
+    std::vector<std::pair<std::string, std::string>> pairs;
+    for (int i = n, j = m; i > 0 || j > 0;) {
+        const bool diag = i > 0 && j > 0 && D[i][j] == D[i - 1][j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1);
+        const bool up = i > 0 && D[i][j] == D[i - 1][j] + 1, left = j > 0 && D[i][j] == D[i][j - 1] + 1;
+        if (diag && (order == 0 || (!up && !left))) { pairs.push_back({a[i - 1], b[j - 1]}); i--; j--; }
+        else if (up) { pairs.push_back({a[i - 1], ""}); i--; }
+        else if (left) { pairs.push_back({"", b[j - 1]}); j--; }
+        else { pairs.push_back({a[i - 1], b[j - 1]}); i--; j--; }
+    }
+    std::reverse(pairs.begin(), pairs.end());
+    std::vector<int> diff;
+    for (size_t q = 0; q < pairs.size(); q++) if (pairs[q].first != pairs[q].second) diff.push_back((int)q);
+    if (diff.size() > 6) continue;   // unrelated readings
+    for (int mask = 0; mask < (1 << diff.size()); mask++) {
+        std::vector<std::string> w;
+        for (size_t q = 0, d = 0; q < pairs.size(); q++) {
+            const bool isDiff = d < diff.size() && diff[d] == (int)q;
+            const std::string &g = isDiff && (mask >> d & 1) ? pairs[q].second : pairs[q].first;
+            if (isDiff) d++;
+            if (!g.empty()) w.push_back(g);
+        }
+        if (!w.empty() && std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
+    }
+    }
+    for (const auto &w : {a, b}) if (std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
+    return out;
+}
+
+/// Restores printed letters the pen hid, by READING them: where the pen ran along a printed stroke
+/// (a "t" drawn over by the "2" of a formula) no pixel of it shows the print's own colour, so no
+/// colour or layout rule can separate the two layers — only knowing which letter was there can.
+/// The recogniser reads the page twice: the erased page (the print as it is left, "…kém ổng 234")
+/// and the original (the letters still whole under the pen, "…kém tổng 234"). Words the erase
+/// touched are re-spelled from those readings; each spelling is typeset from the page's OWN
+/// letters — labelled by reading its clean words, so same font, size and ink — and must explain
+/// what is there before any pixel is put back:
+///  - the visible print of the word, nearly all of it (a wrong letter leaves its own strokes out);
+///  - no ink of the spelling where the page shows paper, erased or not (print under a pen was ink
+///    in the original: a letter placed on paper is not there);
+/// and only erased pixels that were ink in the original are filled. A word no spelling explains is
+/// left as it is: a wrong letter is worse than a gap.
+inline void RestorePrintByRecognition(cv::Mat &dst, const cv::Mat &analysis, const cv::Mat &erasedAll, int k, const TextRecognizer &recognize) {
+    if (!recognize || cv::countNonZero(erasedAll) == 0) return;
+#ifdef INK_DEBUG
+    int64 t0 = cv::getTickCount();
+#endif
+    const int W = dst.cols, H = dst.rows;
+    auto inkMap = [](const cv::Mat &bgr) {
+        cv::Mat g, small, paper, out;
+        cv::cvtColor(bgr, g, cv::COLOR_BGR2GRAY);
+        cv::resize(g, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        cv::medianBlur(small, small, std::min(21, (std::min(small.cols, small.rows) - 1) | 1));
+        cv::resize(small, paper, g.size(), 0, 0, cv::INTER_LINEAR);
+        paper.convertTo(paper, CV_32F);
+        g.convertTo(g, CV_32F);
+        out = (paper - g) * (1.0 / 140.0);
+        cv::max(out, 0.0, out);
+        cv::min(out, 1.0, out);
+        return out;
+    };
+    const cv::Mat inkE = inkMap(dst), inkO = inkMap(analysis);
+    const cv::Mat coreE = inkE > 0.45f, anyE = inkE > 0.2f, inkOrig = inkO > 0.35f, anyO = inkO > 0.2f;
+    // erased = pixels the erase rebuilt, and — beside them — ink of the original that is paper now,
+    // whichever step took it (the leftover cleanups do not record theirs: the circumflex of a
+    // pen-crossed "ổ")
+    cv::Mat erased, erasedNear;
+    cv::dilate(erasedAll, erasedNear, Ellipse(2 * k + 1));
+    cv::dilate(erasedAll | (inkOrig & ~anyE & erasedNear), erased, cv::Mat::ones(3, 3, CV_8U));
+    // evidence maps: visible print, visible paper, erased-but-ink-in-the-original, erased paper —
+    // paper only where no ink is within 1 px (a letter of the page's own set lands a pixel off the
+    // grid of the one it replaces)
+    cv::Mat anyENear, anyONear;
+    cv::dilate(anyE, anyENear, cv::Mat::ones(3, 3, CV_8U));
+    cv::dilate(anyO, anyONear, cv::Mat::ones(3, 3, CV_8U));
+    // (and for the same reason, where a letter puts ink back the original's ink within 1 px counts:
+    // the "t" of "nhất" a "+" crossed came back as a dotted stem)
+    cv::Mat inkOrigNear;
+    cv::dilate(inkOrig, inkOrigNear, cv::Mat::ones(3, 3, CV_8U));
+    const cv::Mat vis = coreE & ~erased, visPaper = ~anyENear & ~erased;
+    const cv::Mat hiddenInk = erased & inkOrig, hiddenPaper = erased & ~anyONear;
+    // rules and table lines (long straight runs of ink): never a leftover of the pen here
+    cv::Mat rulesNear;
+    {
+        const int lr = std::max(9, 6 * k) | 1;
+        cv::Mat hR, vR;
+        cv::morphologyEx(anyE, hR, cv::MORPH_OPEN, cv::Mat::ones(1, lr, CV_8U));
+        cv::morphologyEx(anyE, vR, cv::MORPH_OPEN, cv::Mat::ones(lr, 1, CV_8U));
+        cv::dilate(hR | vR, rulesNear, cv::Mat::ones(3, 3, CV_8U));
+    }
+
+    std::vector<OcrLine> linesE = recognize(dst);
+    if (linesE.empty()) return;
+    std::vector<OcrLine> linesO = recognize(analysis);
+
+    // --- the page's letters: ink columns (a letter with its accents) of each read line, labelled
+    // by the words whose column count equals their grapheme count
+    Components c = FindComponents(coreE);
+    struct Column { cv::Rect box; std::vector<int> comps; };
+    struct LineInfo { float base = 0, height = 0; };
+    auto columnsIn = [&](const cv::Rect &band, float lineH) {
+        std::vector<int> ids;
+        for (int i = 1; i < c.count; i++) {
+            const cv::Point ctr(c.x[i] + c.w[i] / 2, c.y[i] + c.h[i] / 2);
+            if (band.contains(ctr) && c.h[i] <= 1.6f * lineH && c.w[i] <= 3 * lineH) ids.push_back(i);
+        }
+        std::sort(ids.begin(), ids.end(), [&](int a, int b) { return c.x[a] < c.x[b]; });
+        std::vector<Column> cols;
+        for (int i : ids) {
+            bool merged = false;
+            for (auto it = cols.rbegin(); it != cols.rend() && it - cols.rbegin() < 3; ++it) {
+                const int ov = std::min(it->box.x + it->box.width, c.x[i] + c.w[i]) - std::max(it->box.x, c.x[i]);
+                if (ov >= 0.5f * std::min(it->box.width, c.w[i])) {
+                    it->box |= cv::Rect(c.x[i], c.y[i], c.w[i], c.h[i]);
+                    it->comps.push_back(i);
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) cols.push_back({cv::Rect(c.x[i], c.y[i], c.w[i], c.h[i]), {i}});
+        }
+        std::sort(cols.begin(), cols.end(), [](const Column &a, const Column &b) { return a.box.x < b.box.x; });
+        return cols;
+    };
+    // a line's baseline and text height from its columns (letters without descenders are most)
+    auto lineInfo = [&](const std::vector<Column> &cols) {
+        LineInfo li;
+        std::vector<float> bots, hs;
+        for (const Column &col : cols) { bots.push_back((float)(col.box.y + col.box.height)); hs.push_back((float)col.box.height); }
+        if (bots.empty()) return li;
+        li.base = Percentile(bots, 50);
+        li.height = Percentile(hs, 50);
+        return li;
+    };
+    struct Glyph { cv::Mat mask; cv::Rect src; int dy; float lineH; };
+    std::map<std::string, std::vector<Glyph>> bank;
+    auto wordColumns = [&](const std::vector<Column> &cols, const cv::Rect &box) {
+        std::vector<const Column *> out;
+        for (const Column &col : cols) {
+            const int cx = col.box.x + col.box.width / 2;
+            if (cx >= box.x && cx < box.x + box.width) out.push_back(&col);
+        }
+        return out;
+    };
+    std::vector<std::vector<Column>> colsE(linesE.size());
+    std::vector<LineInfo> infoE(linesE.size());
+    for (size_t li = 0; li < linesE.size(); li++) {
+        const cv::Rect band = linesE[li].box & cv::Rect(0, 0, W, H);
+        if (band.area() == 0) continue;
+        colsE[li] = columnsIn(band, (float)band.height);
+        infoE[li] = lineInfo(colsE[li]);
+        if (linesE[li].readings.empty()) continue;
+        for (const OcrWord &w : linesE[li].readings[0]) {
+            std::vector<const Column *> wc = wordColumns(colsE[li], w.box);
+            if (wc.size() != w.graphemes.size()) continue;
+            cv::Rect all;
+            for (const Column *col : wc) all |= col->box;
+            if (cv::countNonZero(erasedNear(all & cv::Rect(0, 0, W, H)))) continue;   // clean words only
+            for (size_t q = 0; q < wc.size(); q++) {
+                std::vector<Glyph> &v = bank[w.graphemes[q]];
+                if (v.size() >= 6) continue;
+                const Column &col = *wc[q];
+                cv::Mat m = cv::Mat::zeros(col.box.size(), CV_8U);
+                for (int id : col.comps) m |= c.labels(col.box) == id;
+                v.push_back({m, col.box, col.box.y - (int)infoE[li].base, infoE[li].height});
+            }
+        }
+    }
+#ifdef INK_DEBUG
+    fprintf(stderr, "restore: %zu lines read, %zu graphemes in the bank\n", linesE.size(), bank.size());
+#endif
+    if (bank.empty()) return;
+
+    const cv::Mat source = dst.clone();
+    cv::Mat sourceGray;
+    cv::cvtColor(source, sourceGray, cv::COLOR_BGR2GRAY);
+    int restoredWords = 0;
+    for (size_t li = 0; li < linesE.size(); li++) {
+        if (linesE[li].readings.empty() || infoE[li].height <= 0) continue;
+        const LineInfo &L = infoE[li];
+        for (const OcrWord &w : linesE[li].readings[0]) {
+            const cv::Rect wb = w.box & cv::Rect(0, 0, W, H);
+            if (wb.area() == 0 || cv::countNonZero(erased(wb)) < k) continue;   // not touched by the erase
+            // the other readings of this word: alternatives of this line, and the original's words
+            // over the same place
+            std::vector<std::vector<std::string>> spellings{w.graphemes};
+            std::vector<std::vector<std::string>> readings{w.graphemes};   // read as such, not mixed
+            cv::Rect region = wb;
+            auto consider = [&](const OcrWord &o) {
+                const int ov = std::min(o.box.x + o.box.width, wb.x + wb.width) - std::max(o.box.x, wb.x);
+                const int oy = std::min(o.box.y + o.box.height, wb.y + wb.height) - std::max(o.box.y, wb.y);
+                if (ov < 0.5f * std::min(o.box.width, wb.width) || oy < 0.5f * std::min(o.box.height, wb.height)) return;
+                // only a reading of the SAME word — about as long, and mostly over it: the original
+                // also reads the pen's own writing ("62-234+132=" over "762."), no spelling of the print
+                const int dLen = std::abs((int)o.graphemes.size() - (int)w.graphemes.size());
+                if (dLen > std::max(1, (int)std::lround(0.34 * w.graphemes.size())) || ov < 0.7f * o.box.width) return;
+                region |= o.box;
+                readings.push_back(o.graphemes);
+                for (auto &sp : MixedSpellings(w.graphemes, o.graphemes))
+                    if (std::find(spellings.begin(), spellings.end(), sp) == spellings.end()) spellings.push_back(sp);
+            };
+            for (size_t r = 1; r < linesE[li].readings.size(); r++) for (const OcrWord &o : linesE[li].readings[r]) consider(o);
+            for (const OcrLine &lo : linesO) for (const auto &rd : lo.readings) for (const OcrWord &o : rd) consider(o);
+            // the strip the word may occupy
+            const int pad = (int)std::ceil(0.5f * L.height);
+            cv::Rect strip(region.x - pad, (int)(L.base - 2.2f * L.height), region.width + 2 * pad, (int)(3.2f * L.height));
+            strip &= cv::Rect(0, 0, W, H);
+            if (strip.width < 4 || strip.height < 4) continue;
+            // visible print of the word as the erased page reads it, in its line's band (the other
+            // readings' boxes may take in a neighbour: not required, never scored against)
+            cv::Mat wordVis = cv::Mat::zeros(strip.size(), CV_8U);
+            {
+                cv::Rect band(wb.x, (int)(L.base - 1.8f * L.height), wb.width, (int)(2.6f * L.height));
+                band &= strip;
+                if (band.area() > 0) vis(band).copyTo(wordVis(band - strip.tl()));
+            }
+            const int visCount = cv::countNonZero(wordVis);
+            // score of a glyph pixel on each kind of evidence
+            cv::Mat M = cv::Mat::zeros(strip.size(), CV_32F);
+            M.setTo(2.0f, wordVis);
+            M.setTo(-4.0f, visPaper(strip));
+            M.setTo(0.3f, hiddenInk(strip));
+            M.setTo(-4.0f, hiddenPaper(strip));
+            const int maxGap = (int)std::ceil(0.6f * L.height);
+            struct Placement { int x, y; const Glyph *g; };
+            struct Fit { std::vector<std::string> spelling; std::vector<Placement> pl; float total, contra; cv::Mat paint, leftover; };
+            std::vector<Fit> accepted;
+            for (const auto &sp : spellings) {
+                // every letter must be in the bank, at this line's text height
+                std::vector<std::vector<const Glyph *>> options(sp.size());
+                bool ok = true;
+                for (size_t q = 0; q < sp.size() && ok; q++) {
+                    auto it = bank.find(sp[q]);
+                    if (it != bank.end())
+                        for (const Glyph &g : it->second)
+                            if (std::fabs(g.lineH - L.height) <= 0.15f * L.height) options[q].push_back(&g);
+                    ok = !options[q].empty();
+                }
+                if (!ok) continue;
+                // dynamic programme over the letters in order: letter q starts at most maxGap after
+                // letter q-1 ends, never before (boxes are the letters' own ink extents)
+                const int SW = strip.width;
+                std::vector<float> prev(SW + 1, 0.0f);   // best score with the previous letter ending at x
+                std::vector<std::vector<std::array<int, 4>>> back(sp.size(), std::vector<std::array<int, 4>>(SW + 1, {-1, -1, -1, -1}));
+                for (size_t q = 0; q < sp.size(); q++) {
+                    std::vector<float> reach(SW + 1, -FLT_MAX);   // best previous score for a start at x
+                    std::vector<int> reachFrom(SW + 1, -1);
+                    for (int x = 0; x <= SW; x++) {
+                        if (q == 0) { reach[x] = 0; reachFrom[x] = -1; continue; }
+                        for (int e = std::max(0, x - maxGap); e <= x; e++)
+                            if (prev[e] > reach[x]) { reach[x] = prev[e]; reachFrom[x] = e; }
+                    }
+                    std::vector<float> cur(SW + 1, -FLT_MAX);
+                    for (size_t oi = 0; oi < options[q].size(); oi++) {
+                        const Glyph &g = *options[q][oi];
+                        cv::Mat G;
+                        g.mask.convertTo(G, CV_32F, 1.0 / 255.0);
+                        for (int jit = -2; jit <= 2; jit++) {
+                            const int gy = (int)L.base + g.dy + jit - strip.y;
+                            if (gy < 0 || gy + G.rows > strip.height || G.cols > SW) continue;
+                            cv::Mat res;
+                            cv::matchTemplate(M(cv::Rect(0, gy, SW, G.rows)), G, res, cv::TM_CCORR);
+                            const float *rp = res.ptr<float>(0);
+                            for (int x = 0; x + G.cols <= SW; x++) {
+                                if (reach[x] == -FLT_MAX) continue;
+                                const float v = reach[x] + rp[x];
+                                if (v > cur[x + G.cols]) { cur[x + G.cols] = v; back[q][x + G.cols] = {x, gy, (int)oi, reachFrom[x]}; }
+                            }
+                        }
+                    }
+                    prev.swap(cur);
+                }
+                int end = -1;
+                for (int x = 0; x <= SW; x++) if (prev[x] > -FLT_MAX && (end < 0 || prev[x] > prev[end])) end = x;
+                if (end < 0) continue;
+                std::vector<Placement> pl(sp.size());
+                for (int q = (int)sp.size() - 1, e = end; q >= 0; q--) {
+                    const auto &b = back[q][e];
+                    pl[q] = {b[0], b[1], options[q][b[2]]};
+                    e = b[3];
+                }
+                // what the spelling explains and contradicts
+                cv::Mat covered = cv::Mat::zeros(strip.size(), CV_8U);
+                int glyphPx = 0;
+                for (const Placement &p : pl) {
+                    cv::Rect r(p.x, p.y, p.g->mask.cols, p.g->mask.rows);
+                    covered(r) |= p.g->mask;
+                    glyphPx += cv::countNonZero(p.g->mask);
+                }
+                cv::Mat coveredNear;
+                cv::dilate(covered, coveredNear, cv::Mat::ones(3, 3, CV_8U));
+                const float explained = visCount ? (float)cv::countNonZero(coveredNear & wordVis) / visCount : 0.0f;
+                const float contra = (float)cv::countNonZero(covered & (visPaper(strip) | hiddenPaper(strip))) / std::max(1, glyphPx);
+                const float total = prev[end] - 2.0f * visCount;
+#ifdef INK_DEBUG
+                {
+                    std::string t;
+                    for (auto &g : sp) t += g;
+                    fprintf(stderr, "restore word @%d,%d \"%s\" explained %.2f contra %.3f total %.1f\n", wb.x, wb.y, t.c_str(), explained, contra, total);
+                }
+#endif
+                if (explained < 0.9f || contra > 0.06f) continue;
+                // the pixels it would put back: erased ones that were ink in the original — of letters
+                // only: a mark wholly under the pen (a dot, a comma, a dash) fits any pen stroke
+                cv::Mat paint = cv::Mat::zeros(strip.size(), CV_8U);
+                for (const Placement &p : pl) {
+                    const cv::Rect r(p.x, p.y, p.g->mask.cols, p.g->mask.rows);
+                    const bool seen = cv::countNonZero(p.g->mask & wordVis(r)) > 0;
+                    if (!seen && p.g->mask.rows < 0.6f * L.height) continue;
+                    paint(r) |= p.g->mask & erased(r + strip.tl()) & inkOrigNear(r + strip.tl());
+                }
+                // and the ink it leaves unexplained beside the erase: once the word's letters are known,
+                // visible ink in it that is none of them and touches the erased pen is the pen's
+                // leftover (a bar of it over the "m" made "Tìm" read "Tìn")
+                cv::Mat leftover;
+                {
+                    cv::Mat explainedNear;
+                    cv::dilate(covered, explainedNear, cv::Mat::ones(3, 3, CV_8U));
+                    cv::Mat rest = wordVis & ~explainedNear;
+                    Components cr = FindComponents(rest);
+                    // (touching the erased stroke itself: a period beside it is its own mark)
+                    cv::Mat touch;
+                    cv::dilate(erased(strip), touch, cv::Mat::ones(3, 3, CV_8U));
+                    std::vector<float> nearPen = FractionPerComponent(cr, touch);
+                    std::vector<char> take(cr.count, 0);
+                    for (int i = 1; i < cr.count; i++) take[i] = nearPen[i] > 0 && cr.area[i] <= L.height * L.height;
+                    cv::dilate(PaintComponents(cr.labels, take), leftover, cv::Mat::ones(3, 3, CV_8U));
+                    leftover &= anyE(strip) & ~covered & ~rulesNear(strip);
+                }
+                accepted.push_back({sp, pl, total, contra, paint, leftover});
+            }
+            // spellings that would put back the same pixels are one answer (best fit kept)
+            std::sort(accepted.begin(), accepted.end(), [](const Fit &a, const Fit &b) { return a.total > b.total; });
+            std::vector<const Fit *> answers;
+            for (const Fit &f : accepted) {
+                bool same = false;
+                for (const Fit *a : answers) {
+                    cv::Mat d;
+                    cv::bitwise_xor(a->paint, f.paint, d);
+                    if (cv::countNonZero(d) <= k) { same = true; break; }
+                }
+                if (!same) answers.push_back(&f);
+            }
+            if (answers.empty()) continue;
+            // ...among those that fit about as well as the best: a spelling that explains the page
+            // clearly worse (half a line height of score: a letter's hidden ink, or paper it covers)
+            // is no rival — "nhít" / "nhất", where the pen hid the circumflex's bowl — and must not
+            // take away the strokes the others agree on
+            const float bestTotal = answers[0]->total;
+            answers.erase(std::remove_if(answers.begin() + 1, answers.end(),
+                                         [&](const Fit *f) { return f->total < bestTotal - 0.5f * L.height; }),
+                          answers.end());
+            // the paper colour of this strip: its pixels with no ink near
+            const cv::Scalar paperColour = cv::mean(dst(strip), ~anyENear(strip) & ~erased(strip));
+            auto render = [&](const Fit &f, cv::Mat &onto, const cv::Point &at) {
+                onto(cv::Rect(strip.tl() - at, strip.size())).setTo(paperColour, f.leftover);
+                for (const Placement &p : f.pl) {
+                    const cv::Rect r(p.x, p.y, p.g->mask.cols, p.g->mask.rows);
+                    cv::Mat target = onto(r + strip.tl() - at);
+                    cv::Mat tg;
+                    cv::cvtColor(target, tg, cv::COLOR_BGR2GRAY);
+                    cv::Mat m = f.paint(r) & (sourceGray(p.g->src) < tg);
+                    source(p.g->src).copyTo(target, m);
+                }
+            };
+            // several spellings fit what is visible and would put back different strokes ("gấp" /
+            // "gốp" where the pen hid the bowl): only what ALL of them put back is certain — the
+            // rest is left as it is. No language decides it (a scrambled word like "GYENEMERC" has
+            // none): the page's evidence does, or nothing is restored.
+            Fit merged = *answers[0];
+            for (size_t q = 1; q < answers.size(); q++) {
+                merged.paint &= answers[q]->paint;
+                merged.leftover &= answers[q]->leftover;
+            }
+            const Fit *chosen = &merged;
+            // ...unless one of them, as the recogniser READ it, restores everything the others do and
+            // more: they only leave out strokes it has ("hạn:" / "hạng", "Tong" / "Tổng" — the original
+            // saw the "g" and the circumflex under the pen)
+            if (answers.size() > 1)
+                for (const Fit *f : answers) {
+                    if (std::find(readings.begin(), readings.end(), f->spelling) == readings.end()) continue;
+                    // (and only one the page does not contradict, fitting about as well as the best:
+                    // the covering reading may be a wrong letter — "thế" over "thứ", a "7" read in
+                    // the remnant of a pen-crossed "ủa" — that puts back MORE only because it is wrong)
+                    if (f->contra > 0.02f || f->total < answers[0]->total - 0.25f * L.height) continue;
+                    bool covers = true;
+                    for (const Fit *g : answers)
+                        if (g != f && cv::countNonZero(g->paint & ~f->paint) > k) { covers = false; break; }
+                    if (covers) { chosen = f; break; }
+                }
+#ifdef INK_DEBUG
+            if (answers.size() > 1) {
+                std::string t;
+                for (const Fit *f : answers) { for (auto &g : f->spelling) t += g; t += " / "; }
+                fprintf(stderr, "restore word @%d,%d undecided between %s: %d px agreed\n", wb.x, wb.y, t.c_str(), cv::countNonZero(merged.paint));
+            }
+#endif
+            const int painted = cv::countNonZero(chosen->paint);
+            if (painted == 0 && cv::countNonZero(chosen->leftover) == 0) continue;
+            render(*chosen, dst, cv::Point(0, 0));
+            restoredWords++;
+#ifdef INK_DEBUG
+            {
+                std::string t;
+                for (auto &g : chosen->spelling) t += g;
+                fprintf(stderr, "restore word @%d,%d -> \"%s\" painted %d px\n", wb.x, wb.y, t.c_str(), painted);
+                for (size_t q = 0; q < chosen->pl.size(); q++) {
+                    const Placement &p = chosen->pl[q];
+                    const cv::Rect r(strip.x + p.x, strip.y + p.y, p.g->mask.cols, p.g->mask.rows);
+                    fprintf(stderr, "   %s at %d,%d %dx%d (src %d,%d) mask %d erased %d origInk %d both %d\n", chosen->spelling[q].c_str(), r.x, r.y, r.width, r.height, p.g->src.x, p.g->src.y,
+                            cv::countNonZero(p.g->mask), cv::countNonZero(p.g->mask & erased(r)), cv::countNonZero(p.g->mask & inkOrig(r)), cv::countNonZero(p.g->mask & erased(r) & inkOrig(r)));
+                }
+            }
+#endif
+        }
+    }
+#ifdef INK_DEBUG
+    fprintf(stderr, "restore by recognition: %d words, %.2fs\n", restoredWords, (cv::getTickCount() - t0) / cv::getTickFrequency());
+#endif
+}
+
 /// Last review layer — stray ink around what was erased. Every piece of ink left near an erased
 /// stroke must "mean something" on this page: a typeset page repeats its glyphs (letters, digits,
 /// dots and accents) almost exactly, so a piece with no twin among the page's untouched glyphs is a
@@ -2365,18 +2967,51 @@ inline void RemoveStrayInk(cv::Mat &dst, const cv::Mat &erasedAll, const cv::Mat
         }
         return false;
     };
+    // a small piece the print layer kept, but among erased strokes only: no untouched print and no
+    // letter-sized ink left (a letter the pen crossed still counts) within a letter's reach on its
+    // line, erased pen on two sides of it and touching the pen's rim — the bar of a pen "=" written
+    // across a table rule (the model saw it as part of the rule), the tip of a stroke. Printed marks
+    // always have their text beside them.
+    cv::Mat refMask, erasedInt, refInt;
+    {
+        std::vector<char> isRef(c.count, 0);
+        for (int i : ref) isRef[i] = 1;
+        for (int i = 1; i < c.count; i++) if (c.area[i] > k * k && c.h[i] >= 0.5f * cap) isRef[i] = 1;
+        refMask = PaintComponents(c.labels, isRef);
+        cv::integral(refMask / 255, refInt, CV_32S);
+        cv::integral(erasedAll / 255, erasedInt, CV_32S);
+    }
+    auto countIn = [](const cv::Mat &integral, cv::Rect r) {
+        r &= cv::Rect(0, 0, integral.cols - 1, integral.rows - 1);
+        if (r.area() <= 0) return 0;
+        return integral.at<int>(r.y + r.height, r.x + r.width) - integral.at<int>(r.y, r.x + r.width) - integral.at<int>(r.y + r.height, r.x) + integral.at<int>(r.y, r.x);
+    };
+    auto amidPen = [&](int i) {
+        if (onPen[i] == 0 || c.h[i] >= 0.5f * cap || c.area[i] > (2 * k) * (2 * k)) return false;
+        const int gx = (int)std::ceil(cap), gy = (int)std::ceil(0.5f * cap);
+        if (countIn(refInt, cv::Rect(c.x[i] - gx, c.y[i] - gy, c.w[i] + 2 * gx, c.h[i] + 2 * gy)) > 0) return false;
+        const cv::Rect sides[4] = {cv::Rect(c.x[i] - gx, c.y[i], gx, c.h[i]), cv::Rect(c.x[i] + c.w[i], c.y[i], gx, c.h[i]),
+                                   cv::Rect(c.x[i], c.y[i] - gy, c.w[i], gy), cv::Rect(c.x[i], c.y[i] + c.h[i], c.w[i], gy)};
+        int n = 0;
+        for (const cv::Rect &s : sides) n += countIn(erasedInt, s) > 0;
+        return n >= 2;
+    };
     // letters to hang marks on
     std::vector<char> stray(c.count, 0);
     for (int i = 1; i < c.count; i++) {
 #ifdef INK_DEBUG
         if (getenv("INK_BOX")) { int bx, by, bw, bh; sscanf(getenv("INK_BOX"), "%d,%d,%d,%d", &bx, &by, &bw, &bh);
             if ((cv::Rect(c.x[i], c.y[i], c.w[i], c.h[i]) & cv::Rect(bx, by, bw, bh)).area() > 0)
-                fprintf(stderr, "stray-cand %d,%d %dx%d a=%d zone %.2f prot %.2f onPen %.2f twin %d\n", c.x[i], c.y[i], c.w[i], c.h[i], c.area[i], inZone[i], prot[i], onPen[i], (int)hasTwin(i)); }
+                fprintf(stderr, "stray-cand %d,%d %dx%d a=%d zone %.2f prot %.2f onPen %.2f twin %d amid %d cap %.1f\n", c.x[i], c.y[i], c.w[i], c.h[i], c.area[i], inZone[i], prot[i], onPen[i], (int)hasTwin(i), (int)amidPen(i), cap); }
 #endif
         // (restored print is kept — unless it is a meaningless crumb: a speck with no twin, what is
         // left of a letter the pen took and nothing could rebuild)
-        const bool crumb = c.area[i] <= k * k && c.h[i] < 0.4f * cap && c.w[i] < 0.4f * cap;
-        if (inZone[i] < 0.3f || (prot[i] > 0.5f && !crumb) || onPen[i] < 0.6f) continue;
+        // (or under half a text height among erased strokes only: a pen "76" the overlap test took
+        // for print under the pen came back as a 7x6 blob at a 15 px cap — what is left of a printed
+        // letter has its word beside it)
+        const bool crumb = c.area[i] <= k * k && ((c.h[i] < 0.4f * cap && c.w[i] < 0.4f * cap) ||
+                                                  (c.h[i] < 0.5f * cap && amidPen(i)));
+        if (inZone[i] < 0.3f || (prot[i] > 0.5f && !crumb) || (onPen[i] < 0.6f && !amidPen(i))) continue;
         if (c.h[i] > 2.5f * cap || c.w[i] > 4 * cap) continue;             // not a stray piece
         if (!hasTwin(i)) { stray[i] = 1; continue; }
         if (c.h[i] < 0.5f * cap && c.area[i] <= (2 * k) * (2 * k)) {
@@ -2420,12 +3055,114 @@ inline void RemoveStrayInk(cv::Mat &dst, const cv::Mat &erasedAll, const cv::Mat
 #endif
 }
 
+/// Level rules (`rule` flags over `c`, found as long ink runs) as the rule ITSELF, not the ink the
+/// run holds: a pen stroke written along a rule fuses with it, and putting that fused ink back as
+/// print left the pen's pieces on the rule as a ragged, dashed edge (a formula written on a table
+/// line). Where the pen (`pen`) crosses it, a column between clean columns on either side gets the
+/// rule's own band — its top and bottom edges interpolated between them (a rule may bow slightly,
+/// or thicken along the page) — limited to ink (`inkSmear`) and to the run's own columns and rows,
+/// so it only ever trims the run. The run's ends under the pen, and a rule without enough clean
+/// columns to measure or thicker than a stroke (`k`), keep their ink as it is.
+inline cv::Mat RuleBands(const Components &c, const std::vector<char> &rule, const cv::Mat &pen, const cv::Mat &inkSmear, int k) {
+    cv::Mat out = cv::Mat::zeros(c.labels.size(), CV_8U);
+    for (int i = 1; i < c.count; i++) {
+        if (!rule[i]) continue;
+        const int x0 = c.x[i], w = c.w[i];
+        std::vector<int> top(w, -1), bot(w, -1);
+        std::vector<char> dirty(w, 0);
+        for (int y = c.y[i]; y < c.y[i] + c.h[i]; y++) {
+            const int *l = c.labels.ptr<int>(y);
+            const uchar *p = pen.ptr<uchar>(y);
+            for (int x = 0; x < w; x++) {
+                if (l[x0 + x] != i) continue;
+                if (top[x] < 0) top[x] = y;
+                bot[x] = y;
+                if (p[x0 + x]) dirty[x] = 1;
+            }
+        }
+        std::vector<int> clean, thick;
+        for (int x = 0; x < w; x++) if (top[x] >= 0 && !dirty[x]) { clean.push_back(x); thick.push_back(bot[x] - top[x] + 1); }
+        // (and only a thin one: a dark band of a photo — a spectacle frame — is no rule to rebuild)
+        bool thin = false;
+        if (!thick.empty()) {
+            std::nth_element(thick.begin(), thick.begin() + thick.size() / 2, thick.end());
+            thin = thick[thick.size() / 2] <= 1.5f * k;
+        }
+        if ((int)clean.size() < std::max(5, w / 10) || !thin) {
+            std::vector<char> one(c.count, 0);
+            one[i] = 1;
+            out |= PaintComponents(c.labels, one);
+            continue;
+        }
+        size_t next = 0;   // first clean column at or right of x
+        for (int x = 0; x < w; x++) {
+            while (next < clean.size() && clean[next] < x) next++;
+            if (top[x] < 0) continue;
+            const int l = next > 0 ? clean[next - 1] : -1, r = next < clean.size() ? clean[next] : -1;
+            // a clean column, or the pen at the run's end (nothing shows the rule goes on there): its
+            // ink as it is
+            if (r == x || l < 0 || r < 0) {
+                for (int y = top[x]; y <= bot[x]; y++) if (c.labels.at<int>(y, x0 + x) == i) out.at<uchar>(y, x0 + x) = 255;
+                continue;
+            }
+            const float f = (x - l) / (float)(r - l);
+            const float t0 = top[l] + (top[r] - top[l]) * f, t1 = bot[l] + (bot[r] - bot[l]) * f;
+            // (never outside the run's own ink in this column: a pen line that curves away from the
+            // rule is not the rule)
+            const int y0 = std::max({0, top[x] - 1, (int)std::lround(t0)}), y1 = std::min({out.rows - 1, bot[x] + 1, (int)std::lround(t1)});
+            for (int y = y0; y <= y1; y++) if (inkSmear.at<uchar>(y, x0 + x)) out.at<uchar>(y, x0 + x) = 255;
+        }
+    }
+    return out;
+}
+
+/// Rules running along the rows of `ink` — the pen written ALONG them fused with them (see
+/// EraseHandwriting); called on the page and on its transpose, so table borders the pen crossed
+/// are found as well as fill-in blanks. `thinOnly`: only runs no thicker than a printed rule (for
+/// the columns: a photo's dark band or a coloured page edge is long and straight too).
+inline cv::Mat LevelRules(const cv::Mat &ink, const cv::Mat &handwriting, int k, bool thinOnly = false) {
+    cv::Mat smear, runs, hwNear;
+    cv::dilate(ink, smear, cv::Mat::ones(3, 1, CV_8U));
+    int l2 = std::max(5, std::min(20 * k, ink.cols / 30)) | 1;
+    cv::morphologyEx(smear, runs, cv::MORPH_OPEN, cv::Mat::ones(1, l2, CV_8U));
+    runs &= ink;
+    cv::dilate(handwriting, hwNear, Ellipse(2 * k + 1));
+    Components cr = FindComponents(runs);
+    std::vector<float> inside = FractionPerComponent(cr, hwNear);
+    std::vector<char> rule(cr.count, 0);
+    // ...or so long and straight that no hand drew it (a blank the answer fills end to end)
+    // (the length is capped by the page width: k has a floor, so on a small page 40k would
+    // be longer than a whole blank)
+    const int ruleLen = std::min(40 * k, ink.cols / 18);
+    // ...but a long one must still show some of itself OUTSIDE the pen strokes: a ruler-straight
+    // pen underline is handwriting end to end, a rule peeks out past the answer written on it
+    std::vector<float> inHw = FractionPerComponent(cr, handwriting);
+    for (int i = 1; i < cr.count; i++)
+        rule[i] = inside[i] <= 0.7f || (cr.w[i] >= ruleLen && inHw[i] <= 0.9f);
+    // a printed rule is level with the page (a scan is deskewed to well under a degree); a pen
+    // strike-through drawn with a ruler still slopes (measured: 4% on a real worksheet)
+    {
+        std::vector<int> thick;
+        for (int i = 1; i < cr.count; i++) if (rule[i]) thick.push_back(std::max(1, cr.area[i] / std::max(1, cr.w[i])));
+        std::sort(thick.begin(), thick.end());
+        const int t = thick.empty() ? k : thick[thick.size() / 2];
+        for (int i = 1; i < cr.count; i++)
+            if (rule[i] && inside[i] > 0.7f && cr.h[i] - t > 0.015f * cr.w[i] + 2) rule[i] = 0;
+    }
+    if (thinOnly)
+        for (int i = 1; i < cr.count; i++)
+            if (rule[i] && cr.area[i] > 1.5f * k * cr.w[i]) rule[i] = 0;
+    return RuleBands(cr, rule, hwNear, smear, k);
+}
+
 /// Removes `handwriting` from `target` by rebuilding, not blurring: overlap pixels (print under the
 /// pen) get the nearby print colour back, everything else the stroke, its faint rim and the camera
 /// sharpening halo cover is inpainted from the PAPER only (print next to the stroke is swapped for
 /// paper colour during inpainting so it cannot bleed in, then put back). `analysis` is the
 /// unprocessed page the masks were computed on (same geometry).
-inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, const cv::Mat &handwriting, const cv::Mat &print, const cv::Mat &overlap) {
+/// `recognize`: the platform's text recogniser, for restoring pen-hidden print (optional).
+inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, const cv::Mat &handwriting, const cv::Mat &print, const cv::Mat &overlap,
+                                const TextRecognizer &recognize = nullptr) {
     const int k = StrokeUnit(target);
     const double s = k / 9.0;   // the window sizes below were measured at k = 9 (a 4032 px photo)
     cv::Mat dst = target.clone();
@@ -2446,40 +3183,14 @@ inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, 
     // never this straight for 20 stroke widths; a slight tilt is tolerated by a 1 px vertical
     // smear), judged as whole lines: a rule runs well beyond the handwriting written on it, a
     // straight hand-drawn strike-through lies (almost) entirely within the handwriting.
-    cv::Mat pageRules = cv::Mat::zeros(target.size(), CV_8U);
+    cv::Mat pageRules;
     {
         OpticalDensity dAll = DensityInRoi(analysis, paperSmall, cv::Rect(0, 0, analysis.cols, analysis.rows));
-        cv::Mat smear, runs, hwNear;
-        cv::dilate(dAll.ink, smear, cv::Mat::ones(3, 1, CV_8U));
-        int l2 = std::max(5, std::min(20 * k, analysis.cols / 30)) | 1;
-        cv::morphologyEx(smear, runs, cv::MORPH_OPEN, cv::Mat::ones(1, l2, CV_8U));
-        runs &= dAll.ink;
-        cv::dilate(handwriting, hwNear, Ellipse(2 * k + 1));
-        Components cr = FindComponents(runs);
-        std::vector<float> inside = FractionPerComponent(cr, hwNear);
-        std::vector<char> rule(cr.count, 0);
-        // ...or so long and straight that no hand drew it (a blank the answer fills end to end)
-        // (the length is capped by the page width: k has a floor, so on a small page 40k would
-        // be longer than a whole blank)
-        const int ruleLen = std::min(40 * k, analysis.cols / 18);
-        // ...but a long one must still show some of itself OUTSIDE the pen strokes: a ruler-straight
-        // pen underline is handwriting end to end, a rule peeks out past the answer written on it
-        std::vector<float> inHw = FractionPerComponent(cr, handwriting);
-        for (int i = 1; i < cr.count; i++)
-            rule[i] = inside[i] <= 0.7f || (cr.w[i] >= ruleLen && inHw[i] <= 0.9f);
-        // a printed rule is level with the page (a scan is deskewed to well under a degree); a pen
-        // strike-through drawn with a ruler still slopes (measured: 4% on a real worksheet)
-        {
-            std::vector<int> thick;
-            for (int i = 1; i < cr.count; i++) if (rule[i]) thick.push_back(std::max(1, cr.area[i] / std::max(1, cr.w[i])));
-            std::sort(thick.begin(), thick.end());
-            const int t = thick.empty() ? k : thick[thick.size() / 2];
-            for (int i = 1; i < cr.count; i++)
-                if (rule[i] && inside[i] > 0.7f && cr.h[i] - t > 0.015f * cr.w[i] + 2) rule[i] = 0;
-        }
-        pageRules = PaintComponents(cr.labels, rule);
+        // (and vertical ones — a table's column borders an answer was written across — on the
+        // transposed page)
+        cv::Mat vertical = LevelRules(dAll.ink.t(), handwriting.t(), k, true).t();
+        pageRules = LevelRules(dAll.ink, handwriting, k) | vertical;
 #ifdef INK_DEBUG
-        cv::imwrite("/tmp/ink_runs.png", runs);
         cv::imwrite("/tmp/ink_rules.png", pageRules);
         cv::imwrite("/tmp/ink_dink.png", dAll.ink);
         fprintf(stderr, "k=%d\n", k);
@@ -2658,10 +3369,13 @@ inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, 
     }
     const cv::Mat beforeRepair = dst.clone();
 #ifndef INK_NO_REPAIR
-    RepairPrintByExample(dst, erasedAll, k);
+    RepairPrintByExample(dst, erasedAll, target, k);
 #endif
 #ifndef INK_NO_RETYPESET
     RetypesetPrint(dst, analysis, handwriting, print | overlap, k);
+#endif
+#ifndef INK_NO_RECOGNITION
+    RestorePrintByRecognition(dst, analysis, erasedAll, k, recognize);
 #endif
 #ifndef INK_NO_STRAY
     {

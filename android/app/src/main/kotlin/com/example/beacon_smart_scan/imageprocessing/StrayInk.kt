@@ -96,11 +96,52 @@ object StrayInk {
                 }
                 return false
             }
+            // a small piece the print layer kept, but among erased strokes only: no untouched print and
+            // no letter-sized ink left (a letter the pen crossed still counts) within a letter's reach
+            // on its line, erased pen on two sides of it and touching the pen's rim — the bar of a pen
+            // "=" written across a table rule, the tip of a stroke. Printed marks always have their
+            // text beside them.
+            val isRef = BooleanArray(n); for (i in ref) isRef[i] = true
+            for (i in 1 until n) if (area(i) > k * k && h(i) >= 0.5f * cap) isRef[i] = true
+            val eb = ByteArray(W * H); erasedAll.get(0, 0, eb)
+            fun integral(set: (Int) -> Boolean): IntArray {
+                val s = IntArray((W + 1) * (H + 1))
+                for (yy in 0 until H) {
+                    var row = 0
+                    for (xx in 0 until W) {
+                        if (set(yy * W + xx)) row++
+                        s[(yy + 1) * (W + 1) + xx + 1] = s[yy * (W + 1) + xx + 1] + row
+                    }
+                }
+                return s
+            }
+            val refInt = integral { isRef[lab[it]] }
+            val erasedInt = integral { eb[it].toInt() != 0 }
+            fun countIn(s: IntArray, rx: Int, ry: Int, rw: Int, rh: Int): Int {
+                val x0 = max(0, rx); val y0 = max(0, ry); val x1 = min(W, rx + rw); val y1 = min(H, ry + rh)
+                if (x1 <= x0 || y1 <= y0) return 0
+                return s[y1 * (W + 1) + x1] - s[y0 * (W + 1) + x1] - s[y1 * (W + 1) + x0] + s[y0 * (W + 1) + x0]
+            }
+            fun amidPen(i: Int): Boolean {
+                if (nh[i] == 0 || h(i) >= 0.5f * cap || area(i) > 4 * k * k) return false
+                val gx = ceil(cap).toInt(); val gy = ceil(0.5f * cap).toInt()
+                if (countIn(refInt, x(i) - gx, y(i) - gy, w(i) + 2 * gx, h(i) + 2 * gy) > 0) return false
+                var sides = 0
+                if (countIn(erasedInt, x(i) - gx, y(i), gx, h(i)) > 0) sides++
+                if (countIn(erasedInt, x(i) + w(i), y(i), gx, h(i)) > 0) sides++
+                if (countIn(erasedInt, x(i), y(i) - gy, w(i), gy) > 0) sides++
+                if (countIn(erasedInt, x(i), y(i) + h(i), w(i), gy) > 0) sides++
+                return sides >= 2
+            }
             val stray = BooleanArray(n)
             for (i in 1 until n) {
                 val a = area(i)
-                val crumb = a <= k * k && h(i) < 0.4f * cap && w(i) < 0.4f * cap
-                if (nz[i] < 0.3f * a || (np[i] > 0.5f * a && !crumb) || nh[i] < 0.6f * a) continue
+                // (restored print is kept — unless it is a meaningless crumb: a speck, or under half a
+                // text height among erased strokes only — a pen "76" the overlap test took for print
+                // under the pen; what is left of a printed letter has its word beside it)
+                val crumb = a <= k * k && ((h(i) < 0.4f * cap && w(i) < 0.4f * cap) ||
+                                           (h(i) < 0.5f * cap && amidPen(i)))
+                if (nz[i] < 0.3f * a || (np[i] > 0.5f * a && !crumb) || (nh[i] < 0.6f * a && !amidPen(i))) continue
                 if (h(i) > 2.5f * cap || w(i) > 4 * cap) continue
                 if (!hasTwin(i)) { stray[i] = true; continue }
                 if (h(i) < 0.5f * cap && a <= 4 * k * k) {

@@ -22,7 +22,7 @@ object MaskEraser {
                 Imgproc.resize(layers.print, layers.print, target.size(), 0.0, 0.0, Imgproc.INTER_NEAREST)
                 Imgproc.resize(layers.overlap, layers.overlap, target.size(), 0.0, 0.0, Imgproc.INTER_NEAREST)
             }
-            val dst = InkRefine.erase(target, analysis, layers.handwriting, layers.print, layers.overlap)
+            val dst = InkRefine.erase(target, analysis, layers.handwriting, layers.print, layers.overlap, MlKitTextRecognizer())
             releasing(dst) { ImageIO.writeOrThrow(dst, outputPath) }
         } finally {
             target.release()

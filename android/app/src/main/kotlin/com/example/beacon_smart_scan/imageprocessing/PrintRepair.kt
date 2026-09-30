@@ -25,7 +25,11 @@ object PrintRepair {
     private fun ellipse(size: Int): Mat =
         Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size((size or 1).toDouble(), (size or 1).toDouble()))
 
-    fun repairByExample(dst: Mat, erased: Mat, k: Int) {
+    /** The twin to copy from and whether only the rule it continues may be copied. */
+    private class Twin(val at: Point, val alongRule: Boolean)
+
+    /** [original]: the page before the erase (same geometry) — a fill only ever goes where it had ink. */
+    fun repairByExample(dst: Mat, erased: Mat, original: Mat, k: Int) {
         if (Core.countNonZero(erased) == 0) return
         val owned = ArrayList<Mat>()
         fun <T : Mat> own(m: T): T { owned.add(m); return m }
@@ -38,6 +42,19 @@ object PrintRepair {
             val ink = own(Mat()); Core.compare(inkLevel, Scalar(60.0), ink, Core.CMP_GT)
             val notErased = own(Mat()); Core.bitwise_not(erased, notErased)
             val visiblePrint = own(Mat()); Core.bitwise_and(ink, notErased, visiblePrint)
+            // ink in the page before the erase (same measure), and within 1 px of it (a twin sits on the
+            // page's pixel grid, the damaged letter may be half a pixel off it — on 1-2 px strokes
+            // that alone halved the overlap)
+            val wasInk = own(Mat()); val wasNear = own(Mat())
+            run {
+                val og = own(Mat()); Imgproc.cvtColor(original, og, Imgproc.COLOR_BGR2GRAY)
+                val os = own(Mat()); Imgproc.resize(og, os, Size(), 0.25, 0.25, Imgproc.INTER_AREA)
+                Imgproc.medianBlur(os, os, min(21, (min(os.cols(), os.rows()) - 1) or 1))
+                val op = own(Mat()); Imgproc.resize(os, op, og.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+                val ol = own(Mat()); Core.subtract(op, og, ol)
+                Core.compare(ol, Scalar(60.0), wasInk, Core.CMP_GT)
+                Imgproc.dilate(wasInk, wasNear, own(Mat.ones(3, 3, CvType.CV_8U)))
+            }
 
             // erased pixels right next to visible print = where print was cut
             val nearPrint = own(Mat()); Imgproc.dilate(visiblePrint, nearPrint, own(ellipse(2 * k + 1)))
@@ -45,6 +62,35 @@ object PrintRepair {
             if (Core.countNonZero(seeds) == 0) return
 
             val t = max(15, 6 * k) or 1   // patch size
+            // visible print that is not a rule, nor a flat line piece (what the erase left of a
+            // slightly sloped pen underline matched other sloped lines and was "repaired" longer);
+            // and the lines the visible rules run along
+            val visibleText = own(Mat()); val ruleLines = own(Mat())
+            run {
+                val hR = own(Mat()); val vR = own(Mat())
+                Imgproc.morphologyEx(visiblePrint, hR, Imgproc.MORPH_OPEN, own(Mat.ones(1, t, CvType.CV_8U)))
+                Imgproc.morphologyEx(visiblePrint, vR, Imgproc.MORPH_OPEN, own(Mat.ones(t, 1, CvType.CV_8U)))
+                val hL = own(Mat()); val vL = own(Mat())
+                Imgproc.dilate(hR, hL, own(Mat.ones(3, 2 * t + 1, CvType.CV_8U)))
+                Imgproc.dilate(vR, vL, own(Mat.ones(2 * t + 1, 3, CvType.CV_8U)))
+                Core.bitwise_or(hL, vL, ruleLines)
+                val near = own(Mat()); Core.bitwise_or(hR, vR, near)
+                Imgproc.dilate(near, near, own(Mat.ones(3, 3, CvType.CV_8U)))
+                Core.bitwise_not(near, near)
+                Core.bitwise_and(visiblePrint, near, visibleText)
+                val labels = own(Mat()); val stats = own(Mat()); val centroids = own(Mat())
+                val n = Imgproc.connectedComponentsWithStats(visibleText, labels, stats, centroids, 8, CvType.CV_32S)
+                val flat = BooleanArray(n) {
+                    val w = stats.get(it, Imgproc.CC_STAT_WIDTH)[0]
+                    it > 0 && w >= t / 2 && w >= 4 * stats.get(it, Imgproc.CC_STAT_HEIGHT)[0]
+                }
+                if (flat.any { it }) {
+                    val lab = IntArray(labels.total().toInt()); labels.get(0, 0, lab)
+                    val vt = ByteArray(lab.size); visibleText.get(0, 0, vt)
+                    for (i in lab.indices) if (flat[lab[i]]) vt[i] = 0
+                    visibleText.put(0, 0, vt)
+                }
+            }
             // matched on SHAPE: ink amount 0..1, lightly blurred
             val inkF = own(Mat())
             inkLevel.convertTo(inkF, CvType.CV_32F, 1.0 / 120.0)
@@ -87,26 +133,30 @@ object PrintRepair {
                 cy += step
             }
 
-            val twinOf = arrayOfNulls<Point>(windows.size)
+            val twinOf = arrayOfNulls<Twin>(windows.size)
             IntStream.range(0, windows.size).parallel().forEach { w ->
                 twinOf[w] = findTwin(windows[w].x.toInt(), windows[w].y.toInt(), t, th, sc, k,
-                    erased, ink, visiblePrint, inkF, inkH, erasedH, validBase, dst.cols(), dst.rows())
+                    erased, ink, visiblePrint, visibleText, wasNear, inkF, inkH, erasedH, validBase, dst.cols(), dst.rows())
             }
 
-            // fill only the erased pixels, and only with the twin's INK (paper is already paper)
+            // fill only the erased pixels that were ink in the original, and only with the twin's INK
+            // (paper is already paper)
             val source = own(dst.clone())
             val done = own(Mat.zeros(dst.size(), CvType.CV_8U))
             for (w in windows.indices) {
                 val tw = twinOf[w] ?: continue
                 val r = Rect(windows[w].x.toInt(), windows[w].y.toInt(), t, t)
-                val rs = Rect(tw.x.toInt(), tw.y.toInt(), t, t)
+                val rs = Rect(tw.at.x.toInt(), tw.at.y.toInt(), t, t)
                 val e = erased.submat(r); val srcInk = ink.submat(rs); val dn = done.submat(r)
+                val was = wasInk.submat(r); val line = ruleLines.submat(r)
                 val notDone = Mat(); Core.bitwise_not(dn, notDone)
                 val mask = Mat(); Core.bitwise_and(e, srcInk, mask); Core.bitwise_and(mask, notDone, mask)
+                Core.bitwise_and(mask, was, mask)
+                if (tw.alongRule) Core.bitwise_and(mask, line, mask)
                 val src = source.submat(rs); val out = dst.submat(r)
                 src.copyTo(out, mask)
                 Core.bitwise_or(dn, mask, dn)
-                listOf(e, srcInk, dn, notDone, mask, src, out).forEach { it.release() }
+                listOf(e, srcInk, dn, was, line, notDone, mask, src, out).forEach { it.release() }
             }
         } finally {
             owned.forEach { it.release() }
@@ -116,9 +166,9 @@ object PrintRepair {
     /** The twin (full-resolution top-left) for the window at ([x0], [y0]), or null if none convinces. */
     private fun findTwin(
         x0: Int, y0: Int, t: Int, th: Int, sc: Int, k: Int,
-        erased: Mat, ink: Mat, visiblePrint: Mat, inkF: Mat, inkH: Mat, erasedH: Mat, validBase: Mat,
+        erased: Mat, ink: Mat, visiblePrint: Mat, visibleText: Mat, wasNear: Mat, inkF: Mat, inkH: Mat, erasedH: Mat, validBase: Mat,
         cols: Int, rows: Int,
-    ): Point? {
+    ): Twin? {
         val owned = ArrayList<Mat>()
         fun <T : Mat> own(m: T): T { owned.add(m); return m }
         try {
@@ -136,6 +186,10 @@ object PrintRepair {
                 for (y in b.indices) if (b[y].toInt() != 0) { if (top < 0) top = y; bottom = y }
                 if (top < 0 || bottom - top + 1 <= k) return null
             }
+            // otherwise only printed rules in view (a vertical table line beside a pen answer in its cell):
+            // all a twin can tell is how the rule goes on — what lies beside a twin rule (a question
+            // number next to the table's border) says nothing about this cell
+            val ruleOnly = Core.countNonZero(own(visibleText.submat(r))) < 2 * k * k
 
             // coarse search
             val rh = Rect(x0 / sc, y0 / sc, th, th)
@@ -196,7 +250,13 @@ object PrintRepair {
             val inter = Core.countNonZero(both); val uni = Core.countNonZero(either)
             val agree = if (uni == 0) 1.0 else inter.toDouble() / uni
             if (scores[0] > 0.06 || scores[1] > 0.10 || agree < 0.6) return null
-            return twins[0]
+            // ...and on what was really there: print under the pen was ink in the original, so a twin
+            // that puts its ink where the original shows paper is a lookalike context ("đầu." beside
+            // a pen "76" matched "762. Tính" and pasted a "T" into the blank: 70% of it on ink, a
+            // pen-crossed "thứ" 100%)
+            val under = own(Mat()); Core.bitwise_and(f0, own(wasNear.submat(r)), under)
+            if (Core.countNonZero(under) < 0.9 * Core.countNonZero(f0)) return null
+            return Twin(twins[0], ruleOnly)
         } finally {
             owned.forEach { it.release() }
         }

@@ -53,4 +53,11 @@ flutter {
 dependencies {
     implementation(project(":opencv"))
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    // on-device text recognition (bundled models) for restoring pen-hidden print, every script ML
+    // Kit has: Latin (incl. Vietnamese), Chinese, Japanese, Korean, Devanagari
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+    implementation("com.google.mlkit:text-recognition-korean:16.0.1")
+    implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
 }

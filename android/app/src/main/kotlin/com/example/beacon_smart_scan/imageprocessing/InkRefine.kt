@@ -273,6 +273,9 @@ object InkRefine {
         // confidently print-coloured: as close to the local print colour as print itself is
         val strongThr = Mat(); Core.subtract(printRef, Scalar(0.02), strongThr)
         var printStrong = and(inkDecided, cmp(ratio, strongThr, Core.CMP_GE))
+        // (the print colour measured on the pixel itself, before the clipped blobs join it: the
+        // wide-context vote below never takes a letter that shows it)
+        val printByColour = printStrong.clone()
         // sensor-clipped cores (no colour of their own) are judged as whole blobs: a blob reaching
         // well outside the coarse handwriting is a print stroke's body the pen merely touches
         run {
@@ -354,17 +357,24 @@ object InkRefine {
             Imgproc.boxFilter(farF, farSum, -1, Size(w, w), Point(-1.0, -1.0), false)
             Core.max(inkSum, Scalar(1.0), inkSum)
             val farShare = Mat(); Core.divide(farSum, inkSum, farShare)
+            // (never a letter that shows the print's own colour itself: a printed word the pen passes
+            // just below — "của" over "1600:2" — is surrounded by pen, yet its measured colour is
+            // print's. Only groups of such pixels, a letter's part, not a lone pixel on a pen stroke)
+            val byColour = and(printByColour, not(coarse))
+            val cp = components(byColour)
+            val printOwn = paint(cp, BooleanArray(cp.n) { it > 0 && cp.area(it) >= k }, byColour)
+            cp.release()
             repeat(2) {
                 val hwF = toFloat(and(hw, d.ink))
                 val hwSum = Mat(); Imgproc.boxFilter(hwF, hwSum, -1, Size(w, w), Point(-1.0, -1.0), false)
                 val share = Mat(); Core.divide(hwSum, inkSum, share)
-                val vote = and(and(and(and(zone, d.ink), cmp(share, 0.55, Core.CMP_GE)), cmp(farShare, 0.15, Core.CMP_LT)),
-                    cmp(hwSum, 6.0 * k * k, Core.CMP_GE))
+                val vote = and(and(and(and(and(zone, d.ink), cmp(share, 0.55, Core.CMP_GE)), cmp(farShare, 0.15, Core.CMP_LT)),
+                    cmp(hwSum, 6.0 * k * k, Core.CMP_GE)), not(printOwn))
                 hw = or(hw, vote)
                 releasing(hwF, hwSum, share, vote) {}
             }
             printStrong = and(printStrong, not(hw))
-            releasing(coarseNear, printFar, inkF2, farF, inkSum, farSum, farShare) {}
+            releasing(coarseNear, printFar, inkF2, farF, inkSum, farSum, farShare, byColour, printOwn, printByColour) {}
         }
         // pen stroke merged into printed letters: pen-coloured pixels that run along a pen stroke
         run {
@@ -756,7 +766,104 @@ object InkRefine {
         } finally { t.forEach { it.release() } }
     }
 
-    fun erase(target: Mat, analysis: Mat, handwriting: Mat, print: Mat, overlap: Mat): Mat {
+    /**
+     * Level rules (`rule` flags over the components `lab`) as the rule ITSELF, not the ink the run
+     * holds: a pen stroke written along a rule fuses with it, and putting that fused ink back as
+     * print left the pen's pieces on the rule as a ragged, dashed edge. Where the pen crosses it, a
+     * column between clean columns on either side gets the rule's own band, its edges interpolated
+     * between them, limited to ink and to the run's own columns and rows (see RuleBands in ios
+     * InkAnalysis.hpp).
+     */
+    private fun ruleBands(lab: IntArray, cols: Int, rows: Int, stats: Mat, n: Int, rule: BooleanArray, pen: ByteArray, inkSmear: ByteArray, k: Int): ByteArray {
+        val out = ByteArray(lab.size)
+        for (i in 1 until n) {
+            if (!rule[i]) continue
+            val x0 = stats.get(i, Imgproc.CC_STAT_LEFT)[0].toInt(); val y0 = stats.get(i, Imgproc.CC_STAT_TOP)[0].toInt()
+            val w = stats.get(i, Imgproc.CC_STAT_WIDTH)[0].toInt(); val h = stats.get(i, Imgproc.CC_STAT_HEIGHT)[0].toInt()
+            val top = IntArray(w) { -1 }; val bot = IntArray(w) { -1 }; val dirty = BooleanArray(w)
+            for (y in y0 until y0 + h) for (x in 0 until w) {
+                val p = y * cols + x0 + x
+                if (lab[p] != i) continue
+                if (top[x] < 0) top[x] = y
+                bot[x] = y
+                if (pen[p].toInt() != 0) dirty[x] = true
+            }
+            fun ownInk(x: Int) { for (y in top[x]..bot[x]) { val p = y * cols + x0 + x; if (lab[p] == i) out[p] = 255.toByte() } }
+            val clean = (0 until w).filter { top[it] >= 0 && !dirty[it] }
+            // (and only a thin one: a dark band of a photo is no rule to rebuild)
+            val thick = clean.map { bot[it] - top[it] + 1 }.sorted()
+            val thin = thick.isNotEmpty() && thick[thick.size / 2] <= 1.5f * k
+            if (clean.size < max(5, w / 10) || !thin) { for (x in 0 until w) if (top[x] >= 0) ownInk(x); continue }
+            var next = 0   // first clean column at or right of x
+            for (x in 0 until w) {
+                while (next < clean.size && clean[next] < x) next++
+                if (top[x] < 0) continue
+                val l = if (next > 0) clean[next - 1] else -1; val r = if (next < clean.size) clean[next] else -1
+                // a clean column, or the pen at the run's end: its ink as it is
+                if (r == x || l < 0 || r < 0) { ownInk(x); continue }
+                val f = (x - l) / (r - l).toFloat()
+                val t0 = top[l] + (top[r] - top[l]) * f; val t1 = bot[l] + (bot[r] - bot[l]) * f
+                val ya = maxOf(0, top[x] - 1, t0.roundToInt()); val yb = minOf(rows - 1, bot[x] + 1, t1.roundToInt())
+                for (y in ya..yb) { val p = y * cols + x0 + x; if (inkSmear[p].toInt() != 0) out[p] = 255.toByte() }
+            }
+        }
+        return out
+    }
+
+    /**
+     * Rules running along the rows of [ink] — the pen written ALONG them fused with them; called on
+     * the page and on its transpose, so table borders the pen crossed are found as well as fill-in
+     * blanks. [thinOnly]: only runs no thicker than a printed rule (for the columns: a photo's dark
+     * band or a coloured page edge is long and straight too). See LevelRules in ios InkAnalysis.hpp.
+     */
+    private fun levelRules(ink: Mat, handwriting: Mat, k: Int, thinOnly: Boolean = false): Mat {
+        val smear = dilate(ink, Mat.ones(3, 1, CvType.CV_8U))
+        val runs = Mat()
+        // (lengths capped by the page width: k has a floor, so on a small page 20k/40k would be
+        // longer than a whole blank)
+        val l2 = max(5, min(20 * k, ink.cols() / 30)) or 1
+        Imgproc.morphologyEx(smear, runs, Imgproc.MORPH_OPEN, Mat.ones(1, l2, CvType.CV_8U))
+        Core.bitwise_and(runs, ink, runs)
+        val hwNear = dilate(handwriting, ellipse(2.0 * k + 1))
+        val labels = Mat(); val stats = Mat(); val centroids = Mat()
+        val n = Imgproc.connectedComponentsWithStats(runs, labels, stats, centroids, 8, CvType.CV_32S)
+        val lab = IntArray(labels.total().toInt()); labels.get(0, 0, lab)
+        val hn = ByteArray(hwNear.total().toInt()); hwNear.get(0, 0, hn)
+        val inside = IntArray(n)
+        for (i in lab.indices) if (lab[i] > 0 && hn[i].toInt() != 0) inside[lab[i]]++
+        // ...or so long and straight that no hand drew it (a blank the answer fills end to end) —
+        // but it must still show some of itself OUTSIDE the pen strokes: a ruler-straight pen
+        // underline is handwriting end to end, a rule peeks out past the answer written on it
+        val hwAll = ByteArray(handwriting.total().toInt()); handwriting.get(0, 0, hwAll)
+        val inHw = IntArray(n)
+        for (i in lab.indices) if (lab[i] > 0 && hwAll[i].toInt() != 0) inHw[lab[i]]++
+        val ruleLen = min(40 * k, ink.cols() / 18)
+        val rule = BooleanArray(n) {
+            val area = stats.get(it, Imgproc.CC_STAT_AREA)[0]
+            it > 0 && (inside[it] <= 0.7 * area || (stats.get(it, Imgproc.CC_STAT_WIDTH)[0] >= ruleLen && inHw[it] <= 0.9 * area))
+        }
+        // a printed rule is level with the page; a pen strike-through drawn with a ruler slopes
+        run {
+            val thick = (1 until n).filter { rule[it] }.map { max(1.0, stats.get(it, Imgproc.CC_STAT_AREA)[0] / max(1.0, stats.get(it, Imgproc.CC_STAT_WIDTH)[0])) }.sorted()
+            val t = if (thick.isEmpty()) k.toDouble() else thick[thick.size / 2]
+            for (i in 1 until n) {
+                val area = stats.get(i, Imgproc.CC_STAT_AREA)[0]
+                if (rule[i] && inside[i] > 0.7 * area &&
+                    stats.get(i, Imgproc.CC_STAT_HEIGHT)[0] - t > 0.015 * stats.get(i, Imgproc.CC_STAT_WIDTH)[0] + 2) rule[i] = false
+            }
+        }
+        if (thinOnly)
+            for (i in 1 until n)
+                if (rule[i] && stats.get(i, Imgproc.CC_STAT_AREA)[0] > 1.5 * k * stats.get(i, Imgproc.CC_STAT_WIDTH)[0]) rule[i] = false
+        val sm = ByteArray(smear.total().toInt()); smear.get(0, 0, sm)
+        val out = ruleBands(lab, labels.cols(), labels.rows(), stats, n, rule, hn, sm, k)
+        val rules = Mat(labels.size(), CvType.CV_8U); rules.put(0, 0, out)
+        releasing(smear, runs, hwNear, labels, stats, centroids) {}
+        return rules
+    }
+
+    /** [recognizer]: reads the page's text, to restore pen-hidden print (optional). */
+    fun erase(target: Mat, analysis: Mat, handwriting: Mat, print: Mat, overlap: Mat, recognizer: TextRecognizer? = null): Mat {
         val k = InkAnalysis.strokeUnit(target.cols(), target.rows())
         val s = k / 9.0
         val dst = target.clone()
@@ -776,44 +883,15 @@ object InkRefine {
         val pageRules: Mat
         run {
             val dAll = densityInRoi(analysis, paperSmall, Rect(0, 0, analysis.cols(), analysis.rows()))
-            val smear = dilate(dAll.ink, Mat.ones(3, 1, CvType.CV_8U))
-            val runs = Mat()
-            // (lengths capped by the page width: k has a floor, so on a small page 20k/40k would be
-            // longer than a whole blank)
-            val l2 = max(5, min(20 * k, analysis.cols() / 30)) or 1
-            Imgproc.morphologyEx(smear, runs, Imgproc.MORPH_OPEN, Mat.ones(1, l2, CvType.CV_8U))
-            Core.bitwise_and(runs, dAll.ink, runs)
-            val hwNear = dilate(handwriting, ellipse(2.0 * k + 1))
-            val labels = Mat(); val stats = Mat(); val centroids = Mat()
-            val n = Imgproc.connectedComponentsWithStats(runs, labels, stats, centroids, 8, CvType.CV_32S)
-            val lab = IntArray(labels.total().toInt()); labels.get(0, 0, lab)
-            val hn = ByteArray(hwNear.total().toInt()); hwNear.get(0, 0, hn)
-            val inside = IntArray(n)
-            for (i in lab.indices) if (lab[i] > 0 && hn[i].toInt() != 0) inside[lab[i]]++
-            // ...or so long and straight that no hand drew it (a blank the answer fills end to end) —
-            // but it must still show some of itself OUTSIDE the pen strokes: a ruler-straight pen
-            // underline is handwriting end to end, a rule peeks out past the answer written on it
-            val hwAll = ByteArray(handwriting.total().toInt()); handwriting.get(0, 0, hwAll)
-            val inHw = IntArray(n)
-            for (i in lab.indices) if (lab[i] > 0 && hwAll[i].toInt() != 0) inHw[lab[i]]++
-            val ruleLen = min(40 * k, analysis.cols() / 18)
-            val rule = BooleanArray(n) {
-                val area = stats.get(it, Imgproc.CC_STAT_AREA)[0]
-                it > 0 && (inside[it] <= 0.7 * area || (stats.get(it, Imgproc.CC_STAT_WIDTH)[0] >= ruleLen && inHw[it] <= 0.9 * area))
-            }
-            // a printed rule is level with the page; a pen strike-through drawn with a ruler slopes
-            run {
-                val thick = (1 until n).filter { rule[it] }.map { max(1.0, stats.get(it, Imgproc.CC_STAT_AREA)[0] / max(1.0, stats.get(it, Imgproc.CC_STAT_WIDTH)[0])) }.sorted()
-                val t = if (thick.isEmpty()) k.toDouble() else thick[thick.size / 2]
-                for (i in 1 until n) {
-                    val area = stats.get(i, Imgproc.CC_STAT_AREA)[0]
-                    if (rule[i] && inside[i] > 0.7 * area &&
-                        stats.get(i, Imgproc.CC_STAT_HEIGHT)[0] - t > 0.015 * stats.get(i, Imgproc.CC_STAT_WIDTH)[0] + 2) rule[i] = false
-                }
-            }
-            val out = ByteArray(lab.size) { if (rule[lab[it]]) 255.toByte() else 0 }
-            pageRules = Mat(labels.size(), CvType.CV_8U); pageRules.put(0, 0, out)
-            releasing(smear, runs, hwNear, labels, stats, centroids) {}
+            pageRules = levelRules(dAll.ink, handwriting, k)
+            // (and vertical ones — a table's column borders an answer was written across — on the
+            // transposed page)
+            val inkT = Mat(); Core.transpose(dAll.ink, inkT)
+            val hwT = Mat(); Core.transpose(handwriting, hwT)
+            val verticalT = levelRules(inkT, hwT, k, thinOnly = true)
+            val vertical = Mat(); Core.transpose(verticalT, vertical)
+            Core.bitwise_or(pageRules, vertical, pageRules)
+            releasing(inkT, hwT, verticalT, vertical) {}
             dAll.release()
         }
         try {
@@ -928,11 +1006,13 @@ object InkRefine {
             }
             cleanupLeftovers(dst, erasedAll, restoredAll, handwriting, print, overlap, targetPaperSmallBright, k)
             val beforeRepair = dst.clone()
-            PrintRepair.repairByExample(dst, erasedAll, k)
+            PrintRepair.repairByExample(dst, erasedAll, target, k)
             // printed letters the pen crossed, re-typeset from the page's own glyphs
             val printOrOverlap = Mat(); Core.bitwise_or(print, overlap, printOrOverlap)
             PrintRetypeset.retypeset(dst, analysis, handwriting, printOrOverlap, k)
             printOrOverlap.release()
+            // printed letters the pen hid entirely, restored by reading them
+            PrintRecognition.restore(dst, analysis, erasedAll, k, recognizer)
             // stray ink review; print put back by the repair steps is protected like restored print
             run {
                 val changed = Mat(); Core.absdiff(dst, beforeRepair, changed)

@@ -312,6 +312,82 @@ object InkAnalysis {
         }
     }
 
+    /**
+     * A printed line the pen wrote across breaks into pieces: its letters fused with the pen no
+     * longer sit on the baseline, and the clean glyphs between them are too few to chain into a line
+     * of their own. Two pieces on ONE baseline with the same text height are that line: the glyphs
+     * between them on the baseline join it — only those with a twin among the printed glyphs, so an
+     * answer written in a blank of the line stays out (see ios DetectAtWorkingSize).
+     */
+    private fun linesBridged(lines: List<TextLine>, c: Components, unit: Int, page: Page): List<TextLine> {
+        class Fit(val a: Double, val b: Double, val x0: Int, val x1: Int, val h: Float)
+        val inLine = BooleanArray(c.count)
+        val fits = lines.map { l ->
+            var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+            var x0 = Int.MAX_VALUE; var x1 = Int.MIN_VALUE
+            for (i in l.members) {
+                sx += c.cx[i]; sy += c.bottom[i]; sxx += c.cx[i].toDouble() * c.cx[i]; sxy += c.cx[i].toDouble() * c.bottom[i]
+                x0 = min(x0, c.x[i]); x1 = max(x1, c.x[i] + c.w[i])
+                inLine[i] = true
+            }
+            val n = l.members.size.toDouble(); val den = n * sxx - sx * sx
+            val a = if (den != 0.0) (n * sxy - sx * sy) / den else 0.0
+            Fit(a, (sy - a * sx) / n, x0, x1, l.medianHeight)
+        }
+        val pool = (1 until c.count).filter { inLine[it] }.sortedBy { c.h[it] }
+        val heights = pool.map { c.h[it] }
+        fun overlapIoU(i: Int, j: Int): Float {
+            val w = c.w[i]; val h = c.h[i]
+            var inter = 0; var uni = 0
+            for (yy in 0 until h) for (xx in 0 until w) {
+                val a = c.labels[(c.y[i] + yy) * page.width + c.x[i] + xx] == i
+                val b = c.labels[(c.y[j] + yy * c.h[j] / h) * page.width + c.x[j] + xx * c.w[j] / w] == j
+                if (a && b) inter++
+                if (a || b) uni++
+            }
+            return if (uni == 0) 0f else inter.toFloat() / uni
+        }
+        fun hasTwin(i: Int): Boolean {
+            val lo = floor(c.h[i] * 0.88).toInt()
+            var k = heights.binarySearch(lo).let { if (it < 0) -it - 1 else it }
+            while (k > 0 && heights[k - 1] >= lo) k--
+            while (k < pool.size && c.h[pool[k]] <= c.h[i] * 1.14f) {
+                val j = pool[k]; k++
+                val rw = c.w[j].toFloat() / c.w[i]
+                if (rw < 0.85f || rw > 1.18f) continue
+                if (overlapIoU(i, j) >= 0.7f) return true
+            }
+            return false
+        }
+        val loose = (1 until c.count).filter { !inLine[it] && isGlyph(c, it, unit, page.height) }
+        val added = List(lines.size) { ArrayList<Int>() }
+        for ((p, P) in fits.withIndex()) {
+            // the nearest piece to its right on the same baseline, of the same text height
+            // (compared where the pieces end, not extrapolated: a fitted slope is noisy)
+            var best = -1
+            for ((q, Q) in fits.withIndex()) {
+                if (q == p || Q.x0 <= P.x1 || abs(Q.h - P.h) > 0.2f * max(Q.h, P.h)) continue
+                val hm = max(P.h, Q.h).toDouble()
+                if (abs((P.a * P.x1 + P.b) - (Q.a * Q.x0 + Q.b)) >= 0.18 * hm) continue
+                if (best < 0 || Q.x0 < fits[best].x0) best = q
+            }
+            if (best < 0) continue
+            val Q = fits[best]
+            val hm = max(P.h, Q.h)
+            for (i in loose) {
+                if (inLine[i] || c.cx[i] <= P.x1 || c.cx[i] >= Q.x0) continue
+                // (the baseline straight from one piece's end to the other's)
+                val f = (c.cx[i] - P.x1) / (Q.x0 - P.x1).toDouble()
+                val base = (1 - f) * (P.a * P.x1 + P.b) + f * (Q.a * Q.x0 + Q.b)
+                val ratio = c.h[i] / hm
+                if (abs(c.bottom[i] - base) >= 0.18 * hm || ratio <= 0.6f || ratio >= 1.67f || !hasTwin(i)) continue
+                added[p].add(i)
+                inLine[i] = true
+            }
+        }
+        return lines.mapIndexed { i, l -> if (added[i].isEmpty()) l else TextLine(l.members + added[i].toIntArray(), l.medianHeight) }
+    }
+
     private fun isGlyph(c: Components, i: Int, unit: Int, pageHeight: Int): Boolean =
         c.area[i] >= unit * 2 && c.h[i] >= unit && c.h[i] <= pageHeight * 0.03 && c.w[i] <= c.h[i] * 4
 
@@ -608,7 +684,7 @@ object InkAnalysis {
         // regular lines by geometry, then the local print-colour (chroma) reference they give, and
         // the hue direction of the page's other ink (the pen)
         val c = components(d.ink, page)
-        val lines = untwinnedLinesRemoved(regularLines(c, k, page.height), c, page)
+        val lines = linesBridged(untwinnedLinesRemoved(regularLines(c, k, page.height), c, page), c, k, page)
         val regular = BooleanArray(c.count)
         for (l in lines) for (i in l.members) regular[i] = true
         val regularMask = paint(c.labels, regular)

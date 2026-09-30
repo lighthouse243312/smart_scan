@@ -1,6 +1,6 @@
 # Uncomment this line to define a global platform for your project
 # The InkSegmenter Core ML model (ml/export_ink_seg.py) targets iOS 15+ — do not lower below 15.
-platform :ios, '15.5'
+platform :ios, '16.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'

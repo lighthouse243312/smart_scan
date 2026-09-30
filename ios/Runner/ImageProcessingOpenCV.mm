@@ -12,6 +12,7 @@
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#import <Vision/Vision.h>
 #import "ImageProcessingOpenCV.h"
 #import "InkAnalysis.hpp"
 
@@ -291,6 +292,82 @@ static bool SegmentPage(const cv::Mat &src, cv::Mat *outPrintProb, cv::Mat *outH
     return true;
 }
 
+// MARK: - Text recognition (Vision)
+
+/// Reads the printed text of `bgr` with Vision, any language it knows (detected per page): each
+/// line's top readings, split into words at whitespace, each word's graphemes and box in pixels.
+/// Vision boxes words only — the letters' own positions come from the page's ink (see
+/// RestorePrintByRecognition).
+static std::vector<inkanalysis::OcrLine> RecognizeText(const cv::Mat &bgr) {
+    std::vector<inkanalysis::OcrLine> lines;
+    cv::Mat rgba;
+    cv::cvtColor(bgr, rgba, cv::COLOR_BGR2RGBA);
+    const int W = rgba.cols, H = rgba.rows;
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(rgba.data, W, H, 8, rgba.step, space,
+                                             kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big);
+    CGImageRef image = ctx ? CGBitmapContextCreateImage(ctx) : nil;
+    if (ctx) CGContextRelease(ctx);
+    CGColorSpaceRelease(space);
+    if (image == nil) return lines;
+    @autoreleasepool {
+        VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
+        request.revision = VNRecognizeTextRequestRevision3;
+        request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+        request.automaticallyDetectsLanguage = YES;
+        request.usesLanguageCorrection = YES;
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image options:@{}];
+        NSError *error = nil;
+        if (![handler performRequests:@[ request ] error:&error]) {
+            CGImageRelease(image);
+            return lines;
+        }
+        // Vision boxes are normalised with the origin bottom-left
+        auto toRect = [&](CGRect b) {
+            return cv::Rect((int)std::floor(b.origin.x * W), (int)std::floor((1.0 - b.origin.y - b.size.height) * H),
+                            (int)std::ceil(b.size.width * W), (int)std::ceil(b.size.height * H));
+        };
+        for (VNRecognizedTextObservation *observation in request.results) {
+            inkanalysis::OcrLine line;
+            line.box = toRect(observation.boundingBox);
+            for (VNRecognizedText *candidate in [observation topCandidates:3]) {
+                NSString *text = candidate.string;
+                std::vector<inkanalysis::OcrWord> words;
+                inkanalysis::OcrWord word;
+                NSRange wordRange = NSMakeRange(NSNotFound, 0);
+                auto flush = [&] {
+                    if (!word.graphemes.empty()) {
+                        NSError *boxError = nil;
+                        VNRectangleObservation *box = [candidate boundingBoxForRange:wordRange error:&boxError];
+                        if (box != nil) {
+                            word.box = toRect(box.boundingBox);
+                            words.push_back(word);
+                        }
+                    }
+                    word = inkanalysis::OcrWord();
+                    wordRange = NSMakeRange(NSNotFound, 0);
+                };
+                for (NSUInteger i = 0; i < text.length;) {
+                    const NSRange range = [text rangeOfComposedCharacterSequenceAtIndex:i];
+                    NSString *grapheme = [text substringWithRange:range];
+                    i = range.location + range.length;
+                    if ([grapheme stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0) {
+                        flush();
+                        continue;
+                    }
+                    word.graphemes.push_back(std::string(grapheme.UTF8String));
+                    wordRange = wordRange.location == NSNotFound ? range : NSUnionRange(wordRange, range);
+                }
+                flush();
+                line.readings.push_back(words);
+            }
+            lines.push_back(line);
+        }
+    }
+    CGImageRelease(image);
+    return lines;
+}
+
 @implementation ImageProcessingOpenCV
 
 + (BOOL)sharpenAtPath:(NSString *)inputPath
@@ -480,7 +557,7 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
         cv::resize(print, print, target.size(), 0, 0, cv::INTER_NEAREST);
         cv::resize(overlap, overlap, target.size(), 0, 0, cv::INTER_NEAREST);
     }
-    cv::Mat dst = inkanalysis::EraseHandwriting(target, analysis, handwriting, print, overlap);
+    cv::Mat dst = inkanalysis::EraseHandwriting(target, analysis, handwriting, print, overlap, RecognizeText);
     return WriteOrFail(dst, outputPath, error);
 }
 
