@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import '../core/models/handwriting_method.dart';
 import '../core/models/scan_page.dart';
 import '../services/document_scanner_service.dart';
+import '../services/image_picker_service.dart';
 import '../services/image_processing_service.dart';
 
 enum ScanStep { capture, processing, review, export }
@@ -12,11 +13,14 @@ enum ScanStep { capture, processing, review, export }
 class ScanSession extends ChangeNotifier {
   ScanSession({
     DocumentScannerService? scannerService,
+    ImagePickerService? imagePickerService,
     ImageProcessingService? imageProcessingService,
   })  : _scannerService = scannerService ?? DocumentScannerService(),
+        _imagePickerService = imagePickerService ?? ImagePickerService(),
         _imageProcessingService = imageProcessingService ?? ImageProcessingService();
 
   final DocumentScannerService _scannerService;
+  final ImagePickerService _imagePickerService;
   final ImageProcessingService _imageProcessingService;
 
   /// Which detector builds the mask, and how aggressively (0-1, higher = erase more).
@@ -35,6 +39,25 @@ class ScanSession extends ChangeNotifier {
 
   Future<bool> capture() async {
     final paths = await _guarded(() => _scannerService.scan());
+    if (paths == null || paths.isEmpty) return false;
+    _pages.addAll(paths.map((p) => ScanPage(originalPath: p)));
+    currentPageIndex = _pages.length - paths.length;
+    step = ScanStep.processing;
+    notifyListeners();
+    return true;
+  }
+
+  /// Adds pictures from outside the app (photo library): each is converted to an upright JPEG
+  /// first, since the rest of the pipeline assumes what the document scanner produces.
+  Future<bool> importImages() async {
+    final paths = await _guarded(() async {
+      final picked = await _imagePickerService.pickImages();
+      final imported = <String>[];
+      for (final p in picked) {
+        imported.add(await _imageProcessingService.importImage(p));
+      }
+      return imported;
+    });
     if (paths == null || paths.isEmpty) return false;
     _pages.addAll(paths.map((p) => ScanPage(originalPath: p)));
     currentPageIndex = _pages.length - paths.length;

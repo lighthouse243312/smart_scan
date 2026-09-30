@@ -373,8 +373,13 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     cv::Mat src;
     if (!ReadOrFail(inputPath, &src, error)) return nil;
 
+    // the model is only a second opinion here (colourless handwriting, print under a near-black
+    // pen); without it the colour method still runs on its own
+    cv::Mat modelPrint, modelHw;
+    NSError *modelError = nil;
+    if (!SegmentPage(src, &modelPrint, &modelHw, &modelError)) { modelPrint.release(); modelHw.release(); }
     cv::Mat handwriting, print, overlap;
-    inkanalysis::DetectByInkColor(src, colorDelta, &handwriting, &print, &overlap);
+    inkanalysis::DetectByInkColor(src, colorDelta, &handwriting, &print, &overlap, modelPrint, modelHw);
 
     if (!WriteMaskFile(handwriting, print, overlap, maskPath, error)) return nil;
     return Coverage(handwriting);
@@ -406,7 +411,7 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     // finds neat pen writing the model (trained on synthetic data) misses; the model finds pen ink
     // the same colour as the print (black ballpoint), which colour cannot see.
     cv::Mat colorHw, colorPrint, colorOverlap;
-    inkanalysis::DetectByInkColor(src, colorDelta, &colorHw, &colorPrint, &colorOverlap);
+    inkanalysis::DetectByInkColor(src, colorDelta, &colorHw, &colorPrint, &colorOverlap, printProb, handwritingProb);
     // a model pixel is dropped only where BOTH methods agree it is print
     cv::Mat combinedHw = colorHw | (handwriting & ~(colorPrint & print));
     // model's two layers are independent: where both are set, print lies under the pen

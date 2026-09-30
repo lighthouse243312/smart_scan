@@ -72,6 +72,7 @@ object ImageProcessingChannel {
                 )
             "inkColorMask" ->
                 InkColorMasker.mask(
+                    appContext,
                     requirePath(call, "inputPath"),
                     requirePath(call, "maskPath"),
                     requireDouble(call, "colorDelta", 0.05),
@@ -89,6 +90,11 @@ object ImageProcessingChannel {
                     requirePath(call, "maskPath"),
                     requirePath(call, "outputPath"),
                     requireMapList(call, "strokes"),
+                )
+            "importImage" ->
+                ImageImporter.import(
+                    requirePath(call, "inputPath"),
+                    requirePath(call, "outputPath"),
                 )
             "eraseWithMask" ->
                 MaskEraser.erase(

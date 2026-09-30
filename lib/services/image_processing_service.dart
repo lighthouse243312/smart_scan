@@ -26,6 +26,12 @@ class ImageProcessingService {
         return ImageProcessingChannel.removeShadow(inputPath: inputPath, outputPath: outputPath);
       });
 
+  /// Converts a picture picked from outside the app into the pipeline's upright JPEG.
+  Future<String> importImage(String inputPath) => _run(() async {
+        final outputPath = await TempPaths.next('imported.jpg');
+        return ImageProcessingChannel.importImage(inputPath: inputPath, outputPath: outputPath);
+      });
+
   /// Rotates by 90°-steps (1 = 90° CW, 2 = 180°, 3 = 90° CCW). Document scanners crop the page
   /// rectangle correctly but don't know which edge is "up" for reading, so this lets the user
   /// fix orientation by hand.

@@ -10,6 +10,7 @@ import org.opencv.geometry.Geometry
 import org.opencv.imgproc.Imgproc
 import org.opencv.photo.Photo
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -266,6 +267,51 @@ object InkAnalysis {
 
     private class TextLine(val members: IntArray, val medianHeight: Float)
 
+    /**
+     * Uniformity review (see ios DetectAtWorkingSize): a typeset page repeats its glyphs almost
+     * exactly, a hand never does — a short "regular line" whose glyphs have no twin in any OTHER line
+     * is neat handwriting that happened to be even and straight, not print.
+     */
+    private fun untwinnedLinesRemoved(lines: List<TextLine>, c: Components, page: Page): List<TextLine> {
+        val lineOf = IntArray(c.count) { -1 }
+        for ((li, l) in lines.withIndex()) for (i in l.members) lineOf[i] = li
+        val all = (1 until c.count).filter { lineOf[it] >= 0 }.sortedBy { c.h[it] }
+        val heights = all.map { c.h[it] }
+        fun overlapIoU(i: Int, j: Int): Float {
+            val w = c.w[i]; val h = c.h[i]
+            var inter = 0; var uni = 0
+            for (yy in 0 until h) for (xx in 0 until w) {
+                val a = c.labels[(c.y[i] + yy) * page.width + c.x[i] + xx] == i
+                val gx = c.x[j] + xx * c.w[j] / w; val gy = c.y[j] + yy * c.h[j] / h
+                val b = c.labels[gy * page.width + gx] == j
+                if (a && b) inter++
+                if (a || b) uni++
+            }
+            return if (uni == 0) 0f else inter.toFloat() / uni
+        }
+        return lines.filterIndexed { li, l ->
+            if (l.members.size > 40) return@filterIndexed true
+            var withTwin = 0; var tested = 0
+            for (i in l.members) {
+                if (c.h[i] < 4) continue
+                tested++
+                val lo = heights.binarySearch(floor(c.h[i] * 0.88).toInt()).let { if (it < 0) -it - 1 else it }
+                var k = lo
+                while (k > 0 && heights[k - 1] >= floor(c.h[i] * 0.88).toInt()) k--
+                var twin = false
+                while (k < all.size && c.h[all[k]] <= c.h[i] * 1.14f && !twin) {
+                    val j = all[k]; k++
+                    if (lineOf[j] == li) continue
+                    val rw = c.w[j].toFloat() / c.w[i]
+                    if (rw < 0.85f || rw > 1.18f) continue
+                    twin = overlapIoU(i, j) >= 0.7f
+                }
+                if (twin) withTwin++
+            }
+            !(tested >= 3 && withTwin < 0.3f * tested)
+        }
+    }
+
     private fun isGlyph(c: Components, i: Int, unit: Int, pageHeight: Int): Boolean =
         c.area[i] >= unit * 2 && c.h[i] >= unit && c.h[i] <= pageHeight * 0.03 && c.w[i] <= c.h[i] * 4
 
@@ -371,10 +417,18 @@ object InkAnalysis {
      * size, then per-pixel refinement at full resolution ([InkRefine.refine]) — downscaling blends
      * thin strokes' edges and destroys the colour signal (measured 96% → 74% per-pixel accuracy).
      */
-    fun detectByInkColor(full: Mat, colorDelta: Double): Triple<Mat, Mat, Mat> {
+    /**
+     * [modelPrint] / [modelHw]: the segmentation model's probabilities at [full]'s size (CV_32F), or
+     * null — a second opinion only where colour cannot decide (see ios DetectByInkColor).
+     */
+    fun detectByInkColor(full: Mat, colorDelta: Double, modelPrint: Mat? = null, modelHw: Mat? = null): Triple<Mat, Mat, Mat> {
         val src = toWorkingSize(full)
         val r = try {
-            detectAtWorkingSize(src, colorDelta)
+            val hwWork = modelHw?.let { m ->
+                val t = Mat(); Imgproc.resize(m, t, src.size(), 0.0, 0.0, Imgproc.INTER_AREA)
+                FloatArray(t.total().toInt()).also { t.get(0, 0, it); t.release() }
+            }
+            detectAtWorkingSize(src, colorDelta, hwWork)
         } finally {
             if (src !== full) src.release()
         }
@@ -382,7 +436,13 @@ object InkAnalysis {
         val coarsePrint = upscale(r.print, full)
         val fragments = upscale(r.fragments, full)
         val mixed = upscale(r.mixed, full)
-        return releasing(coarse, coarsePrint, r.ref, fragments, mixed) { InkRefine.refine(full, coarse, coarsePrint, r.ref, r.penDir, fragments, mixed) }
+        val band = upscale(r.printBand, full)
+        val enclosed = upscale(r.enclosedPrint, full)
+        val ring = upscale(r.ringPen, full)
+        val colourless = upscale(r.colourless, full)
+        return releasing(coarse, coarsePrint, r.ref, fragments, mixed, band, enclosed, ring, colourless) {
+            InkRefine.refine(full, coarse, coarsePrint, r.ref, r.penDir, fragments, mixed, band, enclosed, ring, colourless, modelPrint, modelHw)
+        }
     }
 
     private fun toWorkingSize(full: Mat): Mat {
@@ -403,9 +463,140 @@ object InkAnalysis {
         return out
     }
 
-    private class WorkResult(val hw: Mat, val print: Mat, val ref: Mat, val penDir: FloatArray, val fragments: Mat, val mixed: Mat)
+    private class WorkResult(
+        val hw: Mat, val print: Mat, val ref: Mat, val penDir: FloatArray, val fragments: Mat, val mixed: Mat, val printBand: Mat,
+        val enclosedPrint: Mat, val ringPen: Mat, val colourless: Mat,
+    )
 
-    private fun detectAtWorkingSize(src: Mat, colorDelta: Double): WorkResult {
+    /**
+     * Handwriting with NO colour of its own (black ballpoint, or a scan app that made the page
+     * almost greyscale), found by layout and shape and verified by the segmentation model — see
+     * ColourlessHandwriting in ios/Runner/InkAnalysis.hpp for the measurements behind each gate.
+     * [modelHw]: the model's handwriting probability at working size, or null (then nothing).
+     */
+    private fun colourlessHandwriting(d: OpticalDensity, c: Components, regular: BooleanArray, hw: BooleanArray,
+                                      modelHw: FloatArray?, page: Page): BooleanArray {
+        val W = page.width; val H = page.height
+        val found = BooleanArray(page.size)
+        if (modelHw == null) return found
+        val regIds = (1 until c.count).filter { regular[it] }
+        if (regIds.size < 20) return found
+        fun med(v: List<Float>) = v.sorted()[v.size / 2]
+        val cap = med(regIds.map { c.h[it].toFloat() })
+
+        class RLine(val m: ArrayList<Int>, var cy: Float) { var top = 0f; var bot = 0f; val runs = ArrayList<FloatArray>() }
+        val lines = ArrayList<RLine>()
+        for (i in regIds.sortedBy { c.y[it] + c.h[it] / 2f }) {
+            val cy = c.y[i] + c.h[i] / 2f
+            val L = lines.firstOrNull { abs(cy - it.cy) < 0.5f * cap }
+            if (L != null) { L.m.add(i); L.cy = med(L.m.map { j -> c.y[j] + c.h[j] / 2f }) } else lines.add(RLine(arrayListOf(i), cy))
+        }
+        for (L in lines) {
+            val xs = L.m.map { intArrayOf(c.x[it], c.x[it] + c.w[it]) }.sortedBy { it[0] }
+            var a = xs[0][0].toFloat(); var b = xs[0][1].toFloat()
+            for (q in 1 until xs.size) {
+                if (xs[q][0] - b > 1.5f * cap) { L.runs.add(floatArrayOf(a, b)); a = xs[q][0].toFloat(); b = xs[q][1].toFloat() }
+                else b = max(b, xs[q][1].toFloat())
+            }
+            L.runs.add(floatArrayOf(a, b))
+            L.top = med(L.m.map { c.y[it].toFloat() }); L.bot = med(L.m.map { (c.y[it] + c.h[it]).toFloat() })
+        }
+        // rules / table grid: long straight runs
+        val lr = max(9, (3 * cap).toInt()) or 1
+        val inkMat = toMat(d.ink, page)
+        val hR = Mat(); val vR = Mat(); val rulesMat = Mat()
+        Imgproc.morphologyEx(inkMat, hR, Imgproc.MORPH_OPEN, Mat.ones(1, lr, CvType.CV_8U))
+        Imgproc.morphologyEx(inkMat, vR, Imgproc.MORPH_OPEN, Mat.ones(lr, 1, CvType.CV_8U))
+        Core.bitwise_or(hR, vR, rulesMat)
+        Imgproc.dilate(rulesMat, rulesMat, Mat.ones(3, 3, CvType.CV_8U))
+        val rules = toMask(rulesMat)
+        releasing(inkMat, hR, vR, rulesMat) {}
+        val cc = components(BooleanArray(page.size) { d.ink[it] && !rules[it] && !regular[c.labels[it]] }, page)
+
+        val regDark = ArrayList<Float>()
+        var idx = 0
+        while (idx < page.size) { if (regular[c.labels[idx]]) regDark.add(d.mean[idx]); idx += 3 }
+        if (regDark.isEmpty()) return found
+        val sortedDark = regDark.sorted()
+        val printDark = sortedDark[sortedDark.size / 2]
+        val coreDark = sortedDark[min(sortedDark.size - 1, (0.8 * (sortedDark.size - 1)).roundToInt())]
+
+        // per-component pixel lists of the candidates
+        val pixels = HashMap<Int, ArrayList<Int>>()
+        for (i in 0 until page.size) { val l = cc.labels[i]; if (l > 0) pixels.getOrPut(l) { ArrayList() }.add(i) }
+        class Cand(val i: Int, val x: Int, val y: Int, val w: Int, val h: Int, val twin: Float, val dark: Float, val model: Float, val n: Int)
+        val cands = ArrayList<Cand>()
+        for (i in 1 until cc.count) {
+            val x = cc.x[i]; val y = cc.y[i]; val w = cc.w[i]; val h = cc.h[i]
+            if (cc.area[i] < 0.3f * cap || h < 0.5f * cap || h > 3.5f * cap || w > 8 * cap) continue
+            val px = pixels[i] ?: continue
+            val hwShare = px.count { hw[it] }.toFloat() / max(1, cc.area[i])
+            // a piece only partly handwriting may be a pen stroke fused with a printed letter (colour
+            // splits it): skipped when it sits beside printed text and the model sees its other part as
+            // print (see ios ColourlessHandwriting)
+            if (hwShare > 0.05f && hwShare < 0.9f) {
+                val rest = px.filter { !hw[it] }
+                val besideText = regIds.any { j ->
+                    val gap = max(c.x[j], x) - min(c.x[j] + c.w[j], x + w)
+                    val oy = min(c.y[j] + c.h[j], y + h) - max(c.y[j], y)
+                    gap <= 0.7f * cap && oy > 0.3f * min(c.h[j], h)
+                }
+                if (besideText && rest.isNotEmpty() && rest.sumOf { modelHw[it].toDouble() } / rest.size < 0.4) continue
+            }
+            val cy = y + h / 2f
+            val inLine = lines.any { L ->
+                cy >= L.top - 0.35f * cap && cy <= L.bot + 0.35f * cap && h <= 1.7f * (L.bot - L.top + 1) &&
+                    L.runs.any { rn -> rn[0] - 0.7f * cap <= x + w && x <= rn[1] + 0.7f * cap }
+            }
+            if (inLine) continue
+            // best twin among the regular printed glyphs of about the same size
+            val B = BooleanArray(w * h)
+            for (p in px) B[(p / W - y) * w + (p % W - x)] = true
+            var best = 0f
+            for (j in regIds) {
+                val rh = c.h[j].toFloat() / h; val rw = c.w[j].toFloat() / w
+                if (rh < 0.85f || rh > 1.18f || rw < 0.8f || rw > 1.25f) continue
+                var inter = 0; var uni = 0
+                for (yy in 0 until h) for (xx in 0 until w) {
+                    val gx = c.x[j] + xx * c.w[j] / w; val gy = c.y[j] + yy * c.h[j] / h
+                    val g = c.labels[gy * W + gx] == j
+                    val bb = B[yy * w + xx]
+                    if (g && bb) inter++
+                    if (g || bb) uni++
+                }
+                if (uni > 0) best = max(best, inter.toFloat() / uni)
+                if (best >= 0.95f) break
+            }
+            var dark = 0f; var model = 0f
+            for (p in px) { dark += d.mean[p]; model += modelHw[p] }
+            cands.add(Cand(i, x, y, w, h, best, dark / px.size, model / px.size, px.size))
+        }
+        // groups: candidates side by side on a row decide together
+        val uf = UnionFind(cands.size)
+        for (a in cands.indices) for (b in a + 1 until cands.size) {
+            val A = cands[a]; val Bc = cands[b]
+            val gapx = max(A.x, Bc.x) - min(A.x + A.w, Bc.x + Bc.w)
+            val oy = min(A.y + A.h, Bc.y + Bc.h) - max(A.y, Bc.y)
+            if (gapx <= 0.8f * cap && oy > 0.3f * min(A.h, Bc.h)) uf.join(a, b)
+        }
+        val groups = cands.indices.groupBy { uf.find(it) }
+        for (G in groups.values) {
+            val twins = G.count { cands[it].twin >= 0.7f }
+            val maxTwin = G.maxOf { cands[it].twin }
+            val darks = G.map { cands[it].dark }
+            val modelN = G.sumOf { cands[it].n }
+            val modelMean = if (modelN == 0) 0.0 else G.sumOf { (cands[it].model * cands[it].n).toDouble() } / modelN
+            if (twins >= 0.5f * G.size) continue
+            if (med(darks) < 0.4f * printDark) continue
+            if (modelMean < 0.03) {
+                if (G.size < 2 || maxTwin >= 0.55f || darks.average() >= 0.8f * coreDark) continue
+            }
+            for (a in G) for (p in pixels[cands[a].i]!!) found[p] = true
+        }
+        return found
+    }
+
+    private fun detectAtWorkingSize(src: Mat, colorDelta: Double, modelHw: FloatArray? = null): WorkResult {
         val page = Page(src.cols(), src.rows())
         val k = strokeUnit(page.width, page.height)
         val d = opticalDensity(src, page)
@@ -417,7 +608,7 @@ object InkAnalysis {
         // regular lines by geometry, then the local print-colour (chroma) reference they give, and
         // the hue direction of the page's other ink (the pen)
         val c = components(d.ink, page)
-        val lines = regularLines(c, k, page.height)
+        val lines = untwinnedLinesRemoved(regularLines(c, k, page.height), c, page)
         val regular = BooleanArray(c.count)
         for (l in lines) for (i in l.members) regular[i] = true
         val regularMask = paint(c.labels, regular)
@@ -480,6 +671,28 @@ object InkAnalysis {
             y0 -= 0.6f * l.medianHeight; y1 += 0.3f * l.medianHeight
             for (i in 1 until c.count) {
                 if (small[i] && c.cx[i] >= x0 && c.cx[i] <= x1 && c.y[i] >= y0 && c.y[i] + c.h[i] <= y1) printComp[i] = true
+            }
+        }
+        // print-line bands spanning the text column (see ios InkAnalysis.hpp): where pen crosses
+        // printed words, non-pen-coloured pixels inside them are restored as print
+        val printBand = BooleanArray(page.size)
+        run {
+            val rows = lines.map { l ->
+                var x0 = Float.MAX_VALUE; var y0 = Float.MAX_VALUE; var x1 = -Float.MAX_VALUE; var y1 = -Float.MAX_VALUE
+                for (i in l.members) {
+                    x0 = min(x0, c.x[i].toFloat()); x1 = max(x1, (c.x[i] + c.w[i]).toFloat())
+                    y0 = min(y0, c.y[i].toFloat()); y1 = max(y1, c.bottom[i])
+                }
+                floatArrayOf(y0 - 0.2f * l.medianHeight, y1 + 0.2f * l.medianHeight, x0, x1)
+            }
+            if (rows.isNotEmpty()) {
+                val colL = percentile(rows.map { it[2] }, 5f)
+                val colR = percentile(rows.map { it[3] }, 95f)
+                for (r in rows) {
+                    val ya = max(0, r[0].toInt()); val yb = min(page.height - 1, r[1].toInt())
+                    val xa = max(0, min(r[2], colL).toInt()); val xb = min(page.width - 1, max(r[3], colR).toInt())
+                    for (y in ya..yb) for (x in xa..xb) printBand[y * page.width + x] = true
+                }
             }
         }
         val printByLayout = paint(c.labels, printComp)
@@ -557,9 +770,48 @@ object InkAnalysis {
         // strongly mixed AND shaped like a letter + underline (much wider than tall, a stroke's
         // worth of pen colour): its pen-coloured pixels are handwriting, protected like fragments
         val mixedPen = BooleanArray(page.size)
+        val enclosedPrint = BooleanArray(page.size)
+        val ringPen = BooleanArray(page.size)
         run {
             val strong = BooleanArray(c.count) {
                 it > 0 && printComp[it] && fracC[it] >= 0.4f && c.w[it] >= 2.5f * c.h[it] && fracC[it] * c.area[it] >= 3f * k * k
+            }
+            // ...or a pen LOOP around printed text (a circled item number): its pen-coloured pixels
+            // enclose the component's other ink on at least 3 of 4 sides (the ring is often open
+            // where it crosses the print it circles) — see ios InkAnalysis.hpp
+            for (i in 1 until c.count) {
+                if (strong[i] || !printComp[i] || fracC[i] < 0.4f || fracC[i] * c.area[i] < 3f * k * k) continue
+                val bx = c.x[i]; val by = c.y[i]; val bw = c.w[i]; val bh = c.h[i]
+                val rowFirst = IntArray(bh) { Int.MAX_VALUE }; val rowLast = IntArray(bh) { -1 }
+                val colFirst = IntArray(bw) { Int.MAX_VALUE }; val colLast = IntArray(bw) { -1 }
+                for (y in 0 until bh) for (x in 0 until bw) {
+                    val p = (by + y) * page.width + bx + x
+                    if (c.labels[p] != i || !cand[p]) continue
+                    rowFirst[y] = min(rowFirst[y], x); rowLast[y] = max(rowLast[y], x)
+                    colFirst[x] = min(colFirst[x], y); colLast[x] = max(colLast[x], y)
+                }
+                var restCount = 0; var enclosed = 0
+                val inside = ArrayList<Int>()
+                for (y in 0 until bh) for (x in 0 until bw) {
+                    val p = (by + y) * page.width + bx + x
+                    if (c.labels[p] != i || !d.ink[p] || cand[p]) continue
+                    restCount++
+                    var sides = 0
+                    if (rowFirst[y] < x) sides++
+                    if (rowLast[y] > x) sides++
+                    if (colFirst[x] < y) sides++
+                    if (colLast[x] > y) sides++
+                    if (sides >= 3) { enclosed++; inside.add(p) }
+                }
+                if (enclosed >= k * k && enclosed >= 0.25 * restCount) {
+                    strong[i] = true
+                    // the circled print stays print through refinement; the ring is pen
+                    for (p in inside) enclosedPrint[p] = true
+                    for (y in 0 until bh) for (x in 0 until bw) {
+                        val p = (by + y) * page.width + bx + x
+                        if (c.labels[p] == i && cand[p]) ringPen[p] = true
+                    }
+                }
             }
             for (i in 0 until page.size) if (strong[c.labels[i]] && cand[i]) { mixedPen[i] = true; hw[i] = true }
         }
@@ -624,12 +876,18 @@ object InkAnalysis {
         for (i in 0 until page.size) if (fragmentMask[i] && !picture[i]) hw[i] = true
         val fragmentsOut = BooleanArray(page.size) { fragmentMask[it] && !picture[it] }
         val mixedOut = BooleanArray(page.size) { mixedMask[it] && !picture[it] }
+        val enclosedOut = BooleanArray(page.size) { enclosedPrint[it] && !picture[it] }
+        val colourless = colourlessHandwriting(d, c, regular, hw, modelHw, page)
+        for (i in 0 until page.size) if (picture[i]) colourless[i] = false
+        for (i in 0 until page.size) if (colourless[i]) print[i] = false
+        val ringOut = BooleanArray(page.size) { ringPen[it] && !picture[it] }
 
         val refPlanes = refChroma.map { toFloatMat(it, page) }
         val refMat = Mat()
         Core.merge(refPlanes, refMat)
         refPlanes.forEach { it.release() }
-        return WorkResult(toMat(hw, page), toMat(print, page), refMat, penDir, toMat(fragmentsOut, page), toMat(mixedOut, page))
+        return WorkResult(toMat(hw, page), toMat(print, page), refMat, penDir, toMat(fragmentsOut, page), toMat(mixedOut, page), toMat(printBand, page),
+            toMat(enclosedOut, page), toMat(ringOut, page), toMat(colourless, page))
     }
 
 }

@@ -1,5 +1,6 @@
 import Flutter
 import Foundation
+import UIKit
 
 /// Thrown for argument problems detected on the Swift side before ever reaching OpenCV.
 private struct ArgumentError: Error {
@@ -79,6 +80,12 @@ enum ImageProcessingChannel {
                 try ImageProcessingOpenCV.eraseWithMask(atPath: inputPath, analysisPath: analysisPath, maskPath: maskPath, outputPath: outputPath)
                 return ["outputPath": outputPath]
 
+            case "importImage":
+                let inputPath = try requireString(args, "inputPath")
+                let outputPath = try requireString(args, "outputPath")
+                let size = try importImage(inputPath: inputPath, outputPath: outputPath)
+                return ["outputPath": outputPath, "width": size.width, "height": size.height]
+
             default:
                 return errorResult(code: "INVALID_ARGUMENT", message: "Unknown method: \(call.method)")
             }
@@ -89,6 +96,42 @@ enum ImageProcessingChannel {
         } catch {
             return errorResult(code: "PROCESSING_FAILED", message: error.localizedDescription)
         }
+    }
+
+    /// Longest side of an imported picture: processing time grows with the pixel count, and this
+    /// is well above what text needs.
+    private static let maxImportLongSide: CGFloat = 4000
+
+    /// Brings a picture from outside the app (photo library / files) into the pipeline's format.
+    /// The document scanner hands over upright JPEGs; an arbitrary picture may instead be HEIC
+    /// (which OpenCV cannot read), carry its rotation only as an EXIF orientation, be transparent
+    /// (a PNG screenshot) or be huge. Decoded by UIKit, redrawn upright onto white at <= 4000 px
+    /// and written as JPEG.
+    private static func importImage(inputPath: String, outputPath: String) throws -> (width: Int, height: Int) {
+        guard FileManager.default.fileExists(atPath: inputPath) else {
+            throw NSError(domain: ImageProcessingErrorDomain, code: ImageProcessingErrorCode.fileNotFound.rawValue,
+                          userInfo: [NSLocalizedDescriptionKey: "Không tìm thấy ảnh: \(inputPath)"])
+        }
+        guard let image = UIImage(contentsOfFile: inputPath), image.size.width > 0, image.size.height > 0 else {
+            throw ArgumentError(message: "Không đọc được định dạng ảnh này")
+        }
+        // pixel size, upright (UIImage.size already accounts for the orientation)
+        let pixelW = image.size.width * image.scale, pixelH = image.size.height * image.scale
+        let s = min(1, maxImportLongSide / max(pixelW, pixelH))
+        let target = CGSize(width: (pixelW * s).rounded(), height: (pixelH * s).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let upright = UIGraphicsImageRenderer(size: target, format: format).image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: target))
+            image.draw(in: CGRect(origin: .zero, size: target))   // draws with its orientation applied
+        }
+        guard let data = upright.jpegData(compressionQuality: 0.95) else {
+            throw ArgumentError(message: "Không ghi được ảnh")
+        }
+        try data.write(to: URL(fileURLWithPath: outputPath))
+        return (Int(target.width), Int(target.height))
     }
 
     private static func requireString(_ args: [String: Any], _ key: String) throws -> String {

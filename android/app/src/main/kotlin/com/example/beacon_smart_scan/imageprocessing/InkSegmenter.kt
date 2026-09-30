@@ -62,6 +62,17 @@ object InkSegmenter {
         }
     }
 
+    /**
+     * The model's print / handwriting probabilities for [src] (CV_32F, [src]'s size), or null when the
+     * model is not in the app — a second opinion for the colour method (see [InkColorMasker]).
+     */
+    fun probabilities(context: Context, src: Mat): Pair<Mat, Mat>? {
+        val model = try { ensureLoaded(context) } catch (e: ImageProcessingException) { return null }
+        val printProb = Mat(); val handwritingProb = Mat()
+        segmentPage(model, src, printProb, handwritingProb)
+        return Pair(printProb, handwritingProb)
+    }
+
     fun mask(context: Context, inputPath: String, maskPath: String, threshold: Double, colorDelta: Double): Map<String, Any> {
         val model = ensureLoaded(context)
         val src = ImageIO.readOrThrow(inputPath)
@@ -92,7 +103,7 @@ object InkSegmenter {
             // combined with the ink-colour + layout method (see ios segmentationMaskAtPath): colour
             // finds neat pen writing the model misses, the model finds pen ink the same colour as
             // the print. A model pixel is dropped only where BOTH agree it is print.
-            val (colorHw, colorPrint, colorOverlap) = InkAnalysis.detectByInkColor(src, colorDelta)
+            val (colorHw, colorPrint, colorOverlap) = InkAnalysis.detectByInkColor(src, colorDelta, printProb, handwritingProb)
             val tmp = Mat(); val hw = Mat(); val overlap = Mat(); val outPrint = Mat(); val notHw = Mat(); val notColorHw = Mat()
             releasing(colorHw, colorPrint, colorOverlap, tmp, hw, overlap, outPrint, notHw, notColorHw) {
                 Core.bitwise_and(colorPrint, print, tmp)

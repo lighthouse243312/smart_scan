@@ -67,6 +67,20 @@ class ImageProcessingChannel {
     return result!['outputPath'] as String;
   }
 
+  /// Brings a picture from outside the app (photo library / files) into the pipeline's format:
+  /// decoded by the platform (HEIC too), turned upright by its EXIF orientation, flattened onto
+  /// white, capped at 4000 px on the long side and written as JPEG to [outputPath].
+  static Future<String> importImage({
+    required String inputPath,
+    required String outputPath,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('importImage', {
+      'inputPath': inputPath,
+      'outputPath': outputPath,
+    });
+    return result!['outputPath'] as String;
+  }
+
   /// Ink-colour + layout mask. [colorDelta] = how much bluer than the local print (optical
   /// density OD_B/OD_R) a stroke must be to count as pen; smaller = more sensitive.
   static Future<HandwritingMaskResult> inkColorMask({

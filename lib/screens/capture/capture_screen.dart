@@ -21,7 +21,7 @@ class CaptureScreen extends StatelessWidget {
               const Icon(Icons.document_scanner_outlined, size: 96, color: Colors.grey),
               const SizedBox(height: 16),
               const Text(
-                'Chụp tài liệu để làm nét, xoá bóng và xoá chữ viết tay tự động',
+                'Chụp tài liệu hoặc chọn ảnh có sẵn để làm nét, xoá bóng và xoá chữ viết tay tự động',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 15, color: Colors.grey),
               ),
@@ -46,6 +46,21 @@ class CaptureScreen extends StatelessWidget {
                         width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                     : const Icon(Icons.camera_alt_outlined),
                 label: const Text('Quét tài liệu'),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: session.isProcessing
+                    ? null
+                    : () async {
+                        final ok = await session.importImages();
+                        if (ok && context.mounted) {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(builder: (_) => const ProcessingPreviewScreen()),
+                          );
+                        }
+                      },
+                icon: const Icon(Icons.photo_library_outlined),
+                label: const Text('Chọn ảnh có sẵn'),
               ),
             ],
           ),
