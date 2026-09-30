@@ -120,6 +120,7 @@ object InkSegmenter {
                 Core.bitwise_not(hw, notHw)
                 Core.bitwise_and(outPrint, notHw, outPrint)
                 Core.bitwise_or(outPrint, overlap, outPrint)
+                PenComponentVote.apply(src, hw, outPrint, overlap, handwritingProb)
                 HandwritingMask.write(hw, outPrint, overlap, maskPath)
                 HandwritingMask.result(maskPath, hw)
             }

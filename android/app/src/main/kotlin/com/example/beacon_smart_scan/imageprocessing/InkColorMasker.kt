@@ -16,7 +16,9 @@ object InkColorMasker {
         val probs = InkSegmenter.probabilities(context, src)
         val (handwriting, print, overlap) = releasing(src) {
             try {
-                InkAnalysis.detectByInkColor(src, colorDelta, probs?.first, probs?.second)
+                InkAnalysis.detectByInkColor(src, colorDelta, probs?.first, probs?.second).also { (hw, pr, ov) ->
+                    PenComponentVote.apply(src, hw, pr, ov, probs?.second)
+                }
             } finally {
                 probs?.first?.release(); probs?.second?.release()
             }

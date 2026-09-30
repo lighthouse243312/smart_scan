@@ -23,6 +23,8 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // dev harness for the image pipeline (src/androidTest), not part of the app
+        testInstrumentationRunner = "com.example.beacon_smart_scan.InkHarness"
     }
 
     buildTypes {

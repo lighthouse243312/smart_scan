@@ -32,6 +32,8 @@ object InkAnalysis {
     private const val FAINT_OD = 0.06f
     private const val RIM_OD = 0.04f
     private const val WORK_LONG_SIDE = 2400
+    /** Android only: retried when [WORK_LONG_SIDE] does not fit the device's Java heap. */
+    private const val FALLBACK_WORK_LONG_SIDE = 1600
     /** Chroma distance -> score units (a unit conversion, not tied to any ink colour). */
     const val PEN_SCALE = 4f
 
@@ -498,15 +500,14 @@ object InkAnalysis {
      * null — a second opinion only where colour cannot decide (see ios DetectByInkColor).
      */
     fun detectByInkColor(full: Mat, colorDelta: Double, modelPrint: Mat? = null, modelHw: Mat? = null): Triple<Mat, Mat, Mat> {
-        val src = toWorkingSize(full)
         val r = try {
-            val hwWork = modelHw?.let { m ->
-                val t = Mat(); Imgproc.resize(m, t, src.size(), 0.0, 0.0, Imgproc.INTER_AREA)
-                FloatArray(t.total().toInt()).also { t.get(0, 0, it); t.release() }
-            }
-            detectAtWorkingSize(src, colorDelta, hwWork)
-        } finally {
-            if (src !== full) src.release()
+            detectAtLongSide(full, WORK_LONG_SIDE, colorDelta, modelHw)
+        } catch (e: OutOfMemoryError) {
+            // the working-size pass keeps dozens of page-sized arrays on the Java heap; on a device
+            // whose heap is too small for 2400 px, a smaller pass beats crashing (full-resolution
+            // refinement below still restores most of the per-pixel accuracy)
+            System.gc()
+            detectAtLongSide(full, FALLBACK_WORK_LONG_SIDE, colorDelta, modelHw)
         }
         val coarse = upscale(r.hw, full)
         val coarsePrint = upscale(r.print, full)
@@ -521,10 +522,23 @@ object InkAnalysis {
         }
     }
 
-    private fun toWorkingSize(full: Mat): Mat {
+    private fun detectAtLongSide(full: Mat, workLongSide: Int, colorDelta: Double, modelHw: Mat?): WorkResult {
+        val src = toWorkingSize(full, workLongSide)
+        return try {
+            val hwWork = modelHw?.let { m ->
+                val t = Mat(); Imgproc.resize(m, t, src.size(), 0.0, 0.0, Imgproc.INTER_AREA)
+                FloatArray(t.total().toInt()).also { t.get(0, 0, it); t.release() }
+            }
+            detectAtWorkingSize(src, colorDelta, hwWork)
+        } finally {
+            if (src !== full) src.release()
+        }
+    }
+
+    private fun toWorkingSize(full: Mat, workLongSide: Int): Mat {
         val longSide = max(full.cols(), full.rows())
-        if (longSide <= WORK_LONG_SIDE) return full
-        val scale = WORK_LONG_SIDE.toDouble() / longSide
+        if (longSide <= workLongSide) return full
+        val scale = workLongSide.toDouble() / longSide
         val out = Mat()
         Imgproc.resize(full, out, Size(), scale, scale, Imgproc.INTER_AREA)
         return out

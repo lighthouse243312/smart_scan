@@ -35,6 +35,9 @@ object ImageProcessingChannel {
                     mainHandler.post { result.success(response) }
                 } catch (e: ImageProcessingException) {
                     mainHandler.post { result.error(e.code, e.message, null) }
+                } catch (e: OutOfMemoryError) {
+                    // an Error, not an Exception: uncaught it kills the process instead of failing the call
+                    mainHandler.post { result.error("OUT_OF_MEMORY", "Không đủ bộ nhớ để xử lý ảnh này", null) }
                 } catch (e: Exception) {
                     mainHandler.post { result.error("PROCESSING_FAILED", e.message, null) }
                 }
