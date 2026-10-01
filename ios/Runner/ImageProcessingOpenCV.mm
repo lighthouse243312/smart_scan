@@ -457,6 +457,7 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     if (!SegmentPage(src, &modelPrint, &modelHw, &modelError)) { modelPrint.release(); modelHw.release(); }
     cv::Mat handwriting, print, overlap;
     inkanalysis::DetectByInkColor(src, colorDelta, &handwriting, &print, &overlap, modelPrint, modelHw);
+    inkanalysis::PenComponentVote(src, handwriting, print, overlap, modelHw);
 
     if (!WriteMaskFile(handwriting, print, overlap, maskPath, error)) return nil;
     return Coverage(handwriting);
@@ -494,6 +495,7 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     // model's two layers are independent: where both are set, print lies under the pen
     cv::Mat overlap = colorOverlap | (combinedHw & print & ~colorHw);
     cv::Mat combinedPrint = ((colorPrint | print) & ~combinedHw) | overlap;
+    inkanalysis::PenComponentVote(src, combinedHw, combinedPrint, overlap, handwritingProb);
 
     if (!WriteMaskFile(combinedHw, combinedPrint, overlap, maskPath, error)) return nil;
     return Coverage(combinedHw);
