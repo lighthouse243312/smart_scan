@@ -49,7 +49,11 @@ object PenComponentVote {
      * Updates [handwriting], [print] and [overlap] (CV_8UC1, 255 = set, [src]'s size) in place.
      * [modelHw]: the segmentation model's handwriting probability (CV_32F, [src]'s size) or null.
      */
+    /** Dev switch for comparing with/without the vote (InkHarness `-e vote 0`). */
+    @JvmStatic var enabled = true
+
     fun apply(src: Mat, handwriting: Mat, print: Mat, overlap: Mat, modelHw: Mat?) {
+        if (!enabled) return
         val w = src.cols(); val h = src.rows()
         val k = InkAnalysis.strokeUnit(w, h)
         val (chroma, mean) = chromaAndDensity(src)
@@ -228,7 +232,7 @@ object PenComponentVote {
         // run — a printed rule shows neutral rims somewhere along it (its core is usually clipped,
         // and where letters sit on it the rims take their colour), a pen stroke along the line (a
         // strike-through, an underline) is pen-coloured wherever its colour can be measured
-        val rule = Mat()
+        val rule = Mat(); val ruleUnder = Mat()
         run {
             val runs = Mat(); val thick = Mat(); val segLabels = Mat(); val segStats = Mat(); val segCent = Mat()
             Imgproc.morphologyEx(ink, runs, Imgproc.MORPH_OPEN, Mat.ones(1, 2 * k + 1, CvType.CV_8U))
@@ -269,8 +273,12 @@ object PenComponentVote {
                 for (x in 0 until w) out[x] = if (printed[lab[x]]) 255.toByte() else 0
                 rule.put(y, 0, out)
             }
+            // the rule runs on under a pen stroke crossing it: close its gaps along the row (where
+            // there is ink); the part under the pen is erased with it and restored as print
+            Imgproc.morphologyEx(rule, rule, Imgproc.MORPH_CLOSE, Mat.ones(1, 2 * k + 1, CvType.CV_8U))
             Imgproc.dilate(rule, rule, Mat.ones(3, 1, CvType.CV_8U))
             Core.bitwise_and(rule, ink, rule)
+            Core.bitwise_and(rule, penSeed, ruleUnder)
             Core.bitwise_not(penSeed, tmp); Core.bitwise_and(rule, tmp, rule)
             Core.bitwise_not(rule, tmp); Core.bitwise_and(penSide, tmp, penSide)
             releasing(runs, thick, segLabels, segStats, segCent) {}
@@ -282,23 +290,32 @@ object PenComponentVote {
         centroids.release()
         try {
             val st = IntArray(n * 5); stats.get(0, 0, st)
-            val cntV = IntArray(n); val cntP = IntArray(n); val cntN = IntArray(n); val sumMh = DoubleArray(n)
+            val cntV = IntArray(n); val cntP = IntArray(n); val cntN = IntArray(n); val cntNear = IntArray(n); val sumMh = DoubleArray(n)
             val lab = IntArray(w); val vRow = ByteArray(w); val pRow = ByteArray(w); val nRow = ByteArray(w); val mRow = FloatArray(w)
+            val sRow0 = ByteArray(w)
             for (y in 0 until h) {
                 labels.get(y, 0, lab); valid.get(y, 0, vRow); penSeed.get(y, 0, pRow); neutSeed.get(y, 0, nRow)
+                penSide.get(y, 0, sRow0)
                 modelHw?.get(y, 0, mRow)
                 for (x in 0 until w) {
                     val l = lab[x]; if (l == 0) continue
+                    if (sRow0[x].toInt() != 0) cntNear[l]++
                     if (vRow[x].toInt() != 0) cntV[l]++
                     if (pRow[x].toInt() != 0) cntP[l]++
                     if (nRow[x].toInt() != 0) cntN[l]++
                     if (modelHw != null) sumMh[l] += mRow[x]
                 }
             }
-            // 0 keep, 1 pen, 2 print, 3 mixed
+            // 0 keep, 1 pen, 2 print, 3 mixed, 4 big (only its pen pieces are handwriting)
             val cat = ByteArray(n)
+            val fills = FloatArray(n); val ps = FloatArray(n)
             for (l in 1 until n) {
-                if (cntV[l] < 10) continue
+                if (cntV[l] < 10) {
+                    // too small to vote on (a printed colon, comma, dot): print when every
+                    // measurable pixel is print-coloured
+                    if (cntV[l] >= 3 && cntN[l] >= cntV[l] && st[l * 5 + Imgproc.CC_STAT_AREA] <= 4 * k * k) cat[l] = 2
+                    continue
+                }
                 val cw = st[l * 5 + Imgproc.CC_STAT_WIDTH]; val ch = st[l * 5 + Imgproc.CC_STAT_HEIGHT]
                 val area = st[l * 5 + Imgproc.CC_STAT_AREA]
                 val p = cntP[l].toFloat() / cntV[l]
@@ -306,13 +323,24 @@ object PenComponentVote {
                 val fill = area.toFloat() / max(1, cw * ch)
                 val thinRule = ch <= 2 * k + 1 && cw >= 6 * ch
                 val mh = sumMh[l] / max(1, area)
+                val neutShare = cntN[l].toFloat() / cntV[l]
+                val near = cntNear[l].toFloat() / max(1, area)
+                fills[l] = fill; ps[l] = p
                 cat[l] = when {
-                    // pictures: large and neutral, or large and solid (handwriting strokes are sparse)
-                    big && (p < 0.5f || fill > 0.3f) -> 2
+                    // large and neutral, or large and solid (handwriting strokes are sparse): a picture
+                    // or a printed frame — kept, except pen pieces written into it (a signature
+                    // touching the header box)
+                    big && (p < 0.5f || fill > 0.3f) -> 4
                     // whole-component pen only when nothing in it is confidently print-coloured: a
                     // bold printed hint letter fused with the pen letters beside it is clipped
                     // (colourless) but for its rims, which are print-coloured
                     p >= 0.9f && cntN[l] <= max(3f, 0.02f * cntV[l]) -> 1
+                    // ...or its few neutral pixels are rims scattered along the pen (low resolution
+                    // and JPEG soften a thin stroke's colour: "Sai: 10" in red, 6% neutral, 88% near)
+                    p > 0.05f && neutShare <= 0.1f && near >= 0.85f -> 1
+                    // ...or the colour is too weak to decide but the model is sure: a dark pen at low
+                    // resolution (tick 0.90, underline 0.90; bold print fused with pen ≤ 0.56)
+                    p > 0.05f && mh >= 0.8 && neutShare <= 0.4f -> 1
                     // neutral: print when a rule, when the model sees no handwriting in it, or when it
                     // is toner-dark — clipped almost everywhere with every measurable rim pixel
                     // print-coloured (a bold printed letter: 2% measurable, all neutral; a dark pen
@@ -323,17 +351,32 @@ object PenComponentVote {
                     else -> 3
                 }
             }
+            // inside a picture (big and dense — not a sparse table or box frame): its small parts that
+            // are not pen-coloured (eyes, cheeks) are the picture, whatever the model thinks
+            val pictures = (1 until n).filter { cat[it].toInt() == 4 && fills[it] >= 0.25f }
+            for (b in pictures) {
+                val bx = st[b * 5 + Imgproc.CC_STAT_LEFT]; val by = st[b * 5 + Imgproc.CC_STAT_TOP]
+                val bw = st[b * 5 + Imgproc.CC_STAT_WIDTH]; val bh = st[b * 5 + Imgproc.CC_STAT_HEIGHT]
+                for (l in 1 until n) {
+                    if (l == b) continue
+                    val c = cat[l].toInt(); if (c != 0 && c != 3) continue
+                    val lx = st[l * 5 + Imgproc.CC_STAT_LEFT]; val ly = st[l * 5 + Imgproc.CC_STAT_TOP]
+                    if (lx < bx || ly < by || lx + st[l * 5 + Imgproc.CC_STAT_WIDTH] > bx + bw ||
+                        ly + st[l * 5 + Imgproc.CC_STAT_HEIGHT] > by + bh) continue
+                    if (cntV[l] == 0 || ps[l] < 0.5f) cat[l] = 2
+                }
+            }
             // pieces: a pen-touched component with its printed rules taken out falls apart into the
             // strokes written on the rule (letters, a tick); each piece is judged by its own colour,
             // whole — per-pixel nearest colour is noisy on a dark pen clipped all but its rims, and
             // the upstream "print under the pen" guess does not apply to a piece that is all pen
             val nPieces: Int
-            val penPiece: BooleanArray; val neutralPiece: BooleanArray
+            val penPiece: BooleanArray; val neutralPiece: BooleanArray; val halfPenPiece: BooleanArray
             run {
                 val inPen = Mat(h, w, CvType.CV_8U); val row = ByteArray(w)
                 for (y in 0 until h) {
                     labels.get(y, 0, lab)
-                    for (x in 0 until w) { val c = cat[lab[x]].toInt(); row[x] = if (c == 1 || c == 3) 255.toByte() else 0 }
+                    for (x in 0 until w) { val c = cat[lab[x]].toInt(); row[x] = if (c == 1 || c == 3 || c == 4) 255.toByte() else 0 }
                     inPen.put(y, 0, row)
                 }
                 val t = Mat()
@@ -364,14 +407,15 @@ object PenComponentVote {
                         (pn[it] <= 3 || (near[it] >= 0.9f * area[it] && pn[it] <= 0.1f * pv[it]))
                 }
                 neutralPiece = BooleanArray(nPieces) { it > 0 && pv[it] >= 5 && pn[it] >= 0.6f * pv[it] && pp[it] <= 0.1f * pv[it] }
+                halfPenPiece = BooleanArray(nPieces) { it > 0 && pv[it] >= 5 && pp[it] >= 0.5f * pv[it] }
             }
             val hRow = ByteArray(w); val prRow = ByteArray(w); val oRow = ByteArray(w)
-            val sideRow = ByteArray(w); val ruleRow = ByteArray(w); val pieceRow = IntArray(w)
+            val sideRow = ByteArray(w); val ruleRow = ByteArray(w); val pieceRow = IntArray(w); val underRow = ByteArray(w)
             val on = 255.toByte(); val off: Byte = 0
             for (y in 0 until h) {
                 labels.get(y, 0, lab); pieces.get(y, 0, pieceRow)
                 hw.get(y, 0, hRow); print.get(y, 0, prRow); overlap.get(y, 0, oRow)
-                penSide.get(y, 0, sideRow); rule.get(y, 0, ruleRow)
+                penSide.get(y, 0, sideRow); rule.get(y, 0, ruleRow); ruleUnder.get(y, 0, underRow)
                 var changed = false
                 for (x in 0 until w) {
                     val c = cat[lab[x]].toInt(); if (c == 0) continue
@@ -379,7 +423,13 @@ object PenComponentVote {
                     val isRule = ruleRow[x].toInt() != 0
                     val piece = pieceRow[x]
                     when {
+                        // a printed rule under the pen: erased with it, restored as print
+                        c != 2 && underRow[x].toInt() != 0 -> { hRow[x] = on; prRow[x] = on; oRow[x] = on }
                         penPiece[piece] -> { hRow[x] = on; prRow[x] = off; oRow[x] = off }
+                        // big: a mostly-pen piece still fused with the frame goes pixel by pixel,
+                        // the rest of the picture/frame is print
+                        c == 4 && halfPenPiece[piece] && sideRow[x].toInt() != 0 -> { hRow[x] = on; prRow[x] = off; oRow[x] = off }
+                        c == 4 -> { hRow[x] = off; prRow[x] = on; oRow[x] = off }
                         c == 3 && neutralPiece[piece] -> { hRow[x] = off; prRow[x] = on }
                         c == 2 || (c == 1 && isRule) -> { hRow[x] = off; prRow[x] = on; oRow[x] = off }
                         c == 1 -> { hRow[x] = on; prRow[x] = off; oRow[x] = off }
@@ -389,8 +439,20 @@ object PenComponentVote {
                 }
                 if (changed) { hw.put(y, 0, hRow); print.put(y, 0, prRow); overlap.put(y, 0, oRow) }
             }
+            // faint marks inside a picture (pink cheeks below the ink threshold) are the picture too
+            for (b in pictures) {
+                val bx = st[b * 5 + Imgproc.CC_STAT_LEFT]; val by = st[b * 5 + Imgproc.CC_STAT_TOP]
+                val bw = st[b * 5 + Imgproc.CC_STAT_WIDTH]; val bh = st[b * 5 + Imgproc.CC_STAT_HEIGHT]
+                val bl = IntArray(bw); val bhRow = ByteArray(bw)
+                for (y in by until by + bh) {
+                    labels.get(y, bx, bl); hw.get(y, bx, bhRow)
+                    var changed = false
+                    for (x in 0 until bw) if (bl[x] == 0 && bhRow[x].toInt() != 0) { bhRow[x] = off; changed = true }
+                    if (changed) hw.put(y, bx, bhRow)
+                }
+            }
         } finally {
-            releasing(labels, stats, pieces, penSeed, neutSeed, penSide, rule) {}
+            releasing(labels, stats, pieces, penSeed, neutSeed, penSide, rule, ruleUnder) {}
         }
     }
 }

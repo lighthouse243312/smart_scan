@@ -44,7 +44,8 @@ class InkHarness : Instrumentation() {
             val input = File(dir, args.getString("input") ?: error("missing -e input")).path
             val clean = args.getString("clean")?.let { File(dir, it).path } ?: input
             val s = (args.getString("sensitivity") ?: "0.6").toDouble().coerceIn(0.0, 1.0)
-            val base = input.substringBeforeLast('.')
+            val base = input.substringBeforeLast('.') + (args.getString("tag") ?: "")
+            com.example.beacon_smart_scan.imageprocessing.PenComponentVote.enabled = args.getString("vote") != "0"
             val mask = "${base}_mask.png"
             if (args.getString("layers") == "1") {
                 // the two detectors separately: model probabilities and the colour method's layers
