@@ -38,6 +38,14 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
                 error:(NSError **)error
     NS_SWIFT_NAME(rotate(atPath:outputPath:quarterTurnsClockwise:));
 
+/// Straightens a photographed page (see Straighten.hpp): squares it to its printed rules
+/// (rotation + keystone) or, without rules, levels its text rows; a level page is copied
+/// unchanged. Returns how: "level", "rules" or "rotate".
++ (nullable NSString *)straightenAtPath:(NSString *)inputPath
+                              outputPath:(NSString *)outputPath
+                                   error:(NSError **)error
+    NS_SWIFT_NAME(straighten(atPath:outputPath:));
+
 /// Mask files are BGRA PNGs the size of the page with two independent layers: alpha = handwriting
 /// (drawn semi-transparent red, so the file doubles as the review overlay), blue = printed ink
 /// (kept even where alpha is 0). A pixel can be both — handwriting written over print. The

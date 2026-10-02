@@ -54,7 +54,9 @@ class ScanSession extends ChangeNotifier {
       final picked = await _imagePickerService.pickImages();
       final imported = <String>[];
       for (final p in picked) {
-        imported.add(await _imageProcessingService.importImage(p));
+        // a photo from the library is rarely square to the page (the scanner path is)
+        final upright = await _imageProcessingService.importImage(p);
+        imported.add(await _imageProcessingService.straighten(upright));
       }
       return imported;
     });

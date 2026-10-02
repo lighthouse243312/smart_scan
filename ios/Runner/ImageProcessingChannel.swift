@@ -37,6 +37,12 @@ enum ImageProcessingChannel {
                 try ImageProcessingOpenCV.sharpen(atPath: inputPath, outputPath: outputPath, amount: amount, radius: radius)
                 return ["outputPath": outputPath]
 
+            case "straighten":
+                let inputPath = try requireString(args, "inputPath")
+                let outputPath = try requireString(args, "outputPath")
+                let how = try ImageProcessingOpenCV.straighten(atPath: inputPath, outputPath: outputPath)
+                return ["outputPath": outputPath, "method": how]
+
             case "removeShadow":
                 let inputPath = try requireString(args, "inputPath")
                 let outputPath = try requireString(args, "outputPath")

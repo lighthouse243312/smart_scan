@@ -62,6 +62,11 @@ object ImageProcessingChannel {
                     requireDouble(call, "amount", 1.5),
                     requireDouble(call, "radius", 3.0),
                 )
+            "straighten" ->
+                Straightener.straighten(
+                    requirePath(call, "inputPath"),
+                    requirePath(call, "outputPath"),
+                )
             "removeShadow" ->
                 ShadowRemover.removeShadow(
                     requirePath(call, "inputPath"),

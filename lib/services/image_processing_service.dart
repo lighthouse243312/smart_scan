@@ -33,6 +33,13 @@ class ImageProcessingService {
         return ImageProcessingChannel.importImage(inputPath: inputPath, outputPath: outputPath);
       });
 
+  /// Squares a photographed page to its printed rules / text rows (see
+  /// [ImageProcessingChannel.straighten]) so the handwriting analysis sees level lines.
+  Future<String> straighten(String inputPath) => _run(() async {
+        final outputPath = await TempPaths.next('straightened.png');
+        return ImageProcessingChannel.straighten(inputPath: inputPath, outputPath: outputPath);
+      });
+
   /// Rotates by 90°-steps (1 = 90° CW, 2 = 180°, 3 = 90° CCW). Document scanners crop the page
   /// rectangle correctly but don't know which edge is "up" for reading, so this lets the user
   /// fix orientation by hand.

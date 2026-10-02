@@ -15,6 +15,8 @@
 #import <Vision/Vision.h>
 #import "ImageProcessingOpenCV.h"
 #import "InkAnalysis.hpp"
+#import "PrintRestore.hpp"
+#import "Straighten.hpp"
 
 NSString *const ImageProcessingErrorDomain = @"ImageProcessingOpenCV";
 
@@ -406,6 +408,17 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     return WriteOrFail(src, outputPath, error);
 }
 
++ (nullable NSString *)straightenAtPath:(NSString *)inputPath
+                              outputPath:(NSString *)outputPath
+                                   error:(NSError **)error {
+    cv::Mat src;
+    if (!ReadOrFail(inputPath, &src, error)) return nil;
+    std::string how;
+    cv::Mat dst = straighten::Straighten(src, &how);
+    if (!WriteOrFail(dst, outputPath, error)) return nil;
+    return [NSString stringWithUTF8String:how.c_str()];
+}
+
 + (BOOL)removeShadowAtPath:(NSString *)inputPath
                  outputPath:(NSString *)outputPath
                       error:(NSError **)error {
@@ -558,6 +571,8 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
         cv::resize(overlap, overlap, target.size(), 0, 0, cv::INTER_NEAREST);
     }
     cv::Mat dst = inkanalysis::EraseHandwriting(target, analysis, handwriting, print, overlap, RecognizeText);
+    // give back print / rules the erase took beyond the writing, clear the pen it left
+    printrestore::Restore(analysis, target, dst, handwriting, print);
     return WriteOrFail(dst, outputPath, error);
 }
 

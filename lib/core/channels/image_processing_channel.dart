@@ -67,6 +67,19 @@ class ImageProcessingChannel {
     return result!['outputPath'] as String;
   }
 
+  /// Straightens a photographed page: squared to its printed rules (rotation + keystone) or,
+  /// without rules, its text rows levelled; an already-level page is copied unchanged.
+  static Future<String> straighten({
+    required String inputPath,
+    required String outputPath,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('straighten', {
+      'inputPath': inputPath,
+      'outputPath': outputPath,
+    });
+    return result!['outputPath'] as String;
+  }
+
   /// Brings a picture from outside the app (photo library / files) into the pipeline's format:
   /// decoded by the platform (HEIC too), turned upright by its EXIF orientation, flattened onto
   /// white, capped at 4000 px on the long side and written as PNG (lossless) to [outputPath].
