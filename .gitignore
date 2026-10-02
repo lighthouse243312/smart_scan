@@ -56,3 +56,9 @@ app.*.map.json
 # locally from the official OpenCV 4.10.0 release, not part of the app's own source. Must be
 # present at ios/Frameworks/opencv2.framework/ for local builds, but never committed.
 /ios/Frameworks/opencv2.framework/
+
+# ML: real-photo data, labels, previews and run artefacts stay local (large)
+/ml/real/worksheets/
+/ml/real/pseudo/
+/ml/preview/
+/ml/*_ckpt.pt
