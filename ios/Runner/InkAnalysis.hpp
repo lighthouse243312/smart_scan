@@ -3389,10 +3389,366 @@ inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, 
         cv::GaussianBlur(bright, bright, cv::Size(0, 0), 8);
         cv::Mat protect;
         cv::dilate(painted | restoredAll, protect, cv::Mat::ones(3, 3, CV_8U));
+        // print the mask is sure of (PenComponentVote settles it by the ink's own colour) is not
+        // stray either: a printed blank "_" under a pen letter has no untouched twin on a
+        // worksheet, since every blank got written on
+        {
+            cv::Mat hwRim;
+            cv::dilate(handwriting, hwRim, cv::Mat::ones(3, 3, CV_8U));
+            protect |= print & ~hwRim;
+        }
         RemoveStrayInk(dst, erasedAll, handwriting, protect, bright, k);
     }
 #endif
     return dst;
+}
+
+// ---------------------------------------------------------------- PenComponentVote
+//
+// Final per-ink-component vote over the detectors' layers, by the ink's own colour against the
+// local print colour — no pen hue assumed, so a page with two pens (a purple answer pen and a blue
+// marking pen) is handled like one with a single pen. Mirrors PenComponentVote.kt (same steps,
+// same constants).
+//
+// Measured on a real worksheet (full resolution, 3x3 chroma): printed glyphs deviate ≤ 0.016 from
+// the print colour with 0% of their pixels past kVotePenDev; pen strokes deviate 0.09-0.14 with
+// 85-100% past it. The layout heuristics upstream can get whole lines wrong (a printed word on a
+// line of handwriting marked pen, pen letters on a printed line marked print); this settles them:
+//  - pen-coloured component: all of it is handwriting (a stroke that does not touch print is
+//    erased whole), except printed underscores/rules fused into it;
+//  - neutral component: print when it is a picture, a thin rule, toner-dark, or the model does not
+//    see handwriting in it (neutral handwriting — black ballpoint — is left to the detectors);
+//  - mixed (pen touching print): printed rules are taken out, the pieces left are judged whole by
+//    their colour, the rest pixel by pixel by the nearer confident colour.
+
+// Chroma distance from the local print colour past which a pixel is pen-coloured...
+constexpr double kVotePenDev = 0.03;
+// ...and below which it is confidently print-coloured.
+constexpr double kVoteNeutralDev = 0.015;
+// A thin horizontal run is a printed rule when enough of its measurable pixels are neutral...
+constexpr int kVoteRuleMinNeutral = 10;
+constexpr double kVoteRuleNeutralShare = 0.08;
+// ...or when it is shaped like one (see VoteRuleShaped).
+constexpr double kVoteRuleMaxWobble = 0.7;
+constexpr double kVoteRuleMaxThick = 0.45;
+// A neutral component with less than this share of measurable (unclipped) ink is toner print.
+constexpr float kVoteClippedShare = 0.25f;
+
+/// A printed rule by shape: long, straight (its centre line within kVoteRuleMaxWobble px RMS of a
+/// fitted line) and thin. Measured: printed rules 0.23-0.55 px RMS and ≈ k/3 thick; a pen
+/// strike-through or hand-drawn underline 0.7-1.1 px and ≈ k/1.7 thick.
+inline bool VoteRuleShaped(const std::vector<int> &top, const std::vector<int> &bot, int minLen, int k) {
+    if (top.empty()) return false;
+    int n = 0; double sx = 0, sy = 0, sxx = 0, sxy = 0, thick = 0;
+    for (size_t c = 0; c < top.size(); c++) {
+        if (bot[c] < 0) continue;
+        const double cy = (top[c] + bot[c]) / 2.0;
+        n++; sx += c; sy += cy; sxx += (double)c * c; sxy += c * cy; thick += bot[c] - top[c] + 1;
+    }
+    if (n < minLen) return false;
+    const double den = n * sxx - sx * sx;
+    const double a = den != 0 ? (n * sxy - sx * sy) / den : 0;
+    const double b = (sy - a * sx) / n;
+    double sq = 0;
+    for (size_t c = 0; c < top.size(); c++) {
+        if (bot[c] < 0) continue;
+        const double r = (top[c] + bot[c]) / 2.0 - (a * c + b); sq += r * r;
+    }
+    return std::sqrt(sq / n) <= kVoteRuleMaxWobble && thick / n <= kVoteRuleMaxThick * k;
+}
+
+/// Updates handwriting, print and overlap (CV_8UC1, 255 = set, src's size) in place. modelHw: the
+/// segmentation model's handwriting probability (CV_32F, src's size), or empty.
+inline void PenComponentVote(const cv::Mat &src, cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap, const cv::Mat &modelHw) {
+    const int W = src.cols, H = src.rows;
+    const int k = StrokeUnit(src);
+    const bool haveModel = !modelHw.empty() && modelHw.size() == src.size() && modelHw.type() == CV_32F;
+
+    // optical density against the paper (as ComputeOpticalDensity estimates it), then the local ink
+    // chroma (OD_B, OD_G, OD_R)/sum over a 3x3 window of unclipped ink
+    cv::Mat mean, chroma[3], ink, valid, mag;
+    {
+        cv::Mat small, paper, od;
+        cv::resize(src, small, cv::Size(), 0.125, 0.125, cv::INTER_AREA);
+        cv::medianBlur(small, small, 15);
+        cv::dilate(small, small, cv::Mat::ones(9, 9, CV_8U));
+        cv::resize(small, paper, src.size(), 0, 0, cv::INTER_LINEAR);
+        paper.convertTo(paper, CV_32FC3);
+        cv::GaussianBlur(paper, paper, cv::Size(0, 0), 8);
+        paper += cv::Scalar(1, 1, 1);
+        src.convertTo(od, CV_32FC3);
+        od += cv::Scalar(1, 1, 1);
+        cv::divide(od, paper, od);
+        paper.release();
+        cv::min(od, cv::Scalar(1, 1, 1), od);
+        cv::max(od, cv::Scalar(1e-3, 1e-3, 1e-3), od);
+        cv::log(od, od);
+        od *= -1.0;
+        cv::Mat planes[3];
+        cv::split(od, planes);
+        od.release();
+        mean = (planes[0] + planes[1] + planes[2]) / 3.0;
+        cv::Mat lo, hi, wk;
+        cv::threshold(mean, lo, kInkOD, 1.0, cv::THRESH_BINARY);
+        cv::threshold(mean, hi, kClippedOD, 1.0, cv::THRESH_BINARY_INV);
+        wk = lo.mul(hi);
+        cv::Mat sums[3];
+        for (int c = 0; c < 3; c++) {
+            cv::boxFilter(planes[c].mul(wk), sums[c], -1, cv::Size(3, 3));
+            planes[c].release();
+        }
+        cv::Mat sw;
+        cv::boxFilter(wk, sw, -1, cv::Size(3, 3));
+        cv::Mat total = sums[0] + sums[1] + sums[2] + 1e-6;
+        for (int c = 0; c < 3; c++) cv::divide(sums[c], total, chroma[c]);
+        ink = mean > kInkOD;
+        valid = (sw > 0.2) & ink;
+    }
+
+    // print colour per page region: per-cell median chroma of confident, dark print ink
+    {
+        const int bins = 1000;
+        cv::Mat sel = valid & print & ~handwriting & (mean > 0.5);
+        const int cell = std::max(64, std::max(W, H) / 12);
+        const int gh = (H + cell - 1) / cell, gw = (W + cell - 1) / cell;
+        std::vector<int> hist((size_t)gh * gw * 3 * bins, 0), global(3 * bins, 0), count((size_t)gh * gw, 0);
+        for (int y = 0; y < H; y++) {
+            const uchar *sp = sel.ptr<uchar>(y);
+            const float *cp[3] = {chroma[0].ptr<float>(y), chroma[1].ptr<float>(y), chroma[2].ptr<float>(y)};
+            const int base = (y / cell) * gw;
+            for (int x = 0; x < W; x++) {
+                if (!sp[x]) continue;
+                const int ci = base + x / cell;
+                count[ci]++;
+                for (int c = 0; c < 3; c++) {
+                    const int b = std::min(bins - 1, std::max(0, (int)(cp[c][x] * bins)));
+                    hist[((size_t)ci * 3 + c) * bins + b]++; global[c * bins + b]++;
+                }
+            }
+        }
+        auto median = [&](const int *hs) {
+            long total = 0; for (int i = 0; i < bins; i++) total += hs[i];
+            if (total == 0) return 1.0f / 3;
+            long acc = 0;
+            for (int i = 0; i < bins; i++) { acc += hs[i]; if (acc * 2 >= total) return (i + 0.5f) / bins; }
+            return 1.0f / 3;
+        };
+        float g[3];
+        for (int c = 0; c < 3; c++) g[c] = median(&global[c * bins]);
+        mag = cv::Mat::zeros(H, W, CV_32F);
+        for (int c = 0; c < 3; c++) {
+            cv::Mat grid(gh, gw, CV_32F);
+            for (int i = 0; i < gh * gw; i++)
+                grid.at<float>(i / gw, i % gw) = count[i] >= 300 ? median(&hist[((size_t)i * 3 + c) * bins]) : g[c];
+            cv::GaussianBlur(grid, grid, cv::Size(0, 0), 1.0);
+            cv::Mat ref, d;
+            cv::resize(grid, ref, src.size(), 0, 0, cv::INTER_LINEAR);
+            cv::subtract(chroma[c], ref, d);
+            mag += d.mul(d);
+            chroma[c].release();
+        }
+        cv::sqrt(mag, mag);
+    }
+
+    cv::Mat penSeed = (mag > kVotePenDev) & valid;
+    cv::Mat neutSeed = (mag < kVoteNeutralDev) & valid;
+    mag.release();
+    // each mixed pixel goes with the nearer confident colour
+    cv::Mat penSide;
+    {
+        cv::Mat dPen, dNeu;
+        cv::distanceTransform(~penSeed, dPen, cv::DIST_L2, 3);
+        cv::distanceTransform(~neutSeed, dNeu, cv::DIST_L2, 3);
+        cv::compare(dPen, dNeu, penSide, cv::CMP_LT);
+    }
+    // printed rules / blank underscores fused with pen strokes: thin horizontal runs, decided per
+    // run — a printed rule shows neutral rims somewhere along it (its core is usually clipped, and
+    // where letters sit on it the rims take their colour), or is straight and thin; a pen stroke
+    // along the line (a strike-through, an underline) is pen-coloured wherever its colour can be
+    // measured, and wobbles
+    cv::Mat rule, ruleUnder;
+    {
+        cv::Mat runs, thick, segLabels, segStats, segCent;
+        cv::morphologyEx(ink, runs, cv::MORPH_OPEN, cv::Mat::ones(1, 2 * k + 1, CV_8U));
+        cv::morphologyEx(runs, thick, cv::MORPH_OPEN, cv::Mat::ones(k | 1, 1, CV_8U));
+        cv::dilate(thick, thick, cv::Mat::ones(3, 3, CV_8U));
+        runs &= ~thick;
+        const int segs = cv::connectedComponentsWithStats(runs, segLabels, segStats, segCent, 8, CV_32S);
+        std::vector<int> measured(segs, 0), neutral(segs, 0);
+        const int minLen = 6 * k;
+        std::vector<std::vector<int>> top(segs), bot(segs);
+        for (int l = 1; l < segs; l++) {
+            const int sw = segStats.at<int>(l, cv::CC_STAT_WIDTH);
+            if (sw >= minLen) { top[l].assign(sw, INT_MAX); bot[l].assign(sw, -1); }
+        }
+        for (int y = 0; y < H; y++) {
+            const int *lp = segLabels.ptr<int>(y);
+            const uchar *vp = valid.ptr<uchar>(y), *np = neutSeed.ptr<uchar>(y);
+            for (int x = 0; x < W; x++) {
+                const int l = lp[x]; if (!l) continue;
+                if (vp[x]) measured[l]++;
+                if (np[x]) neutral[l]++;
+                if (top[l].empty()) continue;
+                const int c = x - segStats.at<int>(l, cv::CC_STAT_LEFT);
+                top[l][c] = std::min(top[l][c], y); bot[l][c] = std::max(bot[l][c], y);
+            }
+        }
+        std::vector<char> printed(segs, 0);
+        for (int l = 1; l < segs; l++)
+            printed[l] = (neutral[l] >= kVoteRuleMinNeutral && neutral[l] >= kVoteRuleNeutralShare * measured[l]) ||
+                         VoteRuleShaped(top[l], bot[l], minLen, k);
+        rule = cv::Mat::zeros(H, W, CV_8U);
+        for (int y = 0; y < H; y++) {
+            const int *lp = segLabels.ptr<int>(y); uchar *rp = rule.ptr<uchar>(y);
+            for (int x = 0; x < W; x++) if (printed[lp[x]]) rp[x] = 255;
+        }
+        // the rule runs on under a pen stroke crossing it: close its gaps along the row (where there
+        // is ink); the part under the pen is erased with it and restored as print
+        cv::morphologyEx(rule, rule, cv::MORPH_CLOSE, cv::Mat::ones(1, 2 * k + 1, CV_8U));
+        cv::dilate(rule, rule, cv::Mat::ones(3, 1, CV_8U));
+        rule &= ink;
+        ruleUnder = rule & penSeed;
+        rule &= ~penSeed;
+        penSide &= ~rule;
+    }
+
+    cv::Mat labels, stats, centroids;
+    const int n = cv::connectedComponentsWithStats(ink, labels, stats, centroids, 8, CV_32S);
+    auto S = [&](int l, int f) { return stats.at<int>(l, f); };
+    std::vector<int> cntV(n, 0), cntP(n, 0), cntN(n, 0), cntNear(n, 0);
+    std::vector<double> sumMh(n, 0);
+    for (int y = 0; y < H; y++) {
+        const int *lp = labels.ptr<int>(y);
+        const uchar *vp = valid.ptr<uchar>(y), *pp = penSeed.ptr<uchar>(y), *np = neutSeed.ptr<uchar>(y), *sp = penSide.ptr<uchar>(y);
+        const float *mp = haveModel ? modelHw.ptr<float>(y) : nullptr;
+        for (int x = 0; x < W; x++) {
+            const int l = lp[x]; if (!l) continue;
+            if (sp[x]) cntNear[l]++;
+            if (vp[x]) cntV[l]++;
+            if (pp[x]) cntP[l]++;
+            if (np[x]) cntN[l]++;
+            if (mp) sumMh[l] += mp[x];
+        }
+    }
+    // 0 keep, 1 pen, 2 print, 3 mixed, 4 big (only its pen pieces are handwriting)
+    std::vector<char> cat(n, 0);
+    std::vector<float> fills(n, 0), ps(n, 0);
+    for (int l = 1; l < n; l++) {
+        const int area = S(l, cv::CC_STAT_AREA);
+        if (cntV[l] < 10) {
+            // too small to vote on (a printed colon, comma, dot): print when every measurable pixel
+            // is print-coloured
+            if (cntV[l] >= 3 && cntN[l] >= cntV[l] && area <= 4 * k * k) cat[l] = 2;
+            continue;
+        }
+        const int cw = S(l, cv::CC_STAT_WIDTH), ch = S(l, cv::CC_STAT_HEIGHT);
+        const float p = (float)cntP[l] / cntV[l];
+        const bool big = cw > 12 * k && ch > 12 * k;
+        const float fill = (float)area / std::max(1, cw * ch);
+        const bool thinRule = ch <= 2 * k + 1 && cw >= 6 * ch;
+        const double mh = sumMh[l] / std::max(1, area);
+        const float neutShare = (float)cntN[l] / cntV[l];
+        const float nearPen = (float)cntNear[l] / std::max(1, area);
+        fills[l] = fill; ps[l] = p;
+        // large and neutral, or large and solid (handwriting strokes are sparse): a picture or a
+        // printed frame — kept, except pen pieces written into it (a signature touching the header box)
+        if (big && (p < 0.5f || fill > 0.3f)) cat[l] = 4;
+        // whole-component pen only when nothing in it is confidently print-coloured: a bold printed
+        // hint letter fused with the pen letters beside it is clipped (colourless) but for its rims
+        else if (p >= 0.9f && cntN[l] <= std::max(3.0f, 0.02f * cntV[l])) cat[l] = 1;
+        // ...or its few neutral pixels are rims scattered along the pen (low resolution and JPEG
+        // soften a thin stroke's colour: "Sai: 10" in red, 6% neutral, 88% near)
+        else if (p > 0.05f && neutShare <= 0.1f && nearPen >= 0.85f) cat[l] = 1;
+        // ...or the colour is too weak to decide but the model is sure: a dark pen at low resolution
+        // (tick 0.90, underline 0.90; bold print fused with pen ≤ 0.56)
+        else if (p > 0.05f && mh >= 0.8 && neutShare <= 0.4f) cat[l] = 1;
+        // neutral: print when a rule, when the model sees no handwriting in it, or when toner-dark —
+        // clipped almost everywhere with every measurable rim pixel print-coloured (a bold printed
+        // letter: 2% measurable, all neutral; a dark pen stroke clipped as hard still shows hue)
+        else if (p <= 0.05f && (thinRule || mh < 0.35 ||
+                                (cntV[l] < kVoteClippedShare * area && cntN[l] >= 0.9f * cntV[l]))) cat[l] = 2;
+        else if (p <= 0.05f) cat[l] = 0;
+        else cat[l] = 3;
+    }
+    // inside a picture (big and dense — not a sparse table or box frame): its small parts that are
+    // not pen-coloured (eyes, cheeks) are the picture, whatever the model thinks
+    std::vector<int> pictures;
+    for (int b = 1; b < n; b++) if (cat[b] == 4 && fills[b] >= 0.25f) pictures.push_back(b);
+    for (int b : pictures) {
+        const int bx = S(b, cv::CC_STAT_LEFT), by = S(b, cv::CC_STAT_TOP), bw = S(b, cv::CC_STAT_WIDTH), bh = S(b, cv::CC_STAT_HEIGHT);
+        for (int l = 1; l < n; l++) {
+            if (l == b || (cat[l] != 0 && cat[l] != 3)) continue;
+            const int lx = S(l, cv::CC_STAT_LEFT), ly = S(l, cv::CC_STAT_TOP);
+            if (lx < bx || ly < by || lx + S(l, cv::CC_STAT_WIDTH) > bx + bw || ly + S(l, cv::CC_STAT_HEIGHT) > by + bh) continue;
+            if (cntV[l] == 0 || ps[l] < 0.5f) cat[l] = 2;
+        }
+    }
+    // pieces: a pen-touched component with its printed rules taken out falls apart into the strokes
+    // written on the rule (letters, a tick); each piece is judged by its own colour, whole —
+    // per-pixel nearest colour is noisy on a dark pen clipped all but its rims, and the upstream
+    // "print under the pen" guess does not apply to a piece that is all pen
+    cv::Mat pieces;
+    std::vector<char> penPiece, neutralPiece, halfPenPiece;
+    {
+        cv::Mat inPen = cv::Mat::zeros(H, W, CV_8U);
+        for (int y = 0; y < H; y++) {
+            const int *lp = labels.ptr<int>(y); uchar *ip = inPen.ptr<uchar>(y);
+            for (int x = 0; x < W; x++) { const int c = cat[lp[x]]; if (c == 1 || c == 3 || c == 4) ip[x] = 255; }
+        }
+        inPen &= ink & ~rule;
+        const int np_ = cv::connectedComponents(inPen, pieces, 8, CV_32S);
+        std::vector<int> pv(np_, 0), pp(np_, 0), pn(np_, 0), area(np_, 0), nearPen(np_, 0);
+        for (int y = 0; y < H; y++) {
+            const int *lp = pieces.ptr<int>(y);
+            const uchar *vp = valid.ptr<uchar>(y), *ps_ = penSeed.ptr<uchar>(y), *ns = neutSeed.ptr<uchar>(y), *sp = penSide.ptr<uchar>(y);
+            for (int x = 0; x < W; x++) {
+                const int l = lp[x]; if (!l) continue;
+                area[l]++;
+                if (sp[x]) nearPen[l]++;
+                if (vp[x]) pv[l]++;
+                if (ps_[x]) pp[l]++;
+                if (ns[x]) pn[l]++;
+            }
+        }
+        // pen: mostly pen-coloured, and either (almost) no print-coloured pixel at all, or its few
+        // neutral pixels are rims scattered along the pen (≥ 90% of the piece is nearer pen colour)
+        // — a printed word fused with a pen underline has its neutral pixels in whole letters
+        // (measured 71%), a dark pen's letters 96-100%
+        penPiece.assign(np_, 0); neutralPiece.assign(np_, 0); halfPenPiece.assign(np_, 0);
+        for (int l = 1; l < np_; l++) {
+            penPiece[l] = pv[l] >= 5 && pp[l] >= 0.6f * pv[l] &&
+                          (pn[l] <= 3 || (nearPen[l] >= 0.9f * area[l] && pn[l] <= 0.1f * pv[l]));
+            neutralPiece[l] = pv[l] >= 5 && pn[l] >= 0.6f * pv[l] && pp[l] <= 0.1f * pv[l];
+            halfPenPiece[l] = pv[l] >= 5 && pp[l] >= 0.5f * pv[l];
+        }
+    }
+    for (int y = 0; y < H; y++) {
+        const int *lp = labels.ptr<int>(y), *pc = pieces.ptr<int>(y);
+        const uchar *sp = penSide.ptr<uchar>(y), *rp = rule.ptr<uchar>(y), *up = ruleUnder.ptr<uchar>(y);
+        uchar *hp = handwriting.ptr<uchar>(y), *prp = print.ptr<uchar>(y), *op = overlap.ptr<uchar>(y);
+        for (int x = 0; x < W; x++) {
+            const int c = cat[lp[x]]; if (!c) continue;
+            const int piece = pc[x];
+            // a printed rule under the pen: erased with it, restored as print
+            if (c != 2 && up[x]) { hp[x] = 255; prp[x] = 255; op[x] = 255; }
+            else if (penPiece[piece]) { hp[x] = 255; prp[x] = 0; op[x] = 0; }
+            // big: a mostly-pen piece still fused with the frame goes pixel by pixel, the rest of the
+            // picture/frame is print
+            else if (c == 4 && halfPenPiece[piece] && sp[x]) { hp[x] = 255; prp[x] = 0; op[x] = 0; }
+            else if (c == 4) { hp[x] = 0; prp[x] = 255; op[x] = 0; }
+            else if (c == 3 && neutralPiece[piece]) { hp[x] = 0; prp[x] = 255; }
+            else if (c == 2 || (c == 1 && rp[x])) { hp[x] = 0; prp[x] = 255; op[x] = 0; }
+            else if (c == 1) { hp[x] = 255; prp[x] = 0; op[x] = 0; }
+            else if (sp[x]) { hp[x] = 255; if (!op[x]) prp[x] = 0; }
+            else { hp[x] = 0; prp[x] = 255; }
+        }
+    }
+    // faint marks inside a picture (pink cheeks below the ink threshold) are the picture too
+    for (int b : pictures) {
+        const cv::Rect r(S(b, cv::CC_STAT_LEFT), S(b, cv::CC_STAT_TOP), S(b, cv::CC_STAT_WIDTH), S(b, cv::CC_STAT_HEIGHT));
+        cv::Mat hwRoi = handwriting(r);
+        hwRoi.setTo(0, labels(r) == 0);
+    }
 }
 
 }  // namespace inkanalysis
