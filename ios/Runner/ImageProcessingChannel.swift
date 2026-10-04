@@ -86,6 +86,17 @@ enum ImageProcessingChannel {
                 try ImageProcessingOpenCV.eraseWithMask(atPath: inputPath, analysisPath: analysisPath, maskPath: maskPath, outputPath: outputPath)
                 return ["outputPath": outputPath]
 
+            case "eraseHandwriting":
+                let inputPath = try requireString(args, "inputPath")
+                let analysisPath = try requireString(args, "analysisPath")
+                let maskPath = try requireString(args, "maskPath")
+                let outputPath = try requireString(args, "outputPath")
+                let useModel = (args["useModel"] as? Bool) ?? true
+                let threshold = (args["threshold"] as? Double) ?? 0.5
+                let colorDelta = (args["colorDelta"] as? Double) ?? 0.05
+                let passes = try ImageProcessingOpenCV.eraseHandwriting(atPath: inputPath, analysisPath: analysisPath, maskPath: maskPath, outputPath: outputPath, useModel: useModel, threshold: threshold, colorDelta: colorDelta)
+                return ["outputPath": outputPath, "passes": passes]
+
             case "importImage":
                 let inputPath = try requireString(args, "inputPath")
                 let outputPath = try requireString(args, "outputPath")

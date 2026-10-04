@@ -22,14 +22,16 @@ import kotlin.math.roundToInt
  *    a surviving rule, bridged across the pen strokes crossing them
  * 3. pen the eraser left: bits of mostly-erased writing, and chromatic ink, off the print lines
  *
- * Works on primitive arrays (one byte / float per pixel) — the per-component statistics are
- * single passes over each component's pixel list.
+ * Works on primitive arrays (one byte per pixel) — the per-component statistics are single passes
+ * over each component's pixel list. The app's Java heap is capped (512 MB with largeHeap) whatever
+ * the device's RAM, so full-resolution arrays are kept to bytes, float images stay in native Mats,
+ * and each stage's temporaries live in their own function so they are collectable once it returns.
  */
 object PrintRestore {
 
+    /** Connected components of [mask]; [start]/[pix] list each foreground component's pixels. */
     private class Components(mask: ByteArray, val w: Int, val h: Int) {
         val n: Int
-        val labels: IntArray
         val bx: IntArray; val by: IntArray; val bw: IntArray; val bh: IntArray; val area: IntArray
         val start: IntArray
         val pix: IntArray
@@ -38,17 +40,23 @@ object PrintRestore {
             val m = Mat(h, w, CvType.CV_8U); m.put(0, 0, mask)
             val lab = Mat(); val stats = Mat(); val cents = Mat()
             n = Imgproc.connectedComponentsWithStats(m, lab, stats, cents, 8, CvType.CV_32S)
-            labels = IntArray(w * h); lab.get(0, 0, labels)
-            val st = IntArray(n * 5); stats.get(0, 0, st)
+            m.release(); cents.release()
+            val st = IntArray(n * 5); stats.get(0, 0, st); stats.release()
             bx = IntArray(n) { st[it * 5] }; by = IntArray(n) { st[it * 5 + 1] }
             bw = IntArray(n) { st[it * 5 + 2] }; bh = IntArray(n) { st[it * 5 + 3] }; area = IntArray(n) { st[it * 5 + 4] }
+            // labels read a row at a time; the background (label 0) is never queried, so not listed
+            val row = IntArray(w)
             start = IntArray(n + 1)
-            for (l in labels) start[l + 1]++
+            for (y in 0 until h) { lab.get(y, 0, row); for (l in row) if (l > 0) start[l + 1]++ }
             for (i in 0 until n) start[i + 1] += start[i]
-            pix = IntArray(labels.size)
+            pix = IntArray(start[n])
             val fill = start.copyOf(n)
-            for (i in labels.indices) pix[fill[labels[i]]++] = i
-            m.release(); lab.release(); stats.release(); cents.release()
+            for (y in 0 until h) {
+                lab.get(y, 0, row)
+                val base = y * w
+                for (x in 0 until w) { val l = row[x]; if (l > 0) pix[fill[l]++] = base + x }
+            }
+            lab.release()
         }
 
         fun mean(i: Int, m: ByteArray): Double {
@@ -57,14 +65,14 @@ object PrintRestore {
             return c.toDouble() / max(1, start[i + 1] - start[i])
         }
 
-        fun meanF(i: Int, f: FloatArray): Double {
+        inline fun meanOf(i: Int, f: (Int) -> Float): Double {
             var s = 0.0
-            for (j in start[i] until start[i + 1]) s += f[pix[j]]
+            for (j in start[i] until start[i + 1]) s += f(pix[j])
             return s / max(1, start[i + 1] - start[i])
         }
 
-        fun medianF(i: Int, f: FloatArray): Double {
-            val v = FloatArray(start[i + 1] - start[i]) { f[pix[start[i] + it]] }
+        inline fun medianOf(i: Int, f: (Int) -> Float): Double {
+            val v = FloatArray(start[i + 1] - start[i]) { f(pix[start[i] + it]) }
             return median(v)
         }
 
@@ -73,7 +81,24 @@ object PrintRestore {
         }
     }
 
+    /**
+     * The page's per-pixel Lab, one unsigned byte each — exactly what the 8-bit conversion gives:
+     * darkness (255 - L) of the target [dN] and of the erased page [dE], and the normalized
+     * original's a / b (stored + 128).
+     */
+    private class Page(val w: Int, val h: Int, val k: Int, val dN: ByteArray, val dE: ByteArray, val aN: ByteArray, val bN: ByteArray) {
+        val n = w * h
+        fun dN(p: Int): Int = dN[p].toInt() and 0xff
+        fun dE(p: Int): Int = dE[p].toInt() and 0xff
+        fun a(p: Int): Float = (aN[p].toInt() and 0xff) - 128f
+        fun b(p: Int): Float = (bN[p].toInt() and 0xff) - 128f
+        fun purple(p: Int): Float = a(p) - b(p)
+    }
+
     private data class Box(val x: Float, val y: Float, val w: Float, val h: Float)
+
+    /** The printed text the eraser left: glyph height, glyph pixels, glyph / bar boxes, and mostly-erased writing. */
+    private class Text(val gh: Int, val core: ByteArray, val gBox: List<Box>, val bBox: List<Box>, val residue: ByteArray)
 
     private const val ON: Byte = 255.toByte()
 
@@ -91,18 +116,18 @@ object PrintRestore {
         return v[lo] + (v[hi] - v[lo]) * (idx - lo)
     }
 
-    private fun values(f: FloatArray, m: ByteArray): FloatArray {
+    private inline fun values(m: ByteArray, f: (Int) -> Float): FloatArray {
         var c = 0
         for (b in m) if (b.toInt() != 0) c++
         val out = FloatArray(c); var j = 0
-        for (i in m.indices) if (m[i].toInt() != 0) out[j++] = f[i]
+        for (i in m.indices) if (m[i].toInt() != 0) out[j++] = f(i)
         return out
     }
 
     private fun and(vararg ms: ByteArray): ByteArray = ByteArray(ms[0].size) { i -> if (ms.all { it[i].toInt() != 0 }) ON else 0 }
     private fun or(a: ByteArray, b: ByteArray) = ByteArray(a.size) { if (a[it].toInt() != 0 || b[it].toInt() != 0) ON else 0 }
     private fun not(a: ByteArray) = ByteArray(a.size) { if (a[it].toInt() != 0) 0 else ON }
-    private fun where(n: Int, pred: (Int) -> Boolean) = ByteArray(n) { if (pred(it)) ON else 0 }
+    private inline fun where(n: Int, pred: (Int) -> Boolean) = ByteArray(n) { if (pred(it)) ON else 0 }
 
     private fun morph(m: ByteArray, w: Int, h: Int, op: Int, kw: Int, kh: Int, ellipse: Boolean = false): ByteArray {
         val src = Mat(h, w, CvType.CV_8U); src.put(0, 0, m)
@@ -116,11 +141,31 @@ object PrintRestore {
 
     private fun dilate(m: ByteArray, w: Int, h: Int, kw: Int, kh: Int, ellipse: Boolean = false) = morph(m, w, h, -1, kw, kh, ellipse)
 
-    private fun blur(f: FloatArray, w: Int, h: Int, k: Int): FloatArray {
-        val src = Mat(h, w, CvType.CV_32F); src.put(0, 0, f)
+    /** Box blur ([k] x [k]) of [value] per pixel — filled a row at a time, the image stays native. */
+    private inline fun blurred(w: Int, h: Int, k: Int, value: (Int) -> Float): Mat {
+        val src = Mat(h, w, CvType.CV_32F)
+        val row = FloatArray(w)
+        for (y in 0 until h) {
+            val base = y * w
+            for (x in 0 until w) row[x] = value(base + x)
+            src.put(y, 0, row)
+        }
         val dst = Mat(); Imgproc.blur(src, dst, Size(k.toDouble(), k.toDouble()))
-        val out = FloatArray(w * h); dst.get(0, 0, out)
-        src.release(); dst.release()
+        src.release()
+        return dst
+    }
+
+    /** num / max(den, 1e-3) per pixel; releases both. */
+    private fun ratio(num: Mat, den: Mat): FloatArray {
+        val w = num.cols()
+        val out = FloatArray(w * num.rows()); num.get(0, 0, out)
+        val row = FloatArray(w)
+        for (y in 0 until den.rows()) {
+            den.get(y, 0, row)
+            val base = y * w
+            for (x in 0 until w) out[base + x] = out[base + x] / max(row[x], 1e-3f)
+        }
+        num.release(); den.release()
         return out
     }
 
@@ -143,15 +188,23 @@ object PrintRestore {
         return out
     }
 
-    /** darkness (255 - L), a and b, each as one float per pixel. */
-    private fun lab(bgr: Mat): Triple<FloatArray, FloatArray, FloatArray> {
-        val l = Mat(); Imgproc.cvtColor(bgr, l, Imgproc.COLOR_BGR2Lab)
-        val n = (l.total()).toInt()
-        val raw = ByteArray(n * 3); l.get(0, 0, raw); l.release()
-        val d = FloatArray(n) { 255f - (raw[it * 3].toInt() and 0xff) }
-        val a = FloatArray(n) { (raw[it * 3 + 1].toInt() and 0xff) - 128f }
-        val b = FloatArray(n) { (raw[it * 3 + 2].toInt() and 0xff) - 128f }
-        return Triple(d, a, b)
+    /** The given Lab channels of [bgr], one unsigned byte per pixel. */
+    private fun labChannels(bgr: Mat, vararg channels: Int): List<ByteArray> {
+        val lab = Mat(); Imgproc.cvtColor(bgr, lab, Imgproc.COLOR_BGR2Lab)
+        val c = Mat()
+        val out = channels.map { ch ->
+            Core.extractChannel(lab, c, ch)
+            ByteArray(c.total().toInt()).also { c.get(0, 0, it) }
+        }
+        lab.release(); c.release()
+        return out
+    }
+
+    /** darkness (255 - L) per pixel. */
+    private fun darkness(bgr: Mat): ByteArray {
+        val l = labChannels(bgr, 0)[0]
+        for (i in l.indices) l[i] = (255 - (l[i].toInt() and 0xff)).toByte()
+        return l
     }
 
     /**
@@ -164,24 +217,49 @@ object PrintRestore {
         val k = max(1, (max(w0, h0) / 1280.0).roundToInt())
         val o = if (original.size() == erased.size()) original else Mat().also { Imgproc.resize(original, it, erased.size(), 0.0, 0.0, Imgproc.INTER_AREA) }
         val c = normalize(o)
-        val (dN, _, _) = lab(target)
-        val (_, aN, bN) = lab(c)
-        val (dE, _, _) = lab(erased)
+        val (aN, bN) = labChannels(c, 1, 2)
         c.release(); if (o !== original) o.release()
+        val pg = Page(w0, h0, k, darkness(target), darkness(erased), aN, bN)
         val paperE = paper(erased, 9, 21)
-        val hwRaw = ByteArray(n0); handwriting.get(0, 0, hwRaw)
-        val prRaw = ByteArray(n0); print.get(0, 0, prRaw)
-        val hwMask = where(n0) { hwRaw[it].toInt() != 0 }
-        val printMask = where(n0) { (prRaw[it].toInt() and 0xff) > 127 }
-        val purple = FloatArray(n0) { aN[it] - bN[it] }
-        val inkN = where(n0) { dN[it] > 40 }
-        val inkE = where(n0) { dE[it] > 40 }
-        val erasedM = where(n0) { inkN[it].toInt() != 0 && dE[it] < 0.35f * dN[it] }
-        val faded = where(n0) { inkN[it].toInt() != 0 && dE[it] < 0.6f * dN[it] }
+        val hwMask = ByteArray(n0).also { handwriting.get(0, 0, it); for (i in it.indices) if (it[i].toInt() != 0) it[i] = ON }
+        val printMask = ByteArray(n0).also { print.get(0, 0, it); for (i in it.indices) it[i] = if ((it[i].toInt() and 0xff) > 127) ON else 0 }
+        val inkN = where(n0) { pg.dN(it) > 40 }
+        val inkE = where(n0) { pg.dE(it) > 40 }
+        val erasedM = where(n0) { inkN[it].toInt() != 0 && pg.dE(it) < 0.35f * pg.dN(it) }
 
         val linesE = or(morph(inkE, w0, h0, Imgproc.MORPH_OPEN, 15 * k, 1), morph(inkE, w0, h0, Imgproc.MORPH_OPEN, 1, 15 * k))
-        val textE = and(inkE, not(dilate(linesE, w0, h0, 3, 3)))
-        val t = Components(textE, w0, h0)
+        val text = printedText(pg, inkE, linesE, inkN, erasedM)
+        val gh = text.gh
+
+        var band = dilate(text.core, w0, h0, 4 * gh, gh or 1)
+
+        // colour models — pen from what was erased, print from surviving glyphs
+        val dark70 = where(n0) { pg.dN(it) > 70 }
+        val penC = median(values(and(erasedM, dark70)) { pg.purple(it) })
+        val printC = median(values(and(text.core, dark70)) { pg.purple(it) })
+        val split = (penC + printC) / 2; val margin = 0.25 * abs(penC - printC)
+        val separable = abs(penC - printC) >= 4
+
+        val ruleGap = ruleGaps(pg, erasedM, linesE, split)
+
+        // ── print the eraser took ──
+        val a0 = median(values(and(text.core, dark70)) { pg.a(it) }); val b0 = median(values(and(text.core, dark70)) { pg.b(it) })
+        val restore = ByteArray(n0)
+        band = restorePrint(pg, text, inkN, ruleGap, hwMask, printMask, dark70, band, restore, a0, b0, printC, margin, split, separable)
+
+        // ── pen the eraser left ──
+        val residue = penLeft(pg, text, inkN, inkE, erasedM, dark70, linesE, ruleGap, band, restore, hwMask, printMask, a0, b0, separable)
+
+        compose(pg, target, erased, paperE, residue, restore, ruleGap, linesE, split)
+        paperE.release()
+    }
+
+    /** print colour distance of a pixel from the print's own (a0, b0). */
+    private fun cd(pg: Page, p: Int, a0: Double, b0: Double): Float = kotlin.math.hypot(pg.a(p) - a0, pg.b(p) - b0).toFloat()
+
+    private fun printedText(pg: Page, inkE: ByteArray, linesE: ByteArray, inkN: ByteArray, erasedM: ByteArray): Text {
+        val w0 = pg.w; val h0 = pg.h; val n0 = pg.n; val k = pg.k
+        val t = Components(and(inkE, not(dilate(linesE, w0, h0, 3, 3))), w0, h0)
         val glyph = BooleanArray(t.n)
         val heights = ArrayList<Int>()
         for (i in 1 until t.n) {
@@ -191,25 +269,21 @@ object PrintRestore {
         val gh = if (heights.isEmpty()) 12 * k else heights.sorted()[heights.size / 2]
         // share of the original ink around each point the eraser took (tight window: a printed
         // word right beside an erased one stays intact; a stray pen bit sits in a cleared patch)
-        val win = (gh / 2) or 1
-        val ef = blur(FloatArray(n0) { if (erasedM[it].toInt() != 0) 1f else 0f }, w0, h0, win)
-        val inf = blur(FloatArray(n0) { if (inkN[it].toInt() != 0) 1f else 0f }, w0, h0, win)
-        val erasedRatio = FloatArray(n0) { ef[it] / max(inf[it], 1e-3f) }
+        val erasedShare = erasedShare(t, pg, inkN, erasedM, (gh / 2) or 1)
         val intact = BooleanArray(t.n)
-        for (i in 1 until t.n) { intact[i] = t.meanF(i, erasedRatio) < 0.5; glyph[i] = glyph[i] && intact[i] }
+        for (i in 1 until t.n) { intact[i] = erasedShare[i] < 0.5; glyph[i] = glyph[i] && intact[i] }
         // a printed line = several glyphs side by side on one row (dashes, dots count as members)
         val member = ByteArray(n0); var core = ByteArray(n0)
         for (i in 1 until t.n) {
             if (intact[i] && t.area[i] >= 4 * k * k) t.paint(i, member)
             if (glyph[i]) t.paint(i, core)
         }
-        val rw = Components(morph(member, w0, h0, Imgproc.MORPH_CLOSE, 2 * gh, 1), w0, h0)
-        val lineOk = BooleanArray(rw.n) { it > 0 && rw.bw[it] >= 6 * gh && rw.mean(it, core) > 0 }
+        val onLine = printLines(member, core, w0, h0, gh)
         val gBox = ArrayList<Box>()
         for (i in 1 until t.n) {
             if (!glyph[i]) continue
             var ok = false
-            for (j in t.start[i] until t.start[i + 1]) if (lineOk[rw.labels[t.pix[j]]]) { ok = true; break }
+            for (j in t.start[i] until t.start[i + 1]) if (onLine[t.pix[j]].toInt() != 0) { ok = true; break }
             if (ok) gBox.add(Box(t.bx[i].toFloat(), t.by[i].toFloat(), t.bw[i].toFloat(), t.bh[i].toFloat())) else glyph[i] = false
         }
         core = ByteArray(n0)
@@ -218,6 +292,55 @@ object PrintRestore {
         for (i in 1 until t.n)
             if (t.bw[i] <= 1.5 * gh && t.bw[i] >= 0.4 * gh && t.bh[i] <= max(2.0, 0.3 * gh))
                 bBox.add(Box(t.bx[i].toFloat(), t.by[i].toFloat(), t.bw[i].toFloat(), t.bh[i].toFloat()))
+        val residue = ByteArray(n0)
+        for (i in 1 until t.n) if (erasedShare[i] > 0.5) t.paint(i, residue)
+        return Text(gh, core, gBox, bBox, residue)
+    }
+
+    /** Each component's mean share of erased ink in the [win] window around its pixels. */
+    private fun erasedShare(t: Components, pg: Page, inkN: ByteArray, erasedM: ByteArray, win: Int): DoubleArray {
+        val ef = blurred(pg.w, pg.h, win) { if (erasedM[it].toInt() != 0) 1f else 0f }
+        val inf = blurred(pg.w, pg.h, win) { if (inkN[it].toInt() != 0) 1f else 0f }
+        val erasedRatio = ratio(ef, inf)
+        return DoubleArray(t.n) { if (it == 0) 0.0 else t.meanOf(it) { p -> erasedRatio[p] } }
+    }
+
+    /** Pixels of the printed lines: [member] runs closed along the row, with a glyph of [core] and wide enough. */
+    private fun printLines(member: ByteArray, core: ByteArray, w0: Int, h0: Int, gh: Int): ByteArray {
+        val rw = Components(morph(member, w0, h0, Imgproc.MORPH_CLOSE, 2 * gh, 1), w0, h0)
+        val out = ByteArray(w0 * h0)
+        for (i in 1 until rw.n) if (rw.bw[i] >= 6 * gh && rw.mean(i, core) > 0) rw.paint(i, out)
+        return out
+    }
+
+    /** ── rules the eraser took ── */
+    private fun ruleGaps(pg: Page, erasedM: ByteArray, linesE: ByteArray, split: Double): ByteArray {
+        val w0 = pg.w; val h0 = pg.h; val n0 = pg.n; val k = pg.k
+        val neutralN = where(n0) { pg.dN(it) > 18 && pg.purple(it) < split }
+        val footprint = dilate(erasedM, w0, h0, 7 * k, 7 * k, ellipse = true)
+        val missing = where(n0) { pg.dN(it) > 18 && pg.dE(it) < 0.5f * pg.dN(it) && footprint[it].toInt() != 0 }
+        val ruleGap = ByteArray(n0)
+        for (dir in 0..1) {
+            var run = morph(neutralN, w0, h0, Imgproc.MORPH_CLOSE, if (dir == 0) 7 * k else 1, if (dir == 0) 1 else 7 * k)
+            run = morph(run, w0, h0, Imgproc.MORPH_OPEN, if (dir == 0) 31 * k else 1, if (dir == 0) 1 else 31 * k)
+            val r = Components(run, w0, h0)
+            for (i in 1 until r.n) {
+                val thick = r.area[i].toDouble() / max(r.bw[i], r.bh[i])
+                // a real rule mostly survived the eraser and was only cut
+                if (thick <= 3 * k && r.mean(i, linesE) >= 0.3)
+                    for (j in r.start[i] until r.start[i + 1]) { val p = r.pix[j]; if (missing[p].toInt() != 0) ruleGap[p] = ON }
+            }
+        }
+        return and(ruleGap, not(linesE))
+    }
+
+    /** ── print the eraser took ── marks it in [restore]; returns the band grown by what was restored. */
+    private fun restorePrint(
+        pg: Page, text: Text, inkN: ByteArray, ruleGap: ByteArray, hwMask: ByteArray, printMask: ByteArray, dark70: ByteArray,
+        band0: ByteArray, restore: ByteArray, a0: Double, b0: Double, printC: Double, margin: Double, split: Double, separable: Boolean,
+    ): ByteArray {
+        val w0 = pg.w; val h0 = pg.h; val n0 = pg.n
+        val gh = text.gh; val gBox = text.gBox; val bBox = text.bBox
 
         fun onPrintLine(x: Int, y: Int, w: Int, h: Int): Boolean {
             val near = gBox.filter { it.x < x + w + 4 * gh && it.x + it.w > x - 4 * gh && abs(it.y + it.h / 2 - (y + h / 2.0)) < gh }
@@ -235,47 +358,18 @@ object PrintRestore {
             (a >= -1 && a <= up * gh) || (b >= -1 && b <= down * gh)
         }
 
-        var band = dilate(core, w0, h0, 4 * gh, gh or 1)
-        val tallBand = dilate(core, w0, h0, 2 * gh, (3 * gh) or 1)
-
-        // colour models — pen from what was erased, print from surviving glyphs
-        val dark70 = where(n0) { dN[it] > 70 }
-        val penC = median(values(purple, and(erasedM, dark70)))
-        val printC = median(values(purple, and(core, dark70)))
-        val split = (penC + printC) / 2; val margin = 0.25 * abs(penC - printC)
-        val separable = abs(penC - printC) >= 4
-
-        // ── rules the eraser took ──
-        val neutralN = where(n0) { dN[it] > 18 && purple[it] < split }
-        val footprint = dilate(erasedM, w0, h0, 7 * k, 7 * k, ellipse = true)
-        val missing = where(n0) { dN[it] > 18 && dE[it] < 0.5f * dN[it] && footprint[it].toInt() != 0 }
-        var ruleGap = ByteArray(n0)
-        for (dir in 0..1) {
-            var run = morph(neutralN, w0, h0, Imgproc.MORPH_CLOSE, if (dir == 0) 7 * k else 1, if (dir == 0) 1 else 7 * k)
-            run = morph(run, w0, h0, Imgproc.MORPH_OPEN, if (dir == 0) 31 * k else 1, if (dir == 0) 1 else 31 * k)
-            val r = Components(run, w0, h0)
-            for (i in 1 until r.n) {
-                val thick = r.area[i].toDouble() / max(r.bw[i], r.bh[i])
-                // a real rule mostly survived the eraser and was only cut
-                if (thick <= 3 * k && r.mean(i, linesE) >= 0.3)
-                    for (j in r.start[i] until r.start[i + 1]) { val p = r.pix[j]; if (missing[p].toInt() != 0) ruleGap[p] = ON }
-            }
-        }
-        ruleGap = and(ruleGap, not(linesE))
-
-        // ── print the eraser took ──
-        val a0 = median(values(aN, and(core, dark70))); val b0 = median(values(bN, and(core, dark70)))
-        val cdPx = FloatArray(n0) { kotlin.math.hypot(aN[it] - a0, bN[it] - b0).toFloat() }
-        val cdPrintT = percentile(values(cdPx, and(core, dark70)), 90.0)
+        var band = band0
+        val tallBand = dilate(text.core, w0, h0, 2 * gh, (3 * gh) or 1)
+        val cdPrintT = percentile(values(and(text.core, dark70)) { cd(pg, it, a0, b0) }, 90.0)
+        val faded = where(n0) { inkN[it].toInt() != 0 && pg.dE(it) < 0.6f * pg.dN(it) }
         val f = Components(and(faded, not(ruleGap)), w0, h0)
-        val restore = ByteArray(n0)
         val done = BooleanArray(f.n)
         repeat(3) {                              // a restored glyph extends the band
             for (i in 1 until f.n) {
                 if (done[i]) continue
                 val x = f.bx[i]; val y = f.by[i]; val w = f.bw[i]; val h = f.bh[i]
-                val pm = f.medianF(i, purple)
-                val printColoured = pm < printC + margin && f.medianF(i, cdPx) <= cdPrintT
+                val pm = f.medianOf(i) { pg.purple(it) }
+                val printColoured = pm < printC + margin && f.medianOf(i) { cd(pg, it, a0, b0) } <= cdPrintT
                 if (separable && !printColoured && pm >= split) continue                // pen-coloured
                 val inBand = f.mean(i, band) > 0.6
                 val glyphSized = h <= 1.5 * gh && w <= 1.5 * gh
@@ -292,48 +386,67 @@ object PrintRestore {
             }
             band = or(band, dilate(restore, w0, h0, 4 * gh, gh or 1))
         }
+        return band
+    }
 
-        // ── pen the eraser left ──
-        val cdS: FloatArray
-        run {
-            val num = blur(FloatArray(n0) { if (inkN[it].toInt() != 0) cdPx[it] else 0f }, w0, h0, 3)
-            val den = blur(FloatArray(n0) { if (inkN[it].toInt() != 0) 1f else 0f }, w0, h0, 3)
-            cdS = FloatArray(n0) { num[it] / max(den[it], 1e-3f) }
-        }
-        val penCd = median(values(cdS, and(erasedM, dark70)))
-        val printCd = percentile(values(cdS, and(core, dark70)), 90.0)
+    /** ── pen the eraser left ── the pixels to clear to paper. */
+    private fun penLeft(
+        pg: Page, text: Text, inkN: ByteArray, inkE: ByteArray, erasedM: ByteArray, dark70: ByteArray, linesE: ByteArray,
+        ruleGap: ByteArray, band: ByteArray, restore: ByteArray, hwMask: ByteArray, printMask: ByteArray, a0: Double, b0: Double,
+        separable: Boolean,
+    ): ByteArray {
+        val w0 = pg.w; val h0 = pg.h; val n0 = pg.n; val gh = text.gh
+        val cdS = ratio(
+            blurred(w0, h0, 3) { if (inkN[it].toInt() != 0) cd(pg, it, a0, b0) else 0f },
+            blurred(w0, h0, 3) { if (inkN[it].toInt() != 0) 1f else 0f },
+        )
+        val penCd = median(values(and(erasedM, dark70)) { cdS[it] })
+        val printCd = percentile(values(and(text.core, dark70)) { cdS[it] }, 90.0)
         val chromaT = (penCd + printCd) / 2
         val keep = or(or(or(band, restore), ruleGap), and(printMask, not(hwMask)))
         val beside = dilate(erasedM, w0, h0, (2 * gh) or 1, (2 * gh) or 1, ellipse = true)
         val rulesAll = dilate(or(linesE, ruleGap), w0, h0, 3, 3)
-        var residue = ByteArray(n0)
-        for (i in 1 until t.n) if (t.meanF(i, erasedRatio) > 0.5) t.paint(i, residue)
-        residue = and(residue, not(keep), beside)
+        var residue = and(text.residue, not(keep), beside)
         if (separable) {
             val chromaInk = where(n0) { inkE[it].toInt() != 0 && cdS[it] > chromaT && beside[it].toInt() != 0 && rulesAll[it].toInt() == 0 }
             residue = or(residue, and(dilate(chromaInk, w0, h0, 3, 3), inkE, not(keep), not(rulesAll)))
         }
+        return residue
+    }
 
-        // ── compose ──
-        val tgt = ByteArray(n0 * 3); target.get(0, 0, tgt)
-        val out = ByteArray(n0 * 3); erased.get(0, 0, out)
-        val pap = ByteArray(n0 * 3); paperE.get(0, 0, pap); paperE.release()
+    /** ── compose ── into [erased], a row at a time. */
+    private fun compose(pg: Page, target: Mat, erased: Mat, paperE: Mat, residue: ByteArray, restore: ByteArray, ruleGap: ByteArray, linesE: ByteArray, split: Double) {
+        val w0 = pg.w; val h0 = pg.h
+        val tgt = ByteArray(w0 * 3); val out = ByteArray(w0 * 3); val pap = ByteArray(w0 * 3)
         val ruleCol = IntArray(3) { 160 }
         run {
-            val src = where(n0) { linesE[it].toInt() != 0 && dN[it] > 25 }
-            for (ch in 0..2) {
-                val v = values(FloatArray(n0) { (tgt[it * 3 + ch].toInt() and 0xff).toFloat() }, src)
-                if (v.isNotEmpty()) ruleCol[ch] = median(v).toInt()
+            val src = where(pg.n) { linesE[it].toInt() != 0 && pg.dN(it) > 25 }
+            var c = 0
+            for (b in src) if (b.toInt() != 0) c++
+            if (c > 0) {
+                val v = Array(3) { FloatArray(c) }; var j = 0
+                for (y in 0 until h0) {
+                    target.get(y, 0, tgt)
+                    for (x in 0 until w0) if (src[y * w0 + x].toInt() != 0) {
+                        for (ch in 0..2) v[ch][j] = (tgt[x * 3 + ch].toInt() and 0xff).toFloat()
+                        j++
+                    }
+                }
+                for (ch in 0..2) ruleCol[ch] = median(v[ch]).toInt()
             }
         }
-        for (p in 0 until n0) {
-            when {
-                residue[p].toInt() != 0 -> for (ch in 0..2) out[p * 3 + ch] = pap[p * 3 + ch]
-                restore[p].toInt() != 0 -> for (ch in 0..2) out[p * 3 + ch] = tgt[p * 3 + ch]
-                ruleGap[p].toInt() != 0 -> for (ch in 0..2)
-                    out[p * 3 + ch] = if (purple[p] < split) tgt[p * 3 + ch] else ruleCol[ch].toByte()
+        for (y in 0 until h0) {
+            target.get(y, 0, tgt); erased.get(y, 0, out); paperE.get(y, 0, pap)
+            for (x in 0 until w0) {
+                val p = y * w0 + x
+                when {
+                    residue[p].toInt() != 0 -> for (ch in 0..2) out[x * 3 + ch] = pap[x * 3 + ch]
+                    restore[p].toInt() != 0 -> for (ch in 0..2) out[x * 3 + ch] = tgt[x * 3 + ch]
+                    ruleGap[p].toInt() != 0 -> for (ch in 0..2)
+                        out[x * 3 + ch] = if (pg.purple(p) < split) tgt[x * 3 + ch] else ruleCol[ch].toByte()
+                }
             }
+            erased.put(y, 0, out)
         }
-        erased.put(0, 0, out)
     }
 }

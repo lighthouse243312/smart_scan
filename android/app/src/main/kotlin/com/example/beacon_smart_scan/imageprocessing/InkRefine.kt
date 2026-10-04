@@ -11,6 +11,9 @@ import org.opencv.core.Size
 import org.opencv.geometry.Geometry
 import org.opencv.imgproc.Imgproc
 import org.opencv.photo.Photo
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -86,6 +89,45 @@ object InkRefine {
     private fun toFloat(mask: Mat): Mat = Mat().also { mask.convertTo(it, CvType.CV_32F, 1.0 / 255.0) }
     private fun filter(src: Mat, kernel: Mat): Mat =
         Mat().also { Imgproc.filter2D(src, it, CvType.CV_32F, kernel, Point(-1.0, -1.0), 0.0, Core.BORDER_CONSTANT) }
+
+    /**
+     * The direction kernels are large (up to 6 stroke widths), so filter2D takes its DFT path,
+     * which runs on one core — the per-direction filters are independent, so they run side by
+     * side here instead. Each result is deterministic and combined in the original order, so the
+     * output is the same as running them one after another.
+     */
+    private val pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
+
+    /** Native memory the concurrent filters may hold at once (they are Java-light, native-heavy). */
+    private const val PARALLEL_BUDGET_BYTES = 768L * 1024 * 1024
+
+    /** How many tasks each holding [bytesPerPixel] per pixel of [like] fit in the budget, at least 1. */
+    private fun parallelism(like: Mat, bytesPerPixel: Int): Int =
+        (PARALLEL_BUDGET_BYTES / max(1L, like.total() * bytesPerPixel)).toInt().coerceIn(1, Runtime.getRuntime().availableProcessors())
+
+    /** [f] over [items], at most [parallel] at a time on [pool]; results in [items]' order. */
+    private fun <T, R> parallelMap(items: List<T>, parallel: Int, f: (T) -> R): List<R> {
+        val workers = min(parallel, items.size)
+        if (workers <= 1) return items.map(f)
+        val results = arrayOfNulls<Any?>(items.size)
+        val next = AtomicInteger()
+        val futures = (0 until workers).map {
+            pool.submit {
+                while (true) {
+                    val i = next.getAndIncrement()
+                    if (i >= items.size) break
+                    results[i] = f(items[i])
+                }
+            }
+        }
+        var error: Throwable? = null
+        for (future in futures) {
+            try { future.get() } catch (e: ExecutionException) { if (error == null) error = e.cause ?: e }
+        }
+        error?.let { throw it }
+        @Suppress("UNCHECKED_CAST")
+        return results.toList() as List<R>
+    }
 
     /** 4 directional band kernels; `side` 0 = both sides of the centre, -1/+1 = one side only. */
     private fun directionKernels(length: Int, band: Int, side: Int = 0): List<Mat> {
@@ -300,25 +342,26 @@ object InkRefine {
         var printThrough = Mat.zeros(d.ink.size(), CvType.CV_8U)
         var penThrough = Mat.zeros(d.ink.size(), CvType.CV_8U)
         val penVotes = Mat.zeros(d.ink.size(), CvType.CV_8U)
-        for ((li, m) in DIR_LENGTHS.withIndex()) {
-            val length = (m * k) or 1
-            for (kernel in directionKernels(length, DIR_BAND)) {
-                val full = Core.sumElems(kernel).`val`[0]
-                val n = filter(inkF, kernel)
-                val nn = Mat(); Core.max(n, Scalar(1.0), nn)
-                val pen = filter(penF, kernel); Core.divide(pen, nn, pen)
-                val pr = filter(printF, kernel); Core.divide(pr, nn, pr)
-                val runs = cmp(n, 0.6 * full / DIR_BAND, Core.CMP_GE)
-                printThrough = or(printThrough, and(cmp(pr, 0.6, Core.CMP_GE), runs))
-                penThrough = or(penThrough, and(cmp(pen, 0.6, Core.CMP_GE), runs))
-                if (li == 0) {
-                    val vote = cmp(pen, 0.5, Core.CMP_GE)
-                    Core.divide(vote, Scalar(255.0), vote)
-                    Core.add(penVotes, vote, penVotes)
-                    vote.release()
-                }
-                releasing(kernel, n, nn, pen, pr, runs) {}
-            }
+        val dirKernels = DIR_LENGTHS.withIndex().flatMap { (li, m) -> directionKernels((m * k) or 1, DIR_BAND).map { li to it } }
+        // per direction: (print runs through, pen runs through, pen vote or null); ~4 float planes live each
+        val dirResults = parallelMap(dirKernels, parallelism(d.ink, 24)) { (li, kernel) ->
+            val full = Core.sumElems(kernel).`val`[0]
+            val n = filter(inkF, kernel)
+            val nn = Mat(); Core.max(n, Scalar(1.0), nn)
+            val pen = filter(penF, kernel); Core.divide(pen, nn, pen)
+            val pr = filter(printF, kernel); Core.divide(pr, nn, pr)
+            val runs = cmp(n, 0.6 * full / DIR_BAND, Core.CMP_GE)
+            val prRun = and(cmp(pr, 0.6, Core.CMP_GE), runs)
+            val penRun = and(cmp(pen, 0.6, Core.CMP_GE), runs)
+            val vote = if (li == 0) cmp(pen, 0.5, Core.CMP_GE).also { Core.divide(it, Scalar(255.0), it) } else null
+            releasing(kernel, n, nn, pen, pr, runs) {}
+            Triple(prRun, penRun, vote)
+        }
+        for ((prRun, penRun, vote) in dirResults) {
+            printThrough = or(printThrough, prRun)
+            penThrough = or(penThrough, penRun)
+            if (vote != null) { Core.add(penVotes, vote, penVotes); vote.release() }
+            releasing(prRun, penRun) {}
         }
         val penMost = cmp(penVotes, 3.0, Core.CMP_GE)
         // the working-size (coarse) result is the base; pixels leave it only where a confident
@@ -398,9 +441,14 @@ object InkRefine {
         var both = Mat.zeros(hw.size(), CvType.CV_8U)
         val bothA = directionKernels(4 * k + 1, DIR_BAND, -1)
         val bothB = directionKernels(4 * k + 1, DIR_BAND, +1)
-        for (dir in 0 until 4) {
-            both = or(both, and(cmp(filter(printVisibleF, bothA[dir]), 1.5, Core.CMP_GE), cmp(filter(printVisibleF, bothB[dir]), 1.5, Core.CMP_GE)))
+        val bothSides = parallelMap(bothA + bothB, parallelism(d.ink, 8)) { kernel ->
+            val f = filter(printVisibleF, kernel)
+            cmp(f, 1.5, Core.CMP_GE).also { f.release() }
         }
+        for (dir in 0 until 4) {
+            both = or(both, and(bothSides[dir], bothSides[4 + dir]))
+        }
+        bothSides.forEach { it.release() }
         var overlap = and(and(hw, both), cmp(d.mean, penLocal, Core.CMP_GT))
         (bothA + bothB).forEach { it.release() }
         releasing(odPen, sumOD, sumW, penLocal, printVisibleF, both) {}
@@ -412,19 +460,24 @@ object InkRefine {
             val printVis = and(printStrong, not(hw))
             val printVisF = toFloat(printVis)
             val length = (2 * k) or 1
-            val penScore = directionKernels(length, DIR_BAND).map { kernel -> filter(hwF, kernel).also { kernel.release() } }
+            val penScore = parallelMap(directionKernels(length, DIR_BAND), parallelism(hw, 8)) { kernel -> filter(hwF, kernel).also { kernel.release() } }
             val reach = max(3, k)
             val sideA = directionKernels(2 * reach + 1, DIR_BAND, -1)
             val sideB = directionKernels(2 * reach + 1, DIR_BAND, +1)
+            val printSides = parallelMap(sideA + sideB, parallelism(hw, 8)) { kernel ->
+                val f = filter(printVisF, kernel)
+                cmp(f, 1.5, Core.CMP_GE).also { f.release() }
+            }
             var bridge = Mat.zeros(hw.size(), CvType.CV_8U)
             for (dir in 0 until 4) {
-                val both = and(cmp(filter(printVisF, sideA[dir]), 1.5, Core.CMP_GE), cmp(filter(printVisF, sideB[dir]), 1.5, Core.CMP_GE))
+                val both = and(printSides[dir], printSides[4 + dir])
                 val penDir = PERPENDICULAR[dir]
                 var isPenDir = Mat(hw.size(), CvType.CV_8U, Scalar(255.0))
                 for (o in 0 until 4) if (o != penDir) isPenDir = and(isPenDir, cmp(penScore[penDir], penScore[o], Core.CMP_GE))
                 bridge = or(bridge, and(both, isPenDir))
                 both.release(); isPenDir.release()
             }
+            printSides.forEach { it.release() }
             overlap = or(overlap, and(bridge, hw))
             // pen crossing PRINTED TEXT: in a print line's band, a sensor-clipped pixel has no colour
             // of its own, so it takes the colour of the NEAREST coloured rim pixel: a pen's core is

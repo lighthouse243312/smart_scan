@@ -157,4 +157,30 @@ class ImageProcessingChannel {
     });
     return result!['outputPath'] as String;
   }
+
+  /// Erases in passes, all on the native side: the first pass with [maskPath] (as
+  /// [eraseWithMask]), then up to two more that re-detect on the previous result — the model +
+  /// colour method when [useModel], else the colour method, at [threshold] / [colorDelta] — kept
+  /// off the print the first mask found; print the passes turned to paper is copied back from
+  /// [inputPath]. Returns the output path.
+  static Future<String> eraseHandwriting({
+    required String inputPath,
+    required String analysisPath,
+    required String maskPath,
+    required String outputPath,
+    required bool useModel,
+    required double threshold,
+    required double colorDelta,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('eraseHandwriting', {
+      'inputPath': inputPath,
+      'analysisPath': analysisPath,
+      'maskPath': maskPath,
+      'outputPath': outputPath,
+      'useModel': useModel,
+      'threshold': threshold,
+      'colorDelta': colorDelta,
+    });
+    return result!['outputPath'] as String;
+  }
 }

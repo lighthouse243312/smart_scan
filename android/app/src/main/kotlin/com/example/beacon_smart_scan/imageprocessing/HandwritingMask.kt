@@ -94,21 +94,70 @@ object HandwritingMask {
         }
     }
 
+    /** Dev switch (InkHarness `-e consistent 0`): the old print / overlap layers, for comparison. */
+    @JvmStatic var consistent = true
+
     fun write(handwriting: Mat, print: Mat, overlap: Mat, path: String) {
         val red = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
         val alpha = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
         val blue = Mat()
-        val notOverlap = Mat()
+        val notHw = Mat()
+        val under = Mat()
         val file = Mat()
-        releasing(red, alpha, blue, notOverlap, file) {
+        releasing(red, alpha, blue, notHw, under, file) {
             red.setTo(Scalar(255.0), handwriting)
             alpha.setTo(Scalar(OVERLAY_ALPHA), handwriting)
-            // overlap kept apart from print so it shows yellow, not white
-            Core.bitwise_not(overlap, notOverlap)
-            Core.bitwise_and(print, notOverlap, blue)
-            Core.merge(listOf(blue, overlap, red, alpha), file)
+            // print layer = print with no handwriting on it, pixel by pixel: a pixel both layers
+            // claim is print only as print under the pen (the overlap layer, kept apart so it shows
+            // yellow, not white). Upstream steps that vote per ink component can leave a pen pixel
+            // flagged print too — pen digits fused with a table's grid make one huge mostly-print
+            // component — and the erase would then keep and restore it.
+            if (consistent) {
+                Core.bitwise_not(handwriting, notHw)
+                Core.bitwise_and(print, notHw, blue)
+                printThroughPen(overlap, blue, InkAnalysis.strokeUnit(handwriting.cols(), handwriting.rows()), under)
+            } else {
+                Core.bitwise_not(overlap, notHw); Core.bitwise_and(print, notHw, blue); overlap.copyTo(under)
+            }
+            Core.merge(listOf(blue, under, red, alpha), file)
             ImageIO.writeOrThrow(file, path)
         }
+    }
+
+    /**
+     * [overlap] (print under the pen) kept only where the print runs THROUGH the pen: pure print
+     * within 2 stroke units on both sides along the row or along the column, pixel by pixel. A rule
+     * or a printed letter a pen crosses has print on either side; the body of a pen digit written
+     * on a rule does not — the model's print layer bleeds onto it, and restoring it left dashes and
+     * pieces of the digits behind. Mirrors PrintThroughPen in ios/Runner/ImageProcessingOpenCV.mm.
+     */
+    private fun printThroughPen(overlap: Mat, purePrint: Mat, k: Int, out: Mat) {
+        val d = 2 * k
+        val sides = listOf(
+            Pair(Size((d + 1).toDouble(), 1.0), org.opencv.core.Point(d.toDouble(), 0.0)),   // print to the left
+            Pair(Size((d + 1).toDouble(), 1.0), org.opencv.core.Point(0.0, 0.0)),            // ... to the right
+            Pair(Size(1.0, (d + 1).toDouble()), org.opencv.core.Point(0.0, d.toDouble())),   // ... above
+            Pair(Size(1.0, (d + 1).toDouble()), org.opencv.core.Point(0.0, 0.0)),            // ... below
+        ).map { (size, anchor) ->
+            val kernel = Mat.ones(size, CvType.CV_8U)
+            Mat().also { Imgproc.dilate(purePrint, it, kernel, anchor); kernel.release() }
+        }
+        val row = Mat(); val col = Mat()
+        Core.bitwise_and(sides[0], sides[1], row)
+        Core.bitwise_and(sides[2], sides[3], col)
+        Core.bitwise_or(row, col, out)
+        // ...or it lies on a rule: a long (6 stroke units), thin horizontal run of print and print
+        // under the pen — a blank line written along its whole length has no print beside the pen
+        // close by, but no digit or letter body is a run that long and thin
+        val rule = Mat(); val thick = Mat(); val any = Mat()
+        Core.bitwise_or(overlap, purePrint, any)
+        val runK = Mat.ones(1, 6 * k + 1, CvType.CV_8U); val thickK = Mat.ones(k, 1, CvType.CV_8U)
+        Imgproc.morphologyEx(any, rule, Imgproc.MORPH_OPEN, runK)
+        Imgproc.morphologyEx(rule, thick, Imgproc.MORPH_OPEN, thickK)
+        Core.bitwise_not(thick, thick); Core.bitwise_and(rule, thick, rule)
+        Core.bitwise_or(out, rule, out)
+        Core.bitwise_and(out, overlap, out)
+        (sides + listOf(row, col, rule, thick, any, runK, thickK)).forEach { it.release() }
     }
 
     fun read(path: String): Layers {

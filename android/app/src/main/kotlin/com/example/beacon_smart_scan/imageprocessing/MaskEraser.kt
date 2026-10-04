@@ -25,6 +25,8 @@ object MaskEraser {
             val dst = InkRefine.erase(target, analysis, layers.handwriting, layers.print, layers.overlap, MlKitTextRecognizer())
             // give back print / rules the erase took beyond the writing, clear the pen it left
             PrintRestore.restore(analysis, target, dst, layers.handwriting, layers.print)
+            // rules the handwriting was written on: cleared of pen leftovers and drawn again
+            RuleRedraw.apply(analysis, layers.handwriting, layers.print, dst)
             releasing(dst) { ImageIO.writeOrThrow(dst, outputPath) }
         } finally {
             target.release()

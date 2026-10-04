@@ -27,11 +27,18 @@ android {
         testInstrumentationRunner = "com.example.beacon_smart_scan.InkHarness"
     }
 
+    // -PharnessRelease runs InkHarness against the release (non-debuggable) build, for timings that
+    // match what users get: a debuggable app runs its Kotlin pixel loops far slower
+    val harnessRelease = project.hasProperty("harnessRelease")
+    if (harnessRelease) testBuildType = "release"
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // R8 would strip the Kotlin stdlib the harness needs from the app it instruments
+            if (harnessRelease) { isMinifyEnabled = false; isShrinkResources = false }
         }
     }
 
