@@ -111,6 +111,17 @@ object ImageProcessingChannel {
                     requirePath(call, "maskPath"),
                     requirePath(call, "outputPath"),
                 )
+            "eraseHandwriting" ->
+                MultiPassEraser.erase(
+                    appContext,
+                    requirePath(call, "inputPath"),
+                    requirePath(call, "analysisPath"),
+                    requirePath(call, "maskPath"),
+                    requirePath(call, "outputPath"),
+                    call.argument<Boolean>("useModel") ?: true,
+                    requireDouble(call, "threshold", 0.5),
+                    requireDouble(call, "colorDelta", 0.05),
+                )
             else -> throw ImageProcessingException("INVALID_ARGUMENT", "Unknown method: ${call.method}")
         }
     }

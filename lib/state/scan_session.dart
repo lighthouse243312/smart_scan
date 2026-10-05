@@ -149,12 +149,21 @@ class ScanSession extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Erases in passes on the native side: later passes catch the pen pieces one pass leaves
+  /// behind, kept off the print this (reviewed) mask found — see
+  /// [ImageProcessingService.eraseHandwriting].
   Future<void> eraseHandwriting() async {
     final page = currentPage;
     final maskPath = page?.maskPath;
     if (page == null || maskPath == null) return;
     final result = await _guarded(
-      () => _imageProcessingService.eraseWithMask(page.cleanPath, analysisPath: page.originalPath, maskPath: maskPath),
+      () => _imageProcessingService.eraseHandwriting(
+        page.cleanPath,
+        analysisPath: page.originalPath,
+        maskPath: maskPath,
+        method: method,
+        sensitivity: sensitivity,
+      ),
     );
     if (result == null) return;
     _pages[currentPageIndex] = page.copyWith(finalPath: result);

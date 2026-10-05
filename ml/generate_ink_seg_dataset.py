@@ -256,6 +256,9 @@ def init_emnist(split):
     """byclass *test* file (116k glyphs, 62 classes digits+upper+lower). Samples [0,100k) are
     used for train/val pages, [100k, end) for test pages so test handwriting glyphs are unseen."""
     global EMNIST
+    if EMNIST_DIR is None:  # EMNIST not downloaded on this machine: fonts + cursive only
+        EMNIST = None
+        return
     imgs = _read_idx(os.path.join(EMNIST_DIR, "emnist-byclass-test-images-idx3-ubyte.gz"))
     labels = _read_idx(os.path.join(EMNIST_DIR, "emnist-byclass-test-labels-idx1-ubyte.gz"))
     mapping = {}
@@ -1173,7 +1176,7 @@ class Writer:
 
 
 def hw_text_patch(text, cap_h, writer: Writer, rng, vi=False):
-    src = rng.choices(["emnist", "font", "cursive"], writer.src_w)[0]
+    src = rng.choices(["emnist", "font", "cursive"], writer.src_w if EMNIST else [0] + writer.src_w[1:])[0]
     if src == "emnist":
         sw = max(1.0, cap_h * rng.uniform(0.055, 0.12) * writer.width_scale) if rng.random() < 0.8 else None
         cov, base = emnist_word(text, cap_h, rng, stroke_w=sw)

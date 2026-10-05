@@ -60,7 +60,11 @@ object PrintRetypeset {
         return if (sel.isEmpty()) 1f / 3 else medianF(sel)
     }
 
+    /** Dev switch for comparing with/without re-typesetting (InkHarness `-e retypeset 0`). */
+    @JvmStatic var enabled = true
+
     fun retypeset(dst: Mat, analysis: Mat, handwriting: Mat, printMask: Mat, k: Int) {
+        if (!enabled) return
         if (Core.countNonZero(handwriting) == 0) return
         val owned = ArrayList<Mat>()
         fun <T : Mat> own(m: T): T { owned.add(m); return m }

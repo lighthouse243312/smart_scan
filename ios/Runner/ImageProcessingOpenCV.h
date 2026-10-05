@@ -93,6 +93,21 @@ typedef NS_ENUM(NSInteger, ImageProcessingErrorCode) {
                        error:(NSError **)error
     NS_SWIFT_NAME(eraseWithMask(atPath:analysisPath:maskPath:outputPath:));
 
+/// Erases in passes (see ImageProcessingOpenCV.mm "Multi-pass erase"): the first pass with
+/// `maskPath` as `eraseWithMask` does, then up to two more that re-detect on the previous result —
+/// the model + colour method when `useModel`, else the colour method — kept off the print the first
+/// mask found; print the passes turned to paper is copied back from `inputPath`. Returns the number
+/// of passes run.
++ (nullable NSNumber *)eraseHandwritingAtPath:(NSString *)inputPath
+                                  analysisPath:(NSString *)analysisPath
+                                      maskPath:(NSString *)maskPath
+                                    outputPath:(NSString *)outputPath
+                                      useModel:(BOOL)useModel
+                                     threshold:(double)threshold
+                                    colorDelta:(double)colorDelta
+                                         error:(NSError **)error
+    NS_SWIFT_NAME(eraseHandwriting(atPath:analysisPath:maskPath:outputPath:useModel:threshold:colorDelta:));
+
 @end
 
 NS_ASSUME_NONNULL_END

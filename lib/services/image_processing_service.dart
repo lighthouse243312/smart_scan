@@ -100,6 +100,31 @@ class ImageProcessingService {
         );
       });
 
+  /// Erases the mask's handwriting from [inputPath] in passes (see
+  /// [ImageProcessingChannel.eraseHandwriting]); later passes re-detect with [method] at
+  /// [sensitivity], mapped as in [detectHandwritingMask]. [analysisPath] is the page the mask was
+  /// detected on.
+  Future<String> eraseHandwriting(
+    String inputPath, {
+    required String analysisPath,
+    required String maskPath,
+    required HandwritingMethod method,
+    required double sensitivity,
+  }) =>
+      _run(() async {
+        final s = sensitivity.clamp(0.0, 1.0);
+        final outputPath = await TempPaths.next('erased.png');
+        return ImageProcessingChannel.eraseHandwriting(
+          inputPath: inputPath,
+          analysisPath: analysisPath,
+          maskPath: maskPath,
+          outputPath: outputPath,
+          useModel: method == HandwritingMethod.segmentation,
+          threshold: 0.8 - 0.6 * s,
+          colorDelta: 0.08 - 0.06 * s,
+        );
+      });
+
   Future<T> _run<T>(Future<T> Function() action) async {
     try {
       return await action();

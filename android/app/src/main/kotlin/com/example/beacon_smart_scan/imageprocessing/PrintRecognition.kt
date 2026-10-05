@@ -71,6 +71,9 @@ object PrintRecognition {
     }
 
     /** Candidate spellings from two readings: each alone and every mix where they disagree. */
+    /** The word's letters and digits only (stray marks the recogniser read inside it dropped). */
+    fun lettersOnly(g: List<String>): List<String> = g.filter { t -> t.any { it.isLetterOrDigit() } }
+
     fun mixedSpellings(a: List<String>, b: List<String>): List<List<String>> {
         val n = a.size; val m = b.size
         val d = Array(n + 1) { IntArray(m + 1) }
@@ -129,7 +132,11 @@ object PrintRecognition {
     private class Placement(val x: Int, val y: Int, val g: Glyph)
     private class Fit(val spelling: List<String>, val pl: List<Placement>, val total: Float, val contra: Float, val paint: Mat, val leftover: Mat)
 
+    /** Dev switch for comparing with/without restoring by reading (InkHarness `-e recognition 0`). */
+    @JvmStatic var enabled = true
+
     fun restore(dst: Mat, analysis: Mat, erasedAll: Mat, k: Int, recognizer: TextRecognizer?) {
+        if (!enabled) return
         if (recognizer == null || Core.countNonZero(erasedAll) == 0) return
         val t = ArrayList<Mat>()
         fun <T : Mat> own(m: T): T { t.add(m); return m }
@@ -223,7 +230,31 @@ object PrintRecognition {
                     }
                 }
             }
+            // a line the pen crossed has letters half erased: its columns measure short and every
+            // bank letter would be "the wrong size". The recogniser's line box is not damaged —
+            // where a line's measured height departs from what its box predicts (ratio taken on
+            // the page's lines), the prediction is used
+            run {
+                val ratios = linesE.indices.filter { lineH[it] > 0f && linesE[it].box.height > 0 }
+                    .map { lineH[it] / linesE[it].box.height }.toMutableList()
+                if (ratios.size >= 3) {
+                    val r = median(ratios)
+                    for (li in linesE.indices) {
+                        if (lineH[li] <= 0f) continue
+                        val est = r * linesE[li].box.height
+                        if (abs(lineH[li] - est) > 0.15f * est) lineH[li] = est
+                    }
+                }
+            }
             if (bank.isEmpty()) return
+            // words read clean elsewhere on the page: a pen-crossed word is often one of them
+            val pageWords = HashSet<List<String>>()
+            for (line in linesE) for (w in line.readings.firstOrNull() ?: emptyList()) {
+                val s = clip(w.box, W, H)
+                if (s.width <= 0 || s.height <= 0) continue
+                val sub = erasedNear.submat(s); val dirty = Core.countNonZero(sub); sub.release()
+                if (dirty == 0) pageWords.add(lettersOnly(w.graphemes).map { it.lowercase() })
+            }
 
             val source = own(dst.clone())
             val sourceGray = own(Mat()); Imgproc.cvtColor(source, sourceGray, Imgproc.COLOR_BGR2GRAY)
@@ -252,6 +283,19 @@ object PrintRecognition {
                     }
                     for (r in 1 until line.readings.size) for (o in line.readings[r]) consider(o)
                     for (lo in linesO) for (rd in lo.readings) for (o in rd) consider(o)
+                    // the pen's remnants read as stray marks inside the word ("H.oliday"), and the
+                    // word's own case: the same spellings without interior marks, lower-cased; and
+                    // clean words of this page one or two letters away
+                    for (sp in ArrayList(spellings)) {
+                        val core = lettersOnly(sp)
+                        for (v in listOf(core, core.map { it.lowercase() }, listOf(core.firstOrNull() ?: "") + core.drop(1).map { it.lowercase() }))
+                            if (v.isNotEmpty() && v !in spellings) spellings.add(v)
+                    }
+                    for (pw in pageWords) {
+                        if (pw.size < 3 || spellings.any { it.map { g -> g.lowercase() } == pw }) continue
+                        if (spellings.any { editDistance(lettersOnly(it).map { g -> g.lowercase() }, pw) <= max(1, pw.size / 4) })
+                            spellings.add(pw)
+                    }
                     val pad = ceil(0.5f * lh).toInt()
                     val strip = clip(Rect(region.x - pad, (lb - 2.2f * lh).toInt(), region.width + 2 * pad, (3.2f * lh).toInt()), W, H)
                     if (strip.width < 4 || strip.height < 4) continue
@@ -339,7 +383,21 @@ object PrintRecognition {
                             if (wordVis[i].toInt() != 0 && coveredNear[i].toInt() != 0) expl++
                             if (covered[i].toInt() != 0 && (bVisPaper[i].toInt() != 0 || bHiddenPaper[i].toInt() != 0)) contraPx++
                         }
-                        val explained = if (visCount > 0) expl.toFloat() / visCount else 0f
+                        // ink the spelling leaves unexplained that is a small piece touching the
+                        // erased pen is the pen's own remnant, not print the spelling fails to explain
+                        var remnant = 0
+                        run {
+                            val rest = own(Mat(sh, sw, CvType.CV_8U))
+                            rest.put(0, 0, ByteArray(sw * sh) { if (wordVis[it].toInt() != 0 && coveredNear[it].toInt() == 0) 255.toByte() else 0 })
+                            val cr = components(rest)
+                            val em = own(Mat(sh, sw, CvType.CV_8U)); em.put(0, 0, bErased)
+                            val tm = Mat(); Imgproc.dilate(em, tm, Mat.ones(3, 3, CvType.CV_8U))
+                            val touch = ByteArray(sw * sh); tm.get(0, 0, touch); tm.release()
+                            val touches = BooleanArray(cr.count)
+                            for (i in 0 until sw * sh) if (cr.labels[i] > 0 && touch[i].toInt() != 0) touches[cr.labels[i]] = true
+                            for (l in 1 until cr.count) if (touches[l] && cr.area[l] <= lh * lh) remnant += cr.area[l]
+                        }
+                        val explained = if (visCount - remnant > 0) expl.toFloat() / (visCount - remnant) else 0f
                         val contra = contraPx.toFloat() / max(1, glyphPx)
                         val total = prev[end] - 2f * visCount
                         if (explained < 0.9f || contra > 0.06f) continue

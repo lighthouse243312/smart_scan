@@ -24,6 +24,8 @@
 #include <functional>
 #include <string>
 #include <map>
+#include <set>
+#include <cctype>
 #include <numeric>
 #include <vector>
 
@@ -2466,6 +2468,22 @@ inline int EditDistance(const std::vector<std::string> &a, const std::vector<std
     return prev[b.size()];
 }
 
+/// The word's letters and digits only (stray marks the recogniser read inside it dropped). A
+/// grapheme with any non-ASCII byte is a letter (Vietnamese vowels, accents).
+inline std::vector<std::string> LettersOnly(const std::vector<std::string> &g) {
+    std::vector<std::string> out;
+    for (const std::string &t : g)
+        if (std::any_of(t.begin(), t.end(), [](char ch) { return (unsigned char)ch >= 0x80 || std::isalnum((unsigned char)ch); }))
+            out.push_back(t);
+    return out;
+}
+
+/// ASCII lower case of each grapheme (accented capitals are left as they are).
+inline std::vector<std::string> LowerAscii(std::vector<std::string> g) {
+    for (std::string &t : g) for (char &ch : t) if ((unsigned char)ch < 0x80) ch = (char)std::tolower((unsigned char)ch);
+    return g;
+}
+
 inline std::vector<std::vector<std::string>> MixedSpellings(const std::vector<std::string> &a, const std::vector<std::string> &b) {
     const int n = (int)a.size(), m = (int)b.size();
     std::vector<std::vector<int>> D(n + 1, std::vector<int>(m + 1, 0));
@@ -2649,7 +2667,33 @@ inline void RestorePrintByRecognition(cv::Mat &dst, const cv::Mat &analysis, con
 #ifdef INK_DEBUG
     fprintf(stderr, "restore: %zu lines read, %zu graphemes in the bank\n", linesE.size(), bank.size());
 #endif
+    // a line the pen crossed has letters half erased: its columns measure short and every bank
+    // letter would be "the wrong size". The recogniser's line box is not damaged — where a line's
+    // measured height departs from what its box predicts (ratio taken on the page's lines), the
+    // prediction is used
+    {
+        std::vector<float> ratios;
+        for (size_t li = 0; li < linesE.size(); li++)
+            if (infoE[li].height > 0 && linesE[li].box.height > 0) ratios.push_back(infoE[li].height / linesE[li].box.height);
+        if (ratios.size() >= 3) {
+            const float r = Percentile(ratios, 50);
+            for (size_t li = 0; li < linesE.size(); li++) {
+                if (infoE[li].height <= 0) continue;
+                const float est = r * linesE[li].box.height;
+                if (std::abs(infoE[li].height - est) > 0.15f * est) infoE[li].height = est;
+            }
+        }
+    }
     if (bank.empty()) return;
+    // words read clean elsewhere on the page: a pen-crossed word is often one of them
+    std::set<std::vector<std::string>> pageWords;
+    for (const OcrLine &line : linesE) {
+        if (line.readings.empty()) continue;
+        for (const OcrWord &w : line.readings[0]) {
+            const cv::Rect b = w.box & cv::Rect(0, 0, W, H);
+            if (b.area() > 0 && cv::countNonZero(erasedNear(b)) == 0) pageWords.insert(LowerAscii(LettersOnly(w.graphemes)));
+        }
+    }
 
     const cv::Mat source = dst.clone();
     cv::Mat sourceGray;
@@ -2681,6 +2725,28 @@ inline void RestorePrintByRecognition(cv::Mat &dst, const cv::Mat &analysis, con
             };
             for (size_t r = 1; r < linesE[li].readings.size(); r++) for (const OcrWord &o : linesE[li].readings[r]) consider(o);
             for (const OcrLine &lo : linesO) for (const auto &rd : lo.readings) for (const OcrWord &o : rd) consider(o);
+            // the pen's remnants read as stray marks inside the word ("H.oliday"), and the word's own
+            // case: the same spellings without interior marks, lower-cased; and clean words of this
+            // page one or two letters away
+            {
+                auto add = [&](const std::vector<std::string> &v) {
+                    if (!v.empty() && std::find(spellings.begin(), spellings.end(), v) == spellings.end()) spellings.push_back(v);
+                };
+                const auto base = spellings;
+                for (const auto &sp : base) {
+                    const auto core = LettersOnly(sp);
+                    add(core);
+                    add(LowerAscii(core));
+                    if (!core.empty()) { auto v = LowerAscii(core); v[0] = core[0]; add(v); }
+                }
+                for (const auto &pw : pageWords) {
+                    if (pw.size() < 3) continue;
+                    const int tol = std::max(1, (int)pw.size() / 4);
+                    bool near = false;
+                    for (const auto &sp : spellings) if (EditDistance(LowerAscii(LettersOnly(sp)), pw) <= tol) { near = true; break; }
+                    if (near) add(pw);
+                }
+            }
             // the strip the word may occupy
             const int pad = (int)std::ceil(0.5f * L.height);
             cv::Rect strip(region.x - pad, (int)(L.base - 2.2f * L.height), region.width + 2 * pad, (int)(3.2f * L.height));
@@ -2769,7 +2835,17 @@ inline void RestorePrintByRecognition(cv::Mat &dst, const cv::Mat &analysis, con
                 }
                 cv::Mat coveredNear;
                 cv::dilate(covered, coveredNear, cv::Mat::ones(3, 3, CV_8U));
-                const float explained = visCount ? (float)cv::countNonZero(coveredNear & wordVis) / visCount : 0.0f;
+                // ink the spelling leaves unexplained that is a small piece touching the erased pen is
+                // the pen's own remnant, not print the spelling fails to explain
+                int remnant = 0;
+                {
+                    Components cr = FindComponents(wordVis & ~coveredNear);
+                    cv::Mat touch;
+                    cv::dilate(erased(strip), touch, cv::Mat::ones(3, 3, CV_8U));
+                    std::vector<float> nearPen = FractionPerComponent(cr, touch);
+                    for (int i = 1; i < cr.count; i++) if (nearPen[i] > 0 && cr.area[i] <= L.height * L.height) remnant += cr.area[i];
+                }
+                const float explained = visCount - remnant > 0 ? (float)cv::countNonZero(coveredNear & wordVis) / (visCount - remnant) : 0.0f;
                 const float contra = (float)cv::countNonZero(covered & (visPaper(strip) | hiddenPaper(strip))) / std::max(1, glyphPx);
                 const float total = prev[end] - 2.0f * visCount;
 #ifdef INK_DEBUG

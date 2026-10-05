@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "label-tool",
+      "runtimeExecutable": "ml/venv/bin/python",
+      "runtimeArgs": ["ml/label_tool.py", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}
