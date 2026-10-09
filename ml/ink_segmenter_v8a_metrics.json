@@ -1,0 +1,72 @@
+{
+ "best_step": 300,
+ "val": {
+  "hw_recall": 0.9588883122873229,
+  "hw_precision": 0.9581148816039086,
+  "print_kept": 0.9973033628130183,
+  "iou_hw": 0.9203099059213657,
+  "iou_print": 0.88782843723691
+ },
+ "test": {
+  "hw_recall": 0.9417468012397554,
+  "hw_precision": 0.9281499660592014,
+  "print_kept": 0.9942245488470778,
+  "iou_hw": 0.8777561047875252,
+  "iou_print": 0.8365286963762731
+ },
+ "test_pages": {
+  "p02": {
+   "hw_recall": 0.8591157319890328,
+   "hw_precision": 0.9781192084652969,
+   "print_kept": 0.9989441824452735,
+   "iou_hw": 0.842916022668684,
+   "iou_print": 0.8788695022915406
+  },
+  "p05": {
+   "hw_recall": 0.9216413446583969,
+   "hw_precision": 0.893062076160616,
+   "print_kept": 0.99180744703573,
+   "iou_hw": 0.8300382481279518,
+   "iou_print": 0.8354115600939737
+  },
+  "p11": {
+   "hw_recall": 0.9898077310247386,
+   "hw_precision": 0.9227430555555339,
+   "print_kept": 0.9943437098844674,
+   "iou_hw": 0.9140579609100628,
+   "iou_print": 0.769220396123038
+  }
+ },
+ "synthetic_test": {
+  "iou_print": 0.6574839742852805,
+  "iou_hw": 0.6450258662495819,
+  "hw_precision": 0.6984260387433364,
+  "hw_recall": 0.8940268881486526,
+  "print_to_hw_fp": 0.03432406137621654,
+  "overlap_print_recall": 0.6687508588704022,
+  "paper_to_hw_fp": 0.006255941307692125
+ },
+ "train_pages": [
+  "p01",
+  "p03",
+  "p06",
+  "p07",
+  "p08",
+  "p09",
+  "p10"
+ ],
+ "args": {
+  "init": "/Users/dangnguyen/Downloads/Projects/smart scan/ml/ink_segmenter_v6_torch.pt",
+  "steps": 1500,
+  "bs": 16,
+  "real_frac": 0.5,
+  "lr": 0.0003,
+  "real_w": 2.0,
+  "all": false,
+  "paste": 0.5,
+  "hw_pos_w": 4.0,
+  "val": "p04",
+  "test": "p02,p05,p11",
+  "out": "ink_segmenter_v8a"
+ }
+}

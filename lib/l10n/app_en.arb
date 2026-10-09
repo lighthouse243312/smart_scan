@@ -1,0 +1,205 @@
+{
+  "@@locale": "en",
+  "appTitle": "Smart Scan",
+  "homeHeadline": "Tidy documents,\nready to share",
+  "homeSubtitle": "Scan or pick a photo: the app sharpens it, removes shadows and can erase handwriting. Export to PDF, Word or PNG.",
+  "scanTitle": "Scan document",
+  "scanSubtitle": "Use the camera; edges are found and cropped automatically",
+  "libraryTitle": "Pick from library",
+  "librarySubtitle": "Use photos already on this device, several at once",
+  "pdfTitle": "Import a PDF",
+  "pdfSubtitle": "Each page of a PDF file becomes a page to clean",
+  "exportTo": "Export to",
+  "language": "Language",
+  "systemLanguage": "System default",
+  "stepCapture": "Capture",
+  "stepProcess": "Process",
+  "stepHandwriting": "Handwriting",
+  "stepExport": "Export",
+  "pageOf": "Page {current}/{total}",
+  "@pageOf": {
+    "placeholders": {
+      "current": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "processTitle": "Sharpen & clean",
+  "rotateLeft": "Rotate left",
+  "rotateRight": "Rotate right",
+  "deletePage": "Delete page",
+  "deletePageTitle": "Delete this page?",
+  "deletePageBody": "Page {page} will be removed from the document.",
+  "@deletePageBody": {
+    "placeholders": {
+      "page": {
+        "type": "int"
+      }
+    }
+  },
+  "deleteThisPage": "Delete this page",
+  "deleteAllPages": "Delete all pages",
+  "deleteAllPagesTitle": "Delete all {count} pages?",
+  "@deleteAllPagesTitle": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "deleteAllPagesBody": "All pages will be removed and the document deleted from this device.",
+  "cancel": "Cancel",
+  "delete": "Delete",
+  "addScanPage": "Scan more pages",
+  "addLibraryPage": "Add from library",
+  "addPdfPage": "Add from a PDF file",
+  "processing": "Sharpening and removing shadows…",
+  "original": "Original",
+  "processed": "Processed",
+  "exportNow": "Export now",
+  "eraseWritingShort": "Erase writing",
+  "handwritingTitle": "Handwriting",
+  "hideMask": "Hide detected area",
+  "showMask": "Show detected area",
+  "saveOriginal": "Save original to Photos",
+  "methodInk": "Ink colour",
+  "methodAi": "Ink colour + AI",
+  "sensitivity": "Sensitivity",
+  "brushView": "View",
+  "brushAdd": "Mark to erase",
+  "brushKeep": "Keep",
+  "skip": "Skip",
+  "eraseHandwriting": "Erase handwriting",
+  "detectingPages": "Finding handwriting… page {current} of {total}",
+  "@detectingPages": {
+    "placeholders": {
+      "current": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "erasingPages": "Erasing handwriting… page {current} of {total}",
+  "@erasingPages": {
+    "placeholders": {
+      "current": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "eraseAllPages": "Erase all pages",
+  "hintNoneInk": "No pen strokes in a colour different from the print. Try a higher sensitivity; for pen the same colour as the print, use \"Ink colour + AI\".",
+  "hintNoneAi": "No handwriting found. Try a higher sensitivity or paint over it with the brush.",
+  "hintCoverage": "The red area ({percent}% of the page) will be erased; yellow is print written over, which will be rebuilt. Use the brush to add areas or keep text marked by mistake; changing the method or sensitivity detects again from scratch.",
+  "@hintCoverage": {
+    "placeholders": {
+      "percent": {
+        "type": "String"
+      }
+    }
+  },
+  "savedOriginal": "Original saved to Photos.",
+  "saveFailed": "Save failed: {error}",
+  "@saveFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "exportTitle": "Export document",
+  "fileName": "File name",
+  "formatPdf": "PDF",
+  "formatWord": "Word",
+  "formatPng": "PNG images",
+  "formatPdfDesc": "One file, one A4 page per scan",
+  "formatWordDesc": "A .docx file for Word or Google Docs",
+  "formatPngDesc": "One full-quality image per page",
+  "shareFormat": "Share {format}",
+  "@shareFormat": {
+    "placeholders": {
+      "format": {
+        "type": "String"
+      }
+    }
+  },
+  "saveImages": "Save images",
+  "newDocument": "New document",
+  "savedImages": "Saved {count} images to the gallery",
+  "@savedImages": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "actionFailed": "Couldn't do that: {error}",
+  "@actionFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "galleryPermission": "Photo library access was not granted",
+  "processingFailed": "Image processing failed ({code})",
+  "@processingFailed": {
+    "placeholders": {
+      "code": {
+        "type": "String"
+      }
+    }
+  },
+  "tabScan": "Scan",
+  "tabDocuments": "Documents",
+  "tabAccount": "Account",
+  "documentsTitle": "Saved documents",
+  "documentsEmpty": "No documents yet",
+  "documentsEmptyHint": "Every scan keeps its original here; processed versions you save appear next to it.",
+  "pagesCount": "{count} pages",
+  "@pagesCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "editAgain": "Edit again",
+  "share": "Share",
+  "rename": "Rename",
+  "deleteDocument": "Delete document",
+  "deleteDocumentTitle": "Delete this document?",
+  "deleteDocumentBody": "Its originals and processed versions will be removed from this device for good.",
+  "save": "Save",
+  "documentName": "Document name",
+  "saveToLibrary": "Save to documents",
+  "savedToLibrary": "Processed version saved to documents",
+  "originalsKept": "Originals are saved automatically in Documents",
+  "accountGuest": "Guest",
+  "accountGuestHint": "Your documents are stored on this device. Sign in to sync across devices (coming soon).",
+  "signIn": "Sign in",
+  "comingSoon": "Coming soon",
+  "settings": "Settings",
+  "storage": "Storage",
+  "storageCount": "{count} documents on this device",
+  "@storageCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "about": "About",
+  "version": "Version",
+  "recentDocuments": "Recent",
+  "seeAll": "See all",
+  "noEdits": "No processed version yet"
+}

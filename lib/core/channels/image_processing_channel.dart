@@ -94,6 +94,21 @@ class ImageProcessingChannel {
     return result!['outputPath'] as String;
   }
 
+  /// Renders every page of the PDF at [inputPath] into [outputDir] as `<prefix>_<n>.png` (200 dpi,
+  /// capped at 4000 px on the long side like [importImage], on white); returns their paths in order.
+  static Future<List<String>> renderPdf({
+    required String inputPath,
+    required String outputDir,
+    required String prefix,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>('renderPdf', {
+      'inputPath': inputPath,
+      'outputDir': outputDir,
+      'prefix': prefix,
+    });
+    return (result!['pages'] as List).cast<String>();
+  }
+
   /// Ink-colour + layout mask. [colorDelta] = how much bluer than the local print (optical
   /// density OD_B/OD_R) a stroke must be to count as pen; smaller = more sensitive.
   static Future<HandwritingMaskResult> inkColorMask({

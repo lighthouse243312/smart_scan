@@ -33,6 +33,18 @@ class ImageProcessingService {
         return ImageProcessingChannel.importImage(inputPath: inputPath, outputPath: outputPath);
       });
 
+  /// The pages of the PDF at [inputPath] as images in the pipeline's format (see
+  /// [ImageProcessingChannel.renderPdf]).
+  Future<List<String>> renderPdf(String inputPath) => _run(() async {
+        final prefix = await TempPaths.next('pdf');
+        final slash = prefix.lastIndexOf('/');
+        return ImageProcessingChannel.renderPdf(
+          inputPath: inputPath,
+          outputDir: prefix.substring(0, slash),
+          prefix: prefix.substring(slash + 1),
+        );
+      });
+
   /// Squares a photographed page to its printed rules / text rows (see
   /// [ImageProcessingChannel.straighten]) so the handwriting analysis sees level lines.
   Future<String> straighten(String inputPath) => _run(() async {
@@ -129,7 +141,7 @@ class ImageProcessingService {
     try {
       return await action();
     } on PlatformException catch (e) {
-      throw ImageProcessingException(e.message ?? 'Xử lý ảnh thất bại (${e.code})');
+      throw ImageProcessingException(e.message ?? e.code);
     }
   }
 }

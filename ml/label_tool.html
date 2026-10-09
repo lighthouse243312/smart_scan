@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tô nhãn trang</title>
+<style>
+  :root { --bg:#f4f4f2; --panel:#ffffff; --ink:#1d1d1f; --muted:#6b6b70; --line:#dcdcd8; --accent:#2f6fec; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161618; --panel:#222225; --ink:#eeeeef; --muted:#9a9aa0; --line:#38383c; --accent:#6b9bff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 -apple-system, system-ui, sans-serif; background:var(--bg); color:var(--ink); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header .grp { display:flex; gap:4px; align-items:center; }
+  button, select { font:inherit; color:var(--ink); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:5px 10px; cursor:pointer; }
+  button.on { outline:2px solid var(--accent); }
+  .sw { width:12px; height:12px; border-radius:3px; display:inline-block; margin-right:4px; vertical-align:-1px; }
+  #status { color:var(--muted); margin-left:auto; }
+  #wrap { flex:1; overflow:hidden; position:relative; cursor:crosshair; background:#808080; }
+  #view { position:absolute; left:0; top:0; }
+  #help { color:var(--muted); font-size:12px; padding:4px 12px; background:var(--panel); border-top:1px solid var(--line); }
+  label { display:flex; gap:4px; align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="grp">
+    <button id="prev">◀</button>
+    <select id="page"></select>
+    <button id="next">▶</button>
+  </div>
+  <div class="grp">
+    <button data-mode="hw" class="on"><span class="sw" style="background:#e02020"></span>Chữ viết tay (1)</button>
+    <button data-mode="print"><span class="sw" style="background:#2040e0"></span>Chữ in (2)</button>
+    <button data-mode="ignore"><span class="sw" style="background:#20b040"></span>Bỏ qua (3)</button>
+    <button data-mode="erase">Tẩy (E)</button>
+  </div>
+  <div class="grp">
+    <label>Cọ <input id="size" type="range" min="2" max="60" value="10"></label>
+  </div>
+  <div class="grp">
+    <label><input id="showLabel" type="checkbox" checked>Nhãn tự động</label>
+    <label><input id="showSuspect" type="checkbox" checked>Chỗ đáng ngờ</label>
+    <label><input id="showBrush" type="checkbox" checked>Nét đã tô</label>
+  </div>
+  <span id="status">Đang tải…</span>
+</header>
+<div id="wrap"><canvas id="view"></canvas></div>
+<div id="help">Kéo chuột để tô · Giữ Space hoặc chuột phải để kéo trang · Lăn chuột để phóng to/thu nhỏ · [ ] đổi cỡ cọ · ← → chuyển trang · Tự lưu sau mỗi nét. Đỏ nhạt = chữ viết tay không được chấm, viền vàng = model và nhãn không khớp.</div>
+<script>
+const COLORS = { hw: "rgba(255,0,0,1)", print: "rgba(0,0,255,1)", ignore: "rgba(0,255,0,1)" };
+const wrap = document.getElementById("wrap"), view = document.getElementById("view"), ctx = view.getContext("2d");
+const status = document.getElementById("status"), sel = document.getElementById("page");
+let pages = [], cur = null, img = null, labelImg = null, suspectImg = null;
+let brush = document.createElement("canvas"), bctx = brush.getContext("2d");
+let mode = "hw", scale = 1, ox = 0, oy = 0, painting = false, panning = false, spaceDown = false, last = null, dirty = false;
+
+function setStatus(t) { status.textContent = t; }
+function loadImage(url) {
+  return new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = url + "?t=" + Date.now(); });
+}
+async function loadPages() {
+  const done = await (await fetch("/pages")).json();
+  pages = Object.keys(done);
+  sel.innerHTML = pages.map(p => `<option value="${p}">${p}${done[p] ? " ✓" : ""}</option>`).join("");
+}
+async function openPage(p) {
+  if (dirty) await save();
+  cur = p; sel.value = p; setStatus(`Đang tải ${p}…`);
+  img = await loadImage(`/image/${p}`);
+  labelImg = await loadImage(`/label/${p}`);
+  brush.width = img.width; brush.height = img.height; bctx.clearRect(0, 0, brush.width, brush.height);
+  const b = await loadImage(`/brush/${p}`);
+  if (b) bctx.drawImage(b, 0, 0);
+  fit(); draw(); setStatus(`${p}: đang tìm chỗ đáng ngờ…`);
+  suspectImg = await loadImage(`/suspect/${p}`);
+  if (cur === p) { draw(); setStatus(`${p} · ${img.width}×${img.height}`); }
+}
+function fit() {
+  view.width = wrap.clientWidth; view.height = wrap.clientHeight;
+  scale = Math.min(view.width / img.width, view.height / img.height);
+  ox = (view.width - img.width * scale) / 2; oy = (view.height - img.height * scale) / 2;
+}
+function draw() {
+  if (!img) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = "#808080"; ctx.fillRect(0, 0, view.width, view.height);
+  ctx.setTransform(scale, 0, 0, scale, ox, oy); ctx.imageSmoothingEnabled = scale < 1;
+  ctx.drawImage(img, 0, 0);
+  if (labelImg && document.getElementById("showLabel").checked) ctx.drawImage(labelImg, 0, 0);
+  if (suspectImg && document.getElementById("showSuspect").checked) ctx.drawImage(suspectImg, 0, 0);
+  if (document.getElementById("showBrush").checked) { ctx.globalAlpha = 0.55; ctx.drawImage(brush, 0, 0); ctx.globalAlpha = 1; }
+  if (last && !panning) {   // brush cursor
+    ctx.beginPath(); ctx.arc(last.x, last.y, size() / 2, 0, Math.PI * 2);
+    ctx.lineWidth = 1 / scale; ctx.strokeStyle = "#000"; ctx.stroke();
+  }
+}
+function size() { return +document.getElementById("size").value; }
+function toImg(e) { const r = view.getBoundingClientRect(); return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale }; }
+function stroke(a, b) {
+  bctx.lineCap = "round"; bctx.lineJoin = "round"; bctx.lineWidth = size();
+  bctx.globalCompositeOperation = mode === "erase" ? "destination-out" : "source-over";
+  bctx.strokeStyle = mode === "erase" ? "#000" : COLORS[mode];
+  bctx.beginPath(); bctx.moveTo(a.x, a.y); bctx.lineTo(b.x, b.y); bctx.stroke();
+  bctx.globalCompositeOperation = "source-over";
+}
+async function save() {
+  if (!cur || !dirty) return;
+  dirty = false;
+  const blob = await new Promise(r => brush.toBlob(r, "image/png"));
+  const res = await fetch(`/brush/${cur}`, { method: "POST", body: blob });
+  setStatus(res.ok ? `${cur}: đã lưu` : `${cur}: LỖI khi lưu`);
+  const o = [...sel.options].find(o => o.value === cur); if (o && !o.text.endsWith("✓")) o.text += " ✓";
+}
+view.addEventListener("contextmenu", e => e.preventDefault());
+view.addEventListener("mousedown", e => {
+  last = toImg(e);
+  if (e.button === 2 || spaceDown) { panning = true; last = { cx: e.clientX, cy: e.clientY }; return; }
+  painting = true; stroke(last, last); draw();
+});
+window.addEventListener("mousemove", e => {
+  if (panning) { ox += e.clientX - last.cx; oy += e.clientY - last.cy; last = { cx: e.clientX, cy: e.clientY }; draw(); return; }
+  const p = toImg(e);
+  if (painting) stroke(last, p);
+  last = p; draw();
+});
+window.addEventListener("mouseup", () => {
+  if (painting) { dirty = true; save(); }
+  painting = false; panning = false;
+});
+view.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = view.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const f = Math.exp(-e.deltaY * 0.0015), ns = Math.min(12, Math.max(0.1, scale * f));
+  ox = mx - (mx - ox) * ns / scale; oy = my - (my - oy) * ns / scale; scale = ns; draw();
+}, { passive: false });
+function setMode(m) { mode = m; document.querySelectorAll("[data-mode]").forEach(b => b.classList.toggle("on", b.dataset.mode === m)); }
+document.querySelectorAll("[data-mode]").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+window.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { spaceDown = true; e.preventDefault(); }
+  if (e.key === "1") setMode("hw"); if (e.key === "2") setMode("print"); if (e.key === "3") setMode("ignore");
+  if (e.key === "e" || e.key === "E") setMode("erase");
+  const s = document.getElementById("size");
+  if (e.key === "[") { s.value = Math.max(2, size() - 2); draw(); }
+  if (e.key === "]") { s.value = Math.min(60, size() + 2); draw(); }
+  if (e.key === "ArrowRight") step(1); if (e.key === "ArrowLeft") step(-1);
+});
+window.addEventListener("keyup", e => { if (e.code === "Space") spaceDown = false; });
+["showLabel", "showSuspect", "showBrush"].forEach(id => document.getElementById(id).onchange = draw);
+function step(d) { const i = pages.indexOf(cur); openPage(pages[(i + d + pages.length) % pages.length]); }
+document.getElementById("prev").onclick = () => step(-1);
+document.getElementById("next").onclick = () => step(1);
+sel.onchange = () => openPage(sel.value);
+window.addEventListener("resize", () => { if (img) { fit(); draw(); } });
+window.addEventListener("beforeunload", () => { if (dirty) save(); });
+(async () => { await loadPages(); openPage(pages[0]); })();
+</script>
+</body>
+</html>

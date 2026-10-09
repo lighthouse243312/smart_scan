@@ -201,7 +201,7 @@ def _pen_render(x, m, rng):
 
 def add_pen_marks(tile, rng):
     """answer marks drawn over real print: pen circles round single printed letters (often touching
-    or crossing them) and ticks through words. Labelled exactly: the pen is handwriting; a printed
+    or crossing them), strike-throughs / underlines / scribbles across printed words, and ticks. Labelled exactly: the pen is handwriting; a printed
     letter stays print EVERYWHERE, under the pen too, and is scored there — the model learns which
     pixels are print hidden under a pen (to be redrawn after the erase) and which are only pen."""
     x, y, v = tile
@@ -209,11 +209,22 @@ def add_pen_marks(tile, rng):
     printed = (y[..., 0] > 0.5) & (y[..., 1] < 0.5)
     n, lab, st, _ = cv2.connectedComponentsWithStats(printed.astype(np.uint8), connectivity=8)
     letters = [i for i in range(1, n) if 20 <= st[i, 4] and 7 <= st[i, 3] <= 45 and st[i, 2] <= 50]
+    # printed text rows: letters on a shared baseline, side by side (for strike-throughs / underlines)
+    rows = []
+    for i in sorted(letters, key=lambda i: st[i, 0]):
+        for r in rows:
+            j = r[-1]
+            if abs((st[i, 1] + st[i, 3]) - (st[j, 1] + st[j, 3])) <= 0.25 * max(st[i, 3], st[j, 3]) and 0 <= st[i, 0] - (st[j, 0] + st[j, 2]) <= 1.2 * st[j, 3]:
+                r.append(i); break
+        else:
+            rows.append([i])
+    rows = [r for r in rows if len(r) >= 2]
     pen = np.zeros((TILE, TILE), np.float32)
     for _ in range(int(rng.integers(1, 4))):
         m = np.zeros((TILE, TILE), np.uint8)
         th = max(1, int(round(rng.uniform(1.3, 3.2))))   # (thickness is in pixels, not shifted)
-        if letters and rng.random() < 0.7:          # circle round a letter
+        kind0 = rng.random()
+        if letters and kind0 < 0.35:                # circle round a letter
             i = letters[rng.integers(len(letters))]
             bx, by, bw, bh = st[i, :4]
             cx, cy = bx + bw / 2, by + bh / 2
@@ -227,6 +238,30 @@ def add_pen_marks(tile, rng):
             wob = 1 + rng.uniform(0.02, 0.12) * np.sin(t * rng.uniform(1, 3) + rng.uniform(0, 6))
             rr = 1 + (t - a0) / sweep * rng.uniform(-0.15, 0.15)            # spiral: the ends miss
             P = np.stack([cx + rx * wob * rr * np.cos(t), cy + ry * wob * rr * np.sin(t)], 1)
+        elif rows and kind0 < 0.8:                   # strike-through / underline / scribble over printed words
+            r = rows[rng.integers(len(rows))]
+            ids = [j for j in r]
+            a = int(rng.integers(len(ids))); b = min(len(ids), a + int(rng.integers(2, 8)))
+            sel = ids[a:b]
+            x0 = min(st[j, 0] for j in sel) - rng.uniform(0, 6); x1 = max(st[j, 0] + st[j, 2] for j in sel) + rng.uniform(0, 6)
+            top = np.median([st[j, 1] for j in sel]); bot = np.median([st[j, 1] + st[j, 3] for j in sel])
+            kind = rng.random()
+            t = np.linspace(0, 1, 120)
+            if kind < 0.55:                          # strike-through: through the middle of the letters
+                ym = top + (bot - top) * rng.uniform(0.35, 0.65)
+                slope = rng.uniform(-0.06, 0.06) * (x1 - x0)
+                P = np.stack([x0 + (x1 - x0) * t, ym + slope * (t - 0.5) + rng.uniform(0.3, 1.2) * np.sin(t * rng.uniform(3, 9))], 1)
+                if rng.random() < 0.25:              # struck twice
+                    P2 = P + np.array([0, rng.uniform(2, 4)])
+                    cv2.polylines(m, [np.round(P2 * 4).astype(np.int32)], False, 255, th, cv2.LINE_AA, shift=2)
+            elif kind < 0.8:                         # underline just under the baseline (touching it at times)
+                yb = bot + rng.uniform(-1, 4)
+                P = np.stack([x0 + (x1 - x0) * t, yb + rng.uniform(-1.5, 1.5) * (t - 0.5) + rng.uniform(0.2, 1.0) * np.sin(t * rng.uniform(2, 6))], 1)
+            else:                                    # scribbled out: zigzag over the word
+                nz = int(rng.integers(3, 8))
+                xs = np.linspace(x0, x1, nz * 2 + 1)
+                ys = np.where(np.arange(len(xs)) % 2 == 0, top + rng.uniform(-2, 3), bot + rng.uniform(-3, 2))
+                P = np.stack([xs, ys], 1)
         else:                                        # tick through a word
             cx, cy = rng.uniform(30, 226, 2)
             s = rng.uniform(10, 35)
@@ -400,6 +435,7 @@ def main():
     ap.add_argument("--hard", type=float, default=0.0, help="share of real tiles centred on current errors")
     ap.add_argument("--pen", type=float, default=0.0, help="share of real tiles with drawn pen circles / ticks over print")
     ap.add_argument("--pen-print-neg", type=float, default=0.0, help="extra weight on pen-only pixels in the print channel")
+    ap.add_argument("--ov-print-w", type=float, default=3.0, help="weight of print hidden under pen in the print channel")
     ap.add_argument("--pen-score-w", type=float, default=0.5, help="weight of the pen-mark checks in checkpoint choice")
     ap.add_argument("--recall-w", type=float, default=1.0, help="weight of hw recall in checkpoint choice")
     ap.add_argument("--gate-kept", type=float, default=0.98)
@@ -461,7 +497,7 @@ def main():
         x = augment(torch.cat([xs, xr]), g)
         logits = model(x)
         l_syn, _ = loss_fn(logits[:n_syn], ys, 2.5, 4.0, ov_print_w=3.0)
-        l_real = masked_loss(logits[n_syn:], yr, vr, hw_pos_w=args.hw_pos_w)
+        l_real = masked_loss(logits[n_syn:], yr, vr, hw_pos_w=args.hw_pos_w, ov_print_w=args.ov_print_w)
         if args.pen_print_neg > 0:  # pen with no print under it must not light the print channel
             wn = yr[:, 1] * (1 - yr[:, 0]) * vr[:, 0]
             bn = torch.nn.functional.binary_cross_entropy_with_logits(logits[n_syn:, 0], yr[:, 0], reduction="none")

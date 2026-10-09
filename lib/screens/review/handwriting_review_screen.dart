@@ -7,9 +7,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/models/handwriting_method.dart';
+import '../../core/theme/app_theme.dart';
+import '../../l10n/app_localizations.dart';
 import '../../services/export_service.dart';
 import '../../state/scan_session.dart';
-import '../../widgets/step_progress_indicator.dart';
+import '../../widgets/page_strip.dart';
 import '../export/export_screen.dart';
 
 enum _BrushMode { none, add, keep }
@@ -57,141 +59,185 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
       _decodeFuture = _decodeImage(page.cleanPath);
     }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Chữ viết tay'),
-        actions: [
-          IconButton(
-            tooltip: _showMask ? 'Ẩn vùng phát hiện' : 'Hiện vùng phát hiện',
-            icon: Icon(_showMask ? Icons.visibility : Icons.visibility_off),
-            onPressed: () => setState(() => _showMask = !_showMask),
+    final l = AppLocalizations.of(context);
+    // closing a later step ends the scan: a new capture starts a new document
+    return PopScope(
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) session.reset();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          // steps only go forward: leaving here closes the scan flow, it does not reopen processing
+          leading: const CloseButton(),
+          title: Text(
+            session.pages.length > 1
+                ? '${l.handwritingTitle} · ${l.pageOf(session.currentPageIndex + 1, session.pages.length)}'
+                : l.handwritingTitle,
           ),
-          // Saves the RAW capture straight out of the document scanner — before sharpen,
-          // shadow-removal, or erase touch it — so a bug report can tell "the detector read this
-          // wrong" apart from "the photo itself was already blurry/warped/cropped oddly".
-          if (kDebugMode && page != null)
+          actions: [
             IconButton(
-              tooltip: 'Lưu ảnh gốc vào Ảnh',
-              icon: _savingOriginalImage
-                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.image_outlined),
-              onPressed: _savingOriginalImage ? null : () => _saveOriginalImageToGallery(context, page.originalPath),
+              tooltip: _showMask ? l.hideMask : l.showMask,
+              icon: Icon(_showMask ? Icons.visibility : Icons.visibility_off),
+              onPressed: () => setState(() => _showMask = !_showMask),
             ),
-        ],
-      ),
-      body: page == null
-          ? const SizedBox.shrink()
-          : Column(
-              children: [
-                StepProgressIndicator(currentStep: session.step),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: SegmentedButton<HandwritingMethod>(
-                    segments: const [
-                      ButtonSegment(
-                        value: HandwritingMethod.inkColor,
-                        label: Text('Màu mực'),
-                        icon: Icon(Icons.palette_outlined),
-                      ),
-                      ButtonSegment(
-                        value: HandwritingMethod.segmentation,
-                        label: Text('Màu mực + AI'),
-                        icon: Icon(Icons.auto_awesome_outlined),
-                      ),
-                    ],
-                    selected: {session.method},
-                    onSelectionChanged: session.isProcessing
-                        ? null
-                        : (s) => session.updateDetection(method: s.first),
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: Row(
-                    children: [
-                      const Text('Độ nhạy', style: TextStyle(fontSize: 13)),
-                      Expanded(
-                        child: Slider(
-                          value: _pendingSensitivity ?? session.sensitivity,
-                          onChanged: session.isProcessing ? null : (v) => setState(() => _pendingSensitivity = v),
-                          onChangeEnd: (v) async {
-                            await session.updateDetection(sensitivity: v);
-                            if (mounted) setState(() => _pendingSensitivity = null);
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: Text(
-                    _hintText(session.method, page.maskCoverage),
-                    style: const TextStyle(fontSize: 13, color: Colors.grey),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: FutureBuilder<ui.Image>(
-                    future: _decodeFuture,
-                    builder: (context, snapshot) {
-                      if (!snapshot.hasData) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
-                      return _buildCanvas(context, session, snapshot.data!);
-                    },
-                  ),
-                ),
-                if (session.lastError != null)
+            // Saves the RAW capture straight out of the document scanner — before sharpen,
+            // shadow-removal, or erase touch it — so a bug report can tell "the detector read this
+            // wrong" apart from "the photo itself was already blurry/warped/cropped oddly".
+            if (kDebugMode && page != null)
+              IconButton(
+                tooltip: l.saveOriginal,
+                icon: _savingOriginalImage
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.image_outlined),
+                onPressed: _savingOriginalImage ? null : () => _saveOriginalImageToGallery(context, page.originalPath),
+              ),
+          ],
+        ),
+        body: page == null
+            ? const SizedBox.shrink()
+            : Column(
+                children: [
+                  const SizedBox(height: 8),
                   Padding(
-                    padding: const EdgeInsets.all(8),
-                    child: Text(session.lastError!, style: const TextStyle(color: Colors.red)),
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: SegmentedButton<HandwritingMethod>(
+                      segments: [
+                        ButtonSegment(
+                          value: HandwritingMethod.inkColor,
+                          label: Text(l.methodInk),
+                          icon: const Icon(Icons.palette_outlined),
+                        ),
+                        ButtonSegment(
+                          value: HandwritingMethod.segmentation,
+                          label: Text(l.methodAi),
+                          icon: const Icon(Icons.auto_awesome_outlined),
+                        ),
+                      ],
+                      selected: {session.method},
+                      onSelectionChanged: session.isProcessing ? null : (s) => session.updateDetection(method: s.first),
+                    ),
                   ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: SegmentedButton<_BrushMode>(
-                    segments: const [
-                      ButtonSegment(value: _BrushMode.none, label: Text('Xem'), icon: Icon(Icons.pan_tool_outlined)),
-                      ButtonSegment(value: _BrushMode.add, label: Text('Thêm vùng xoá'), icon: Icon(Icons.brush)),
-                      ButtonSegment(value: _BrushMode.keep, label: Text('Giữ lại'), icon: Icon(Icons.cleaning_services_outlined)),
-                    ],
-                    selected: {_brushMode},
-                    onSelectionChanged: (s) => setState(() => _brushMode = s.first),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Row(
+                      children: [
+                        Text(l.sensitivity, style: const TextStyle(fontSize: 13)),
+                        Expanded(
+                          child: Slider(
+                            value: _pendingSensitivity ?? session.sensitivity,
+                            onChanged: session.isProcessing ? null : (v) => setState(() => _pendingSensitivity = v),
+                            onChangeEnd: (v) async {
+                              await session.updateDetection(sensitivity: v);
+                              if (mounted) setState(() => _pendingSensitivity = null);
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  child: FilledButton.icon(
-                    onPressed: session.isProcessing || page.maskCoverage <= 0
-                        ? null
-                        : () async {
-                            await session.eraseHandwriting();
-                            if (context.mounted && session.lastError == null) {
-                              Navigator.of(context).push(
-                                MaterialPageRoute(builder: (_) => const ExportScreen()),
-                              );
-                            }
-                          },
-                    icon: session.isProcessing
-                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                        : const Icon(Icons.auto_fix_high),
-                    label: const Text('Xoá chữ viết tay'),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Text(
+                      _hintText(l, session.method, page.maskCoverage),
+                      style: const TextStyle(fontSize: 13, color: Colors.grey),
+                    ),
                   ),
-                ),
-              ],
-            ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: FutureBuilder<ui.Image>(
+                      future: _decodeFuture,
+                      builder: (context, snapshot) {
+                        if (!snapshot.hasData) {
+                          return const Center(child: CircularProgressIndicator());
+                        }
+                        return _buildCanvas(context, session, snapshot.data!);
+                      },
+                    ),
+                  ),
+                  if (session.lastError != null)
+                    Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Text(session.lastError!, style: const TextStyle(color: AppColors.danger)),
+                    ),
+                  if (session.pages.length > 1) ...[
+                    const SizedBox(height: 8),
+                    PageStrip(
+                      pages: session.pages,
+                      selected: session.currentPageIndex,
+                      onSelect: session.isProcessing ? (_) {} : session.selectPage,
+                    ),
+                  ],
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    child: SegmentedButton<_BrushMode>(
+                      segments: [
+                        ButtonSegment(
+                          value: _BrushMode.none,
+                          label: Text(l.brushView),
+                          icon: const Icon(Icons.pan_tool_outlined),
+                        ),
+                        ButtonSegment(value: _BrushMode.add, label: Text(l.brushAdd), icon: const Icon(Icons.brush)),
+                        ButtonSegment(
+                          value: _BrushMode.keep,
+                          label: Text(l.brushKeep),
+                          icon: const Icon(Icons.cleaning_services_outlined),
+                        ),
+                      ],
+                      selected: {_brushMode},
+                      onSelectionChanged: (s) => setState(() => _brushMode = s.first),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          flex: 2,
+                          child: OutlinedButton(
+                            onPressed: session.isProcessing ? null : () => _toExport(context, session),
+                            child: Text(l.skip),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          flex: 3,
+                          child: FilledButton.icon(
+                            onPressed: session.isProcessing || !session.hasHandwriting
+                                ? null
+                                : () async {
+                                    await session.eraseHandwriting();
+                                    if (context.mounted && session.lastError == null) await _toExport(context, session);
+                                  },
+                            icon: session.isProcessing
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                  )
+                                : const Icon(Icons.auto_fix_high_rounded),
+                            label: Text(session.pages.length > 1 ? l.eraseAllPages : l.eraseHandwriting),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+      ),
     );
   }
 
-  String _hintText(HandwritingMethod method, double coverage) {
-    if (coverage <= 0) {
-      return method == HandwritingMethod.inkColor
-          ? 'Không thấy nét bút khác màu mực in — thử tăng độ nhạy; bút cùng màu mực in thì dùng "Màu mực + AI".'
-          : 'Không thấy chữ viết tay — thử tăng độ nhạy hoặc tô thêm bằng cọ.';
-    }
-    final percent = (coverage * 100).toStringAsFixed(coverage < 0.01 ? 2 : 1);
-    return 'Vùng đỏ ($percent% trang) sẽ bị xoá; chỗ vàng là chữ in bị viết đè — sẽ được dựng lại. '
-        'Dùng cọ để thêm vùng hoặc giữ lại chữ bị tô nhầm; đổi cách/độ nhạy sẽ phát hiện lại từ đầu.';
+  /// The other pages are sharpened / de-shadowed first, so the export never mixes raw captures in.
+  Future<void> _toExport(BuildContext context, ScanSession session) async {
+    await session.processRemainingPages();
+    if (!context.mounted || session.lastError != null) return;
+    session.goToExport();
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const ExportScreen()));
+  }
+
+  String _hintText(AppLocalizations l, HandwritingMethod method, double coverage) {
+    if (coverage <= 0) return method == HandwritingMethod.inkColor ? l.hintNoneInk : l.hintNoneAi;
+    return l.hintCoverage((coverage * 100).toStringAsFixed(coverage < 0.01 ? 2 : 1));
   }
 
   Widget _buildCanvas(BuildContext context, ScanSession session, ui.Image image) {
@@ -218,9 +264,7 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
                 onPanUpdate: brushing && !session.isProcessing
                     ? (d) => setState(() => _liveStroke = [..._liveStroke, d.localPosition * toImage])
                     : null,
-                onPanEnd: brushing && !session.isProcessing
-                    ? (_) => _commitStroke(session, brushImageWidth)
-                    : null,
+                onPanEnd: brushing && !session.isProcessing ? (_) => _commitStroke(session, brushImageWidth) : null,
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
@@ -237,9 +281,23 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
                         ),
                       ),
                     if (session.isProcessing)
-                      const ColoredBox(
-                        color: Color(0x66FFFFFF),
-                        child: Center(child: CircularProgressIndicator()),
+                      ColoredBox(
+                        color: const Color(0x66FFFFFF),
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const CircularProgressIndicator(),
+                              if (session.batchProgress case final b?) ...[
+                                const SizedBox(height: 12),
+                                Text(
+                                  AppLocalizations.of(context).erasingPages(b.current, b.total),
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
                       ),
                   ],
                 ),
@@ -255,7 +313,9 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
     final points = _liveStroke;
     if (points.isEmpty) return;
     final stroke = MaskStroke(
-      points: [for (final p in points) ...[p.dx, p.dy]],
+      points: [
+        for (final p in points) ...[p.dx, p.dy],
+      ],
       width: brushImageWidth,
       erase: _brushMode == _BrushMode.keep,
     );
@@ -273,16 +333,16 @@ class _HandwritingReviewScreenState extends State<HandwritingReviewScreen> {
       final ext = originalPath.split('.').last;
       final outPath = '${tempDir.path}/original_${DateTime.now().millisecondsSinceEpoch}.$ext';
       await File(originalPath).copy(outPath);
-      await ExportService().saveToGallery(outPath);
+      await ExportService().saveToGallery([outPath]);
 
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Đã lưu ảnh gốc vào Ảnh — gửi trực tiếp từ đó.')),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(AppLocalizations.of(context).savedOriginal)));
       }
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Lưu thất bại: $e')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(AppLocalizations.of(context).saveFailed('$e'))));
       }
     } finally {
       if (mounted) setState(() => _savingOriginalImage = false);
