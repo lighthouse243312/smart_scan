@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Scan Privacy Policy</title>
+<meta name="description" content="How the Smart Scan app handles your data.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="icon.png">
+</head>
+<body>
+<main>
+  <header>
+    <img src="icon.png" alt="Smart Scan icon">
+    <div><strong>Smart Scan</strong><span>Document scanner &amp; handwriting eraser</span></div>
+  </header>
+  <nav><a href="./">Support</a><a class="on" href="privacy.html">Privacy Policy</a></nav>
+
+  <h1>Privacy Policy</h1>
+  <p class="muted">Last updated: October 11, 2026</p>
+
+  <p>This policy explains what the Smart Scan app ("the app", "we") collects and why. In short: your documents never
+     leave your device unless you share them yourself; we collect a small amount of technical device information to keep
+     the app working and to send notifications.</p>
+
+  <h2>Your documents and photos</h2>
+  <ul>
+    <li>Photos you scan or pick, and the documents made from them, are processed <strong>on your device</strong>.
+        They are not uploaded to our servers.</li>
+    <li>They are stored in the app's private storage on your device until you delete them or remove the app.</li>
+    <li>When you share or export a document, it goes only to the app or person you choose.</li>
+    <li>The app asks for camera access to scan, and for photo library access only when you pick photos or save images.</li>
+  </ul>
+
+  <h2>Technical information we collect</h2>
+  <p>When the app starts, it stores one record per device in Google Firebase Cloud Firestore containing:</p>
+  <ul>
+    <li>a device identifier (Android ID on Android, identifierForVendor on iOS),</li>
+    <li>device model, operating system version and whether it is a physical device,</li>
+    <li>app version, the app language you chose, and your device's language, region and time zone,</li>
+    <li>a Firebase Cloud Messaging token, used to deliver notifications to the app.</li>
+  </ul>
+  <p>We use this to understand which devices and languages to support and to send notifications. It does not include
+     your name, contacts, location or document contents.</p>
+
+  <h2>Crash reports</h2>
+  <p>If the app crashes, Firebase Crashlytics sends a crash report (stack trace, device model, OS version, app version and
+     the device identifier above) so we can fix the problem.</p>
+
+  <h2>Notifications</h2>
+  <p>The app may ask for permission to show notifications. You can turn notifications off at any time in your device
+     settings.</p>
+
+  <h2>Third-party services</h2>
+  <p>The app uses Google Firebase (Cloud Firestore, Cloud Messaging, Crashlytics), operated by Google, to process the
+     information above. See <a href="https://firebase.google.com/support/privacy">Firebase privacy and security</a>.
+     The app does not show ads and does not sell your data.</p>
+
+  <h2>Data retention and deletion</h2>
+  <p>Documents are deleted when you delete them in the app or uninstall it. To ask us to delete the technical record for
+     your device, open a <a href="https://github.com/lighthouse243312/smart_scan/issues/new">support request</a>
+     and include the app version and device model.</p>
+
+  <h2>Children</h2>
+  <p>The app is a general-purpose document tool and does not knowingly collect personal information from children.</p>
+
+  <h2>Changes</h2>
+  <p>We may update this policy; the date at the top shows the latest version.</p>
+
+  <h2>Contact</h2>
+  <p>Questions about this policy: <a href="https://github.com/lighthouse243312/smart_scan/issues/new">open a support request</a>.</p>
+
+  <footer>© 2026 Beacon · <a href="./">Support</a></footer>
+</main>
+</body>
+</html>
