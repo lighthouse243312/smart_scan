@@ -122,9 +122,13 @@ object RuleRedraw {
             if (hwTight[i].toInt() != 0) inHw[l]++
             if (pure[i].toInt() != 0) isPure[l]++
         }
+        // specks: a few pixels left in the band beside a rule the writing touched are pen residue
+        // whatever the mask says (anti-aliased stroke edges fall outside it); a letter is bigger
+        val speck = 2 * k * k
         val go = BooleanArray(count) { l ->
             l > 0 && isPure[l] <= 0.2 * cnt[l] &&
-                ((inZone[l] >= 0.85 * cnt[l] && inHw[l] >= 0.6 * cnt[l]) || (inZone[l] >= 0.4 * cnt[l] && inHw[l] >= 0.9 * cnt[l]))
+                ((inZone[l] >= 0.85 * cnt[l] && inHw[l] >= 0.6 * cnt[l]) || (inZone[l] >= 0.4 * cnt[l] && inHw[l] >= 0.9 * cnt[l]) ||
+                    (cnt[l] <= speck && inZone[l] >= 0.5 * cnt[l]))
         }
         for (i in 0 until n) if (go[lab[i]]) for (c in 0..2) out[i * 3 + c] = pap[i * 3 + c]
 

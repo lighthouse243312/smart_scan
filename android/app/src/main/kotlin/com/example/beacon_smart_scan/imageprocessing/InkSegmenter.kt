@@ -100,28 +100,15 @@ object InkSegmenter {
             print.convertTo(print, CvType.CV_8U)
             Core.bitwise_and(print, ink, print)
 
-            // combined with the ink-colour + layout method (see ios segmentationMaskAtPath): colour
-            // finds neat pen writing the model misses, the model finds pen ink the same colour as
-            // the print. A model pixel is dropped only where BOTH agree it is print.
-            val (colorHw, colorPrint, colorOverlap) = InkAnalysis.detectByInkColor(src, colorDelta, printProb, handwritingProb)
-            val tmp = Mat(); val hw = Mat(); val overlap = Mat(); val outPrint = Mat(); val notHw = Mat(); val notColorHw = Mat()
-            releasing(colorHw, colorPrint, colorOverlap, tmp, hw, overlap, outPrint, notHw, notColorHw) {
-                Core.bitwise_and(colorPrint, print, tmp)
-                Core.bitwise_not(tmp, tmp)
-                Core.bitwise_and(handwriting, tmp, tmp)
-                Core.bitwise_or(colorHw, tmp, hw)
-                // print under the pen: colour's overlap, plus where the model's print layer is set
-                // under model-only handwriting
-                Core.bitwise_not(colorHw, notColorHw)
-                Core.bitwise_and(hw, print, tmp)
-                Core.bitwise_and(tmp, notColorHw, tmp)
-                Core.bitwise_or(colorOverlap, tmp, overlap)
-                Core.bitwise_or(colorPrint, print, outPrint)
-                Core.bitwise_not(hw, notHw)
-                Core.bitwise_and(outPrint, notHw, outPrint)
-                Core.bitwise_or(outPrint, overlap, outPrint)
+            // two stages: the ink-colour method decides first (ink clearly unlike the print is
+            // handwriting, exactly as "Ink colour" alone), then the model only finishes what colour
+            // left — tails of those strokes and pen the colour of the print (see ModelFinish)
+            val (hw, outPrint, overlap) = InkAnalysis.detectByInkColor(src, colorDelta, printProb, handwritingProb)
+            releasing(hw, outPrint, overlap) {
                 PenComponentVote.apply(src, hw, outPrint, overlap, handwritingProb)
-                StrokeVote.apply(hw, outPrint, overlap, ink, handwritingProb, printProb, threshold)
+                ModelFinish.apply(hw, outPrint, overlap, ink, handwritingProb, printProb, threshold,
+                    HandwritingMask.minSpeckleArea(src))
+                StrikeThrough.apply(src, hw, outPrint, overlap)
                 HandwritingMask.write(hw, outPrint, overlap, maskPath)
                 HandwritingMask.result(maskPath, hw)
             }

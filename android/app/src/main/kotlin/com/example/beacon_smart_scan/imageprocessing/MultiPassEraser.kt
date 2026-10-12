@@ -21,9 +21,41 @@ object MultiPassEraser {
     /**
      * [inputPath]: the processed page to erase from; [analysisPath]: the unprocessed page [maskPath]
      * was detected on. Later passes re-detect with the model + colour method when [useModel], else
-     * the colour method alone, at [threshold] / [colorDelta].
+     * the colour method alone, at [threshold] / [colorDelta]. A page larger than the working size is
+     * erased at that size and the result laid back over the full-resolution page (see [WorkingSize]).
      */
     fun erase(
+        context: Context, inputPath: String, analysisPath: String, maskPath: String, outputPath: String,
+        useModel: Boolean, threshold: Double, colorDelta: Double,
+    ): Map<String, Any> {
+        val scale = WorkingSize.scaleFor(inputPath)
+        if (scale >= 1.0) return eraseAtSize(context, inputPath, analysisPath, maskPath, outputPath, useModel, threshold, colorDelta)
+        val work = WorkingSize.newWorkDir(context)
+        try {
+            val smallIn = WorkingSize.downscaleImage(inputPath, File(work, "page.png").path, scale)
+            val size = WorkingSize.sizeOf(smallIn)
+            val smallAnalysis = File(work, "analysis.png").path
+            run {
+                val analysis = ImageIO.readOrThrow(analysisPath)
+                val small = org.opencv.core.Mat()
+                try {
+                    org.opencv.imgproc.Imgproc.resize(analysis, small, size, 0.0, 0.0, org.opencv.imgproc.Imgproc.INTER_AREA)
+                    ImageIO.writeOrThrow(small, smallAnalysis)
+                } finally {
+                    analysis.release(); small.release()
+                }
+            }
+            val smallMask = WorkingSize.resizeMask(maskPath, File(work, "mask.png").path, size)
+            val smallOut = File(work, "erased.png").path
+            val result = eraseAtSize(context, smallIn, smallAnalysis, smallMask, smallOut, useModel, threshold, colorDelta)
+            WorkingSize.composite(inputPath, smallIn, smallOut, outputPath)
+            return mapOf("outputPath" to outputPath, "passes" to result.getValue("passes"))
+        } finally {
+            work.deleteRecursively()
+        }
+    }
+
+    private fun eraseAtSize(
         context: Context, inputPath: String, analysisPath: String, maskPath: String, outputPath: String,
         useModel: Boolean, threshold: Double, colorDelta: Double,
     ): Map<String, Any> {
@@ -47,6 +79,25 @@ object MultiPassEraser {
                 passes = pass
             }
             PrintGuard.restorePrint(erased, inputPath, maskPath, laterMasks, outputPath)
+            // the restore draws print back from the clean page, pen bits stuck to the rules with it:
+            // the rules the handwriting touched are cleared and drawn once more, last
+            run {
+                val dst = ImageIO.readOrThrow(outputPath)
+                val analysis = ImageIO.readOrThrow(analysisPath)
+                val ref = HandwritingMask.read(maskPath)
+                try {
+                    if (analysis.size() != dst.size()) org.opencv.imgproc.Imgproc.resize(analysis, analysis, dst.size(), 0.0, 0.0, org.opencv.imgproc.Imgproc.INTER_AREA)
+                    if (ref.handwriting.size() != dst.size()) {
+                        org.opencv.imgproc.Imgproc.resize(ref.handwriting, ref.handwriting, dst.size(), 0.0, 0.0, org.opencv.imgproc.Imgproc.INTER_NEAREST)
+                        org.opencv.imgproc.Imgproc.resize(ref.print, ref.print, dst.size(), 0.0, 0.0, org.opencv.imgproc.Imgproc.INTER_NEAREST)
+                    }
+                    RuleRedraw.apply(analysis, ref.handwriting, ref.print, dst)
+                    LineHeal.apply(dst, ref.handwriting, ref.print)
+                    ImageIO.writeOrThrow(dst, outputPath)
+                } finally {
+                    dst.release(); analysis.release(); ref.release()
+                }
+            }
             return mapOf("outputPath" to outputPath, "passes" to passes)
         } finally {
             work.deleteRecursively()

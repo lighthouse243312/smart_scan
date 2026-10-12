@@ -100,6 +100,8 @@ object PrintRepair {
             // coarse search at half resolution, refined at full resolution around the best hit
             val sc = 2
             val inkH = own(Mat()); Imgproc.resize(inkF, inkH, Size(), 1.0 / sc, 1.0 / sc, Imgproc.INTER_AREA)
+            // the page and its square in the frequency domain, once for every window's search
+            val spectra = Spectra(inkH).also { own(it.page); own(it.pageSquared) }
             val erasedH = own(Mat()); Imgproc.resize(erased, erasedH, inkH.size(), 0.0, 0.0, Imgproc.INTER_NEAREST)
             val th = t / sc
             val resW = inkH.cols() - th + 1; val resH = inkH.rows() - th + 1
@@ -136,7 +138,7 @@ object PrintRepair {
             val twinOf = arrayOfNulls<Twin>(windows.size)
             IntStream.range(0, windows.size).parallel().forEach { w ->
                 twinOf[w] = findTwin(windows[w].x.toInt(), windows[w].y.toInt(), t, th, sc, k,
-                    erased, ink, visiblePrint, visibleText, wasNear, inkF, inkH, erasedH, validBase, dst.cols(), dst.rows())
+                    erased, ink, visiblePrint, visibleText, wasNear, inkF, inkH, spectra, erasedH, validBase, dst.cols(), dst.rows())
             }
 
             // fill only the erased pixels that were ink in the original, and only with the twin's INK
@@ -163,10 +165,61 @@ object PrintRepair {
         }
     }
 
+    /**
+     * The search page [img] (CV_32F) and its square, Fourier-transformed once (zero-padded to a fast
+     * DFT size) for every window's masked match against it. The caller releases [page] and
+     * [pageSquared].
+     */
+    private class Spectra(img: Mat) {
+        private val cols = img.cols()
+        private val rows = img.rows()
+        private val dftSize = Size(Core.getOptimalDFTSize(cols).toDouble(), Core.getOptimalDFTSize(rows).toDouble())
+        val page = transform(img, rows)
+        val pageSquared = Mat().let { sq ->
+            Core.multiply(img, img, sq)
+            transform(sq, rows).also { sq.release() }
+        }
+
+        private fun transform(m: Mat, nonzeroRows: Int): Mat {
+            val padded = Mat.zeros(dftSize, CvType.CV_32F)
+            val roi = padded.submat(Rect(0, 0, m.cols(), m.rows()))
+            m.copyTo(roi); roi.release()
+            Core.dft(padded, padded, 0, nonzeroRows)
+            return padded
+        }
+
+        /**
+         * Masked TM_SQDIFF of [templ] over the page, up to a constant: Σ m·(I − T)² = Σ m·I² − 2·Σ m·T·I
+         * + Σ m·T², and the last term is the same at every spot, so where the minimum lies — all the
+         * search needs — is unchanged. Both correlations in one inverse transform, against the page's
+         * spectra computed once, instead of matchTemplate's masked path (three full correlations, the
+         * page squared again, for every window).
+         */
+        fun maskedSqDiff(templ: Mat, mask: Mat): Mat {
+            val mt = Mat()
+            Core.multiply(templ, mask, mt)
+            val fMask = transform(mask, mask.rows())
+            val fMt = transform(mt, mt.rows())
+            val acc = Mat(); val cross = Mat()
+            try {
+                // correlation = conjugate product
+                Core.mulSpectrums(pageSquared, fMask, acc, 0, true)
+                Core.mulSpectrums(page, fMt, cross, 0, true)
+                Core.scaleAdd(cross, -2.0, acc, acc)
+                val resW = cols - templ.cols() + 1; val resH = rows - templ.rows() + 1
+                Core.dft(acc, acc, Core.DFT_INVERSE or Core.DFT_SCALE or Core.DFT_REAL_OUTPUT, resH)
+                val roi = acc.submat(Rect(0, 0, resW, resH))
+                return roi.clone().also { roi.release() }
+            } finally {
+                listOf(mt, fMask, fMt, acc, cross).forEach { it.release() }
+            }
+        }
+    }
+
     /** The twin (full-resolution top-left) for the window at ([x0], [y0]), or null if none convinces. */
     private fun findTwin(
         x0: Int, y0: Int, t: Int, th: Int, sc: Int, k: Int,
-        erased: Mat, ink: Mat, visiblePrint: Mat, visibleText: Mat, wasNear: Mat, inkF: Mat, inkH: Mat, erasedH: Mat, validBase: Mat,
+        erased: Mat, ink: Mat, visiblePrint: Mat, visibleText: Mat, wasNear: Mat, inkF: Mat, inkH: Mat, spectra: Spectra, erasedH: Mat, validBase: Mat,
         cols: Int, rows: Int,
     ): Twin? {
         val owned = ArrayList<Mat>()
@@ -197,8 +250,7 @@ object PrintRepair {
             val maskH = own(Mat())
             val knownH = own(Mat()); Core.bitwise_not(own(erasedH.submat(rh)), knownH)
             knownH.convertTo(maskH, CvType.CV_32F, 1.0 / 255.0)
-            val res = own(Mat())
-            Imgproc.matchTemplate(inkH, own(inkH.submat(rh)), res, Imgproc.TM_SQDIFF, maskH)
+            val res = own(spectra.maskedSqDiff(own(inkH.submat(rh)), maskH))
             // the best valid spot, then the best valid spot clear of the first (not itself)
             val valid = own(validBase.clone())
             fun exclude(p: Point) {

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/theme/app_theme.dart';
 import '../../l10n/app_localizations.dart';
+import '../../services/firebase/firebase_setup.dart';
 import '../capture/capture_screen.dart';
 import '../library/library_screen.dart';
 
@@ -21,6 +22,13 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // notification permission prompt + FCM token + user log, once the UI is up
+    WidgetsBinding.instance.addPostFrameCallback((_) => FirebaseSetup.start());
+  }
 
   void _select(int i) => setState(() => _index = i);
 

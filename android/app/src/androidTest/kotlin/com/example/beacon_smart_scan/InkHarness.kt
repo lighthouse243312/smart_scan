@@ -76,6 +76,11 @@ class InkHarness : Instrumentation() {
             }
             val context = targetContext
             val dir = File(context.getExternalFilesDir(null), args.getString("dir") ?: "harness")
+            args.getString("pdf")?.let { pdf ->
+                // -e pdf file.pdf: the PDF import's page rendering (<dir>/<file>_<n>.png)
+                val r = com.example.beacon_smart_scan.imageprocessing.PdfImporter.render(File(dir, pdf).path, dir.path, pdf.substringBeforeLast('.'))
+                out.putString(REPORT_KEY_STREAMRESULT, "pdf pages: ${r["pages"]}\n"); finish(0, out); return
+            }
             val input = File(dir, args.getString("input") ?: error("missing -e input")).path
             val clean = args.getString("clean")?.let { File(dir, it).path } ?: input
             val s = (args.getString("sensitivity") ?: "0.6").toDouble().coerceIn(0.0, 1.0)
@@ -89,8 +94,12 @@ class InkHarness : Instrumentation() {
             com.example.beacon_smart_scan.imageprocessing.PrintRetypeset.enabled = args.getString("retypeset") != "0"
             com.example.beacon_smart_scan.imageprocessing.PrintRecognition.enabled = args.getString("recognition") != "0"
             com.example.beacon_smart_scan.imageprocessing.StrokeVote.enabled = args.getString("strokevote") != "0"
+            com.example.beacon_smart_scan.imageprocessing.LineHeal.enabled = args.getString("lineheal") != "0"
             com.example.beacon_smart_scan.imageprocessing.HandwritingMask.consistent = args.getString("consistent") != "0"
             com.example.beacon_smart_scan.imageprocessing.RuleRedraw.enabled = args.getString("rules") != "0"
+            com.example.beacon_smart_scan.imageprocessing.HandwritingMask.touchCheck = args.getString("touch") != "0"
+            com.example.beacon_smart_scan.imageprocessing.StrokeVote.pieces = args.getString("pieces") != "0"
+            com.example.beacon_smart_scan.imageprocessing.StrikeThrough.enabled = args.getString("strike") == "1"
             val mask = "${base}_mask.png"
             if (args.getString("layers") == "1") {
                 // the two detectors separately: model probabilities and the colour method's layers
@@ -106,19 +115,24 @@ class InkHarness : Instrumentation() {
             }
             val t0 = System.currentTimeMillis()
             val result = when (args.getString("method") ?: "segmentation") {
-                "color" -> InkColorMasker.mask(context, input, mask, 0.08 - 0.06 * s)
-                else -> InkSegmenter.mask(context, input, mask, 0.8 - 0.6 * s, 0.08 - 0.06 * s)
+                // through the working size, as the app's channel does
+                "color" -> com.example.beacon_smart_scan.imageprocessing.WorkingSize.detect(context, input, mask) { i, m ->
+                    InkColorMasker.mask(context, i, m, 0.08 - 0.06 * s) }
+                else -> com.example.beacon_smart_scan.imageprocessing.WorkingSize.detect(context, input, mask) { i, m ->
+                    InkSegmenter.mask(context, i, m, 0.8 - 0.6 * s, 0.08 - 0.06 * s) }
             }
             val t1 = System.currentTimeMillis()
-            if (args.getString("erase") != "0") MaskEraser.erase(clean, input, mask, "${base}_erased.png")
+            if (args.getString("erase") != "0" && (args.getString("passes")?.toInt() ?: 1) <= 1) MaskEraser.erase(clean, input, mask, "${base}_erased.png")
             val t2 = System.currentTimeMillis()
             val report = StringBuilder("mask ${t1 - t0} ms, erase ${t2 - t1} ms, coverage ${result["coverage"]}\n")
             // -e passes N: the app's multi-pass erase (lib/state/scan_session.dart eraseHandwriting)
+            com.example.beacon_smart_scan.imageprocessing.LineHeal.stats = ""
             val passes = args.getString("passes")?.toInt() ?: 1
             if (passes > 1 && args.getString("erase") != "0") {
                 val tp = System.currentTimeMillis()
                 val r = MultiPassEraser.erase(context, clean, input, mask, "${base}_final.png",
                     args.getString("method") != "color", 0.8 - 0.6 * s, 0.08 - 0.06 * s)
+                report.append(com.example.beacon_smart_scan.imageprocessing.LineHeal.stats)
                 report.append("multi-pass: ${r["passes"]} passes, ${System.currentTimeMillis() - tp} ms\n")
             }
             out.putString(REPORT_KEY_STREAMRESULT, report.toString())

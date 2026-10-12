@@ -78,21 +78,19 @@ object ImageProcessingChannel {
                     requirePath(call, "outputPath"),
                     (call.argument<Any>("quarterTurnsClockwise") as? Number)?.toInt() ?: 1,
                 )
-            "inkColorMask" ->
-                InkColorMasker.mask(
-                    appContext,
-                    requirePath(call, "inputPath"),
-                    requirePath(call, "maskPath"),
-                    requireDouble(call, "colorDelta", 0.05),
-                )
-            "segmentationMask" ->
-                InkSegmenter.mask(
-                    appContext,
-                    requirePath(call, "inputPath"),
-                    requirePath(call, "maskPath"),
-                    requireDouble(call, "threshold", 0.5),
-                    requireDouble(call, "colorDelta", 0.05),
-                )
+            "inkColorMask" -> {
+                val colorDelta = requireDouble(call, "colorDelta", 0.05)
+                WorkingSize.detect(appContext, requirePath(call, "inputPath"), requirePath(call, "maskPath")) { input, mask ->
+                    InkColorMasker.mask(appContext, input, mask, colorDelta)
+                }
+            }
+            "segmentationMask" -> {
+                val threshold = requireDouble(call, "threshold", 0.5)
+                val colorDelta = requireDouble(call, "colorDelta", 0.05)
+                WorkingSize.detect(appContext, requirePath(call, "inputPath"), requirePath(call, "maskPath")) { input, mask ->
+                    InkSegmenter.mask(appContext, input, mask, threshold, colorDelta)
+                }
+            }
             "applyMaskStrokes" ->
                 MaskEditor.applyStrokes(
                     requirePath(call, "maskPath"),
@@ -103,6 +101,12 @@ object ImageProcessingChannel {
                 ImageImporter.import(
                     requirePath(call, "inputPath"),
                     requirePath(call, "outputPath"),
+                )
+            "renderPdf" ->
+                PdfImporter.render(
+                    requirePath(call, "inputPath"),
+                    requirePath(call, "outputDir"),
+                    requirePath(call, "prefix"),
                 )
             "eraseWithMask" ->
                 MaskEraser.erase(

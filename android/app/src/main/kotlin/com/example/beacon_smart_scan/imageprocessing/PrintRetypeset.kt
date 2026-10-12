@@ -105,15 +105,18 @@ object PrintRetypeset {
             for (c in 0 until 3) dir[c] /= norm
             val thr = 0.5f * norm
             if (thr < 0.004f) return   // no distinguishable pen colour on this page
+            val unknown = own(Mat.zeros(H, W, CvType.CV_8U))
             val proj = own(Mat.zeros(H, W, CvType.CV_32F))
-            for (c in 0 until 3) {
-                val t = own(Mat()); Core.subtract(chroma[c], Scalar(refPr[c].toDouble()), t)
-                Core.scaleAdd(t, dir[c].toDouble(), proj, proj)
+            run {
+                for (c in 0 until 3) {
+                    val t = own(Mat()); Core.subtract(chroma[c], Scalar(refPr[c].toDouble()), t)
+                    Core.scaleAdd(t, dir[c].toDouble(), proj, proj)
+                }
+                val penPx = and(decided, cmp(proj, thr.toDouble(), Core.CMP_GT))
+                Imgproc.dilate(penPx, unknown, Mat.ones(3, 3, CvType.CV_8U))
+                val penNear = own(Mat()); Imgproc.dilate(penPx, penNear, Mat.ones(5, 5, CvType.CV_8U))
+                Core.bitwise_or(unknown, and(clipped, penNear), unknown)
             }
-            val penPx = and(decided, cmp(proj, thr.toDouble(), Core.CMP_GT))
-            val unknown = own(Mat()); Imgproc.dilate(penPx, unknown, Mat.ones(3, 3, CvType.CV_8U))
-            val penNear = own(Mat()); Imgproc.dilate(penPx, penNear, Mat.ones(5, 5, CvType.CV_8U))
-            Core.bitwise_or(unknown, and(clipped, penNear), unknown)
             // handwriting that touches no printed TEXT (an answer in its own cell; rules do not
             // count) holds no print to re-typeset: all of it is unknown, whatever its colour
             run {

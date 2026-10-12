@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../services/firebase/firebase_setup.dart';
+
 /// The app language: null follows the device, otherwise one of [supported]. Remembered across
 /// launches.
 class LocaleController extends ChangeNotifier {
@@ -46,5 +48,6 @@ class LocaleController extends ChangeNotifier {
     } else {
       await prefs.setString(_key, locale.languageCode);
     }
+    await FirebaseSetup.onAppLanguageChanged(locale?.languageCode);
   }
 }

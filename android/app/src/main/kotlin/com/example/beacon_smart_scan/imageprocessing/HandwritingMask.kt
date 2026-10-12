@@ -96,6 +96,11 @@ object HandwritingMask {
 
     /** Dev switch (InkHarness `-e consistent 0`): the old print / overlap layers, for comparison. */
     @JvmStatic var consistent = true
+    /** Dev switch (InkHarness `-e touch 0`). */
+    @JvmStatic var touchCheck = true
+
+    /** Print within this many pixels of handwriting may be its rim (see [strokesTouchingPrint]). */
+    private const val RIM_CLEAR = 2
 
     fun write(handwriting: Mat, print: Mat, overlap: Mat, path: String) {
         val red = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
@@ -115,7 +120,7 @@ object HandwritingMask {
             if (consistent) {
                 Core.bitwise_not(handwriting, notHw)
                 Core.bitwise_and(print, notHw, blue)
-                printThroughPen(overlap, blue, InkAnalysis.strokeUnit(handwriting.cols(), handwriting.rows()), under)
+                printThroughPen(overlap, blue, handwriting, InkAnalysis.strokeUnit(handwriting.cols(), handwriting.rows()), under)
             } else {
                 Core.bitwise_not(overlap, notHw); Core.bitwise_and(print, notHw, blue); overlap.copyTo(under)
             }
@@ -125,13 +130,43 @@ object HandwritingMask {
     }
 
     /**
+     * Handwriting strokes (connected pieces) with print near them that is not their own rim:
+     * pure print more than [RIM_CLEAR] px from any handwriting, within 2 stroke units of the stroke.
+     */
+    private fun strokesTouchingPrint(purePrint: Mat, handwriting: Mat, k: Int): Mat {
+        val rimK = Mat.ones(2 * RIM_CLEAR + 1, 2 * RIM_CLEAR + 1, CvType.CV_8U)
+        val near = Mat(); Imgproc.dilate(handwriting, near, rimK)
+        val far = Mat(); Core.bitwise_not(near, near); Core.bitwise_and(purePrint, near, far)
+        removeSmallComponents(far, k * k)   // specks of noise on the paper are not print
+        val reach = Mat(); val reachK = Mat.ones(4 * k + 1, 4 * k + 1, CvType.CV_8U)
+        Imgproc.dilate(far, reach, reachK)
+        val labels = Mat()
+        val n = Imgproc.connectedComponents(handwriting, labels, 8, CvType.CV_32S)
+        val w = handwriting.cols(); val h = handwriting.rows()
+        val lab = IntArray(w); val rr = ByteArray(w)
+        val touches = BooleanArray(n)
+        for (y in 0 until h) {
+            labels.get(y, 0, lab); reach.get(y, 0, rr)
+            for (x in 0 until w) if (lab[x] > 0 && rr[x].toInt() != 0) touches[lab[x]] = true
+        }
+        val out = Mat(h, w, CvType.CV_8U); val row = ByteArray(w)
+        for (y in 0 until h) {
+            labels.get(y, 0, lab)
+            for (x in 0 until w) row[x] = if (touches[lab[x]]) 255.toByte() else 0
+            out.put(y, 0, row)
+        }
+        listOf(rimK, near, far, reach, reachK, labels).forEach { it.release() }
+        return out
+    }
+
+    /**
      * [overlap] (print under the pen) kept only where the print runs THROUGH the pen: pure print
      * within 2 stroke units on both sides along the row or along the column, pixel by pixel. A rule
      * or a printed letter a pen crosses has print on either side; the body of a pen digit written
      * on a rule does not — the model's print layer bleeds onto it, and restoring it left dashes and
      * pieces of the digits behind. Mirrors PrintThroughPen in ios/Runner/ImageProcessingOpenCV.mm.
      */
-    private fun printThroughPen(overlap: Mat, purePrint: Mat, k: Int, out: Mat) {
+    private fun printThroughPen(overlap: Mat, purePrint: Mat, handwriting: Mat, k: Int, out: Mat) {
         val d = 2 * k
         val sides = listOf(
             Pair(Size((d + 1).toDouble(), 1.0), org.opencv.core.Point(d.toDouble(), 0.0)),   // print to the left
@@ -157,7 +192,12 @@ object HandwritingMask {
         Core.bitwise_not(thick, thick); Core.bitwise_and(rule, thick, rule)
         Core.bitwise_or(out, rule, out)
         Core.bitwise_and(out, overlap, out)
-        (sides + listOf(row, col, rule, thick, any, runK, thickK)).forEach { it.release() }
+        // a pen stroke that touches no print at all (a "1800" alone in an answer box) has nothing
+        // under it: the print layer only carries its own soft rim, which would bracket the stroke
+        // and bring it back. Kept only on strokes with print clear of the pen within 2 units.
+        val touching = if (touchCheck) strokesTouchingPrint(purePrint, handwriting, k) else Mat(out.size(), CvType.CV_8U, Scalar(255.0))
+        Core.bitwise_and(out, touching, out)
+        (sides + listOf(row, col, rule, thick, any, runK, thickK, touching)).forEach { it.release() }
     }
 
     fun read(path: String): Layers {

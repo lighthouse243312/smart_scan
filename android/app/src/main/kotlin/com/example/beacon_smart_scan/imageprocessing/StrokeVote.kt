@@ -3,6 +3,7 @@ package com.example.beacon_smart_scan.imageprocessing
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
+import kotlin.math.max
 
 /**
  * Last say on the handwriting layer, per ink stroke, by the segmentation model. The model judges a
@@ -22,6 +23,8 @@ object StrokeVote {
 
     /** Dev switch (InkHarness `-e strokevote 0`). */
     @JvmStatic var enabled = true
+    /** Dev switch (InkHarness `-e pieces 0`). */
+    @JvmStatic var pieces = true
 
     /**
      * [handwriting] / [print] / [overlap]: CV_8UC1 255 = set, updated in place. [ink]: CV_8UC1 ink of
@@ -85,9 +88,61 @@ object StrokeVote {
             }
             handwriting.put(y, 0, hwRow); print.put(y, 0, prRow); overlap.put(y, 0, ovRow)
         }
-        labels.release(); ruleShaped.release()
+        labels.release()
+        if (pieces) wholePieces(handwriting, print, overlap, ink, ruleShaped)
+        ruleShaped.release()
         growAlongStrokes(handwriting, print, overlap, ink, modelHw)
         rememberPrintUnderPen(handwriting, print, overlap, modelPrint)
+    }
+
+    /** A piece of ink (rules aside) at least this much handwriting is handwriting whole. */
+    private const val PIECE_HALF = 0.5
+
+    /**
+     * Per piece of ink with the rules taken out: a pen letter written on an answer line touches the
+     * line, so as one stroke with it, it was judged pixel by pixel — and a black pen "I" came out
+     * half handwriting, half print (its colour is the print's), leaving half its stem after the
+     * erase. Off the rules each letter is its own piece; one that is mostly handwriting is
+     * handwriting whole (print under it is still remembered from the model's print layer).
+     */
+    private fun wholePieces(handwriting: Mat, print: Mat, overlap: Mat, ink: Mat, ruleShaped: Mat) {
+        val w = ink.cols(); val h = ink.rows()
+        val pieces = Mat(); val notRule = Mat()
+        org.opencv.core.Core.bitwise_not(ruleShaped, notRule)
+        org.opencv.core.Core.bitwise_and(ink, notRule, pieces)
+        val labels = Mat()
+        val n = Imgproc.connectedComponents(pieces, labels, 8, CvType.CV_32S)
+        // print clear of the pen (more than 2 px from handwriting): a printed letter a pen circle
+        // runs into has its body there; the half of a pen stem the colour called print does not
+        val farPrint = Mat(); val near = Mat(); val k5 = Mat.ones(5, 5, CvType.CV_8U)
+        Imgproc.dilate(handwriting, near, k5); org.opencv.core.Core.bitwise_not(near, near)
+        org.opencv.core.Core.bitwise_and(print, near, farPrint)
+        // only pieces written on a rule (touching it): elsewhere a piece is a whole stroke already
+        val onRule = Mat(); Imgproc.dilate(ruleShaped, onRule, Mat.ones(3, 3, CvType.CV_8U))
+        val area = IntArray(n); val hwc = IntArray(n); val far = IntArray(n); val touch = BooleanArray(n)
+        val lab = IntArray(w); val hr = ByteArray(w); val fr = ByteArray(w); val rr = ByteArray(w)
+        for (y in 0 until h) {
+            labels.get(y, 0, lab); handwriting.get(y, 0, hr); farPrint.get(y, 0, fr); onRule.get(y, 0, rr)
+            for (x in 0 until w) {
+                val l = lab[x]; if (l == 0) continue
+                area[l]++; if (hr[x].toInt() != 0) hwc[l]++; if (fr[x].toInt() != 0) far[l]++; if (rr[x].toInt() != 0) touch[l] = true
+            }
+        }
+        listOf(farPrint, near, k5, onRule).forEach { it.release() }
+        val whole = BooleanArray(n) {
+            it > 0 && touch[it] && hwc[it] >= PIECE_HALF * area[it] && hwc[it] < area[it] && far[it] < max(5.0, 0.05 * area[it])
+        }
+        val pr = ByteArray(w); val ov = ByteArray(w); val on = 255.toByte()
+        for (y in 0 until h) {
+            labels.get(y, 0, lab)
+            var changed = false
+            for (x in 0 until w) if (whole[lab[x]]) {
+                if (!changed) { handwriting.get(y, 0, hr); print.get(y, 0, pr); overlap.get(y, 0, ov); changed = true }
+                if (hr[x].toInt() == 0) { hr[x] = on; pr[x] = 0; ov[x] = 0 }
+            }
+            if (changed) { handwriting.put(y, 0, hr); print.put(y, 0, pr); overlap.put(y, 0, ov) }
+        }
+        listOf(pieces, notRule, labels).forEach { it.release() }
     }
 
     /** The model's print probability above which a handwriting pixel has print under it. */
