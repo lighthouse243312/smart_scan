@@ -103,6 +103,12 @@ enum ImageProcessingChannel {
                 let size = try importImage(inputPath: inputPath, outputPath: outputPath)
                 return ["outputPath": outputPath, "width": size.width, "height": size.height]
 
+            case "renderPdf":
+                let inputPath = try requireString(args, "inputPath")
+                let outputDir = try requireString(args, "outputDir")
+                let prefix = try requireString(args, "prefix")
+                return ["pages": try renderPdf(inputPath: inputPath, outputDir: outputDir, prefix: prefix)]
+
             default:
                 return errorResult(code: "INVALID_ARGUMENT", message: "Unknown method: \(call.method)")
             }
@@ -151,6 +157,60 @@ enum ImageProcessingChannel {
         }
         try data.write(to: URL(fileURLWithPath: outputPath))
         return (Int(target.width), Int(target.height))
+    }
+
+    /// Resolution PDF pages are rendered at (capped at `maxImportLongSide` like a picture).
+    private static let pdfDpi: CGFloat = 200
+
+    /// Brings a PDF into the pipeline: every page rendered by Core Graphics at `pdfDpi`, upright
+    /// (its /Rotate applied), on white, written as `<prefix>_<n>.png` into `outputDir`. Returns the
+    /// paths, in page order. Mirrors PdfImporter.kt on Android.
+    private static func renderPdf(inputPath: String, outputDir: String, prefix: String) throws -> [String] {
+        guard FileManager.default.fileExists(atPath: inputPath) else {
+            throw NSError(domain: ImageProcessingErrorDomain, code: ImageProcessingErrorCode.fileNotFound.rawValue,
+                          userInfo: [NSLocalizedDescriptionKey: "Không tìm thấy file: \(inputPath)"])
+        }
+        guard let document = CGPDFDocument(URL(fileURLWithPath: inputPath) as CFURL) else {
+            throw ArgumentError(message: "Không đọc được file PDF này")
+        }
+        if document.isEncrypted && !document.unlockWithPassword("") {
+            throw ArgumentError(message: "File PDF có mật khẩu, không mở được")
+        }
+        try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+        var paths: [String] = []
+        for n in 0..<document.numberOfPages {
+            guard let page = document.page(at: n + 1) else { continue }
+            // the page as it is shown: cropped, with its rotation applied (in points, 1/72 inch)
+            let box = page.getBoxRect(.cropBox)
+            let rotated = page.rotationAngle % 180 != 0
+            let points = rotated ? CGSize(width: box.height, height: box.width) : box.size
+            guard points.width > 0, points.height > 0 else { continue }
+            let s = min(pdfDpi / 72, maxImportLongSide / max(points.width, points.height))
+            let target = CGSize(width: (points.width * s).rounded(), height: (points.height * s).rounded())
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            let image = UIGraphicsImageRenderer(size: target, format: format).image { ctx in
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: target))
+                let cg = ctx.cgContext
+                // PDF space is y-up: flip and scale to the target, then let the page place its
+                // (rotated) box at 1:1 — getDrawingTransform only ever scales down, never up
+                cg.translateBy(x: 0, y: target.height)
+                cg.scaleBy(x: s, y: -s)
+                cg.concatenate(page.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: points),
+                                                        rotate: 0, preserveAspectRatio: true))
+                cg.drawPDFPage(page)
+            }
+            guard let data = image.pngData() else {
+                throw ArgumentError(message: "Không ghi được ảnh")
+            }
+            let path = (outputDir as NSString).appendingPathComponent("\(prefix)_\(n + 1).png")
+            try data.write(to: URL(fileURLWithPath: path))
+            paths.append(path)
+        }
+        if paths.isEmpty { throw ArgumentError(message: "File PDF không có trang nào") }
+        return paths
     }
 
     private static func requireString(_ args: [String: Any], _ key: String) throws -> String {

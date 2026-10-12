@@ -38,6 +38,8 @@ object LineHeal {
     private const val PURE = 2
     private const val HW = 4
     private const val ZONE = 8
+    private const val LINE_H = 16
+    private const val LINE_V = 32
 
     /**
      * A straight piece of a line: centre line from p to q, [th] px thick. [profile]: its measured
@@ -120,30 +122,90 @@ object LineHeal {
         for (i in 0 until n) for (j in i + 1 until n) {
             val a = pieces[i]; val b = pieces[j]
             if (abs(a.ux * b.uy - a.uy * b.ux) > 0.026) continue           // within 1.5 degrees
-            val tol = max(2.0, (a.th + b.th) / 4 + 1)
+            val tol = max(3.0, (a.th + b.th) / 2 + 1)
             if (abs(a.off(b.px, b.py)) > tol || abs(a.off(b.qx, b.qy)) > tol) continue
             parent[root(i)] = root(j)
         }
         val groups = (0 until n).groupBy { root(it) }.values
 
         val maxGap = max(w, h) / 5
+        // each line: its pieces chained along it while the break between two is one the pen made;
+        // a line is then known by its two ends only, and drawn again as one straight stroke from
+        // the first to the last — not patched piece by piece
+        class Line(val ax: Double, val ay: Double, val bx: Double, val by: Double, val th: Double,
+                   val profile: Array<DoubleArray>, val broken: Boolean) {
+            val horizontal = abs(bx - ax) >= abs(by - ay)
+        }
+        val found = ArrayList<Line>()
         for (members in groups) {
             val ps = members.map { pieces[it] }
-            // the line: the longest piece's, over the whole stretch its pieces cover
             val ref = ps.maxByOrNull { it.len }!!
-            val ts = ps.flatMap { listOf(ref.along(it.px, it.py), ref.along(it.qx, it.qy)) }
-            val tMin = ts.minOrNull()!!; val tMax = ts.maxOrNull()!!
-            val ax = ref.px + tMin * ref.ux; val ay = ref.py + tMin * ref.uy
-            val bx = ref.px + tMax * ref.ux; val by = ref.py + tMax * ref.uy
-            clearOffLine(dst, paper, ax, ay, bx, by, ref.th, k, ::at)
-            fill(dst, paper, ref, tMin, tMax, maxGap, k, ::at)
-            // past its ends: dashes of it left between the pen strokes
-            extend(dst, paper, ax, ay, -ref.ux, -ref.uy, ref, maxGap, k, ::at)
-            extend(dst, paper, bx, by, ref.ux, ref.uy, ref, maxGap, k, ::at)
+            class Span(val t0: Double, val t1: Double, val p: Piece)
+            val spans = ps.map { p ->
+                val a = ref.along(p.px, p.py); val b = ref.along(p.qx, p.qy)
+                Span(min(a, b), max(a, b), p)
+            }.sortedBy { it.t0 }
+            var chain = arrayListOf(spans[0]); var end = spans[0].t1; var broken = false
+            fun close() {
+                // the straight line through the chain: offsets of its pieces' ends from ref's line,
+                // least squares weighted by length
+                var sw = 0.0; var st = 0.0; var so = 0.0; var stt = 0.0; var sto = 0.0
+                for (c in chain) for ((x, y) in listOf(c.p.px to c.p.py, c.p.qx to c.p.qy)) {
+                    val wgt = c.p.len; val t = ref.along(x, y); val o = ref.off(x, y)
+                    sw += wgt; st += wgt * t; so += wgt * o; stt += wgt * t * t; sto += wgt * t * o
+                }
+                val den = sw * stt - st * st
+                val sl = if (abs(den) > 1e-9) (sw * sto - st * so) / den else 0.0
+                val ic = (so - sl * st) / sw
+                val t0 = chain.minOf { it.t0 }; val t1 = end
+                fun px(t: Double) = ref.px + t * ref.ux - (sl * t + ic) * ref.uy
+                fun py(t: Double) = ref.py + t * ref.uy + (sl * t + ic) * ref.ux
+                val best = chain.maxByOrNull { it.p.len }!!.p
+                val th = chain.map { it.p.th }.sorted()[chain.size / 2]
+                found.add(Line(px(t0), py(t0), px(t1), py(t1), th, best.profile, broken))
+            }
+            for (sp in spans.drop(1)) {
+                if (sp.t0 <= end + 1) { chain.add(sp); end = max(end, sp.t1); continue }
+                if (joinable(ref, end, sp.t0, maxGap, k, ::at)) { chain.add(sp); end = max(end, sp.t1); broken = true; continue }
+                close()
+                chain = arrayListOf(sp); end = sp.t1; broken = false
+            }
+            close()
+        }
+        // the lines' own pixels are never wiped as stray ink around a line square to them
+        for (l in found) {
+            val len = hypot(l.bx - l.ax, l.by - l.ay); if (len < 1) continue
+            val ux = (l.bx - l.ax) / len; val uy = (l.by - l.ay) / len
+            val half = l.th / 2 + 0.5
+            val bit = if (l.horizontal) LINE_H else LINE_V
+            var t = 0.0
+            while (t <= len) {
+                var d = -half
+                while (d <= half) {
+                    val x = (l.ax + t * ux - d * uy).roundToInt(); val y = (l.ay + t * uy + d * ux).roundToInt()
+                    if (x in 0 until w && y in 0 until h) flags[y * w + x] = (flags[y * w + x].toInt() or bit).toByte()
+                    d += 0.5
+                }
+                t += 0.5
+            }
+        }
+        for (l in found) {
+            val len = hypot(l.bx - l.ax, l.by - l.ay); if (len < 1) continue
+            val ux = (l.bx - l.ax) / len; val uy = (l.by - l.ay) / len
+            // its true ends: past the pieces, dashes of it the pen strokes left
+            val ea = reachEnd(l.ax, l.ay, -ux, -uy, l.th, maxGap, k, ::at)
+            val eb = reachEnd(l.bx, l.by, ux, uy, l.th, maxGap, k, ::at)
+            val ax = l.ax - ea * ux; val ay = l.ay - ea * uy
+            val bx = l.bx + eb * ux; val by = l.by + eb * uy
+            // only a line the pen touched is drawn again
+            if (!l.broken && ea == 0 && eb == 0 && !touched(ax, ay, bx, by, l.th, k, ::at)) continue
+            bridged++
+            log += "line (%.0f,%.0f)-(%.0f,%.0f) th %.1f ends +%d +%d\n".format(ax, ay, bx, by, l.th, ea, eb)
+            paint(dst, paper, ax, ay, bx, by, l.th, l.profile, k, at = ::at, other = if (l.horizontal) LINE_V else LINE_H)
         }
         paper.release()
         stats += log
-        stats += "hough $houghCount pieces $n groups ${groups.size} reject ${reject.joinToString()} bridged $bridged refused ${refused.joinToString()} k $k\n"
+        stats += "hough $houghCount pieces $n groups ${groups.size} lines ${found.size} reject ${reject.joinToString()} redrawn $bridged refused ${refused.joinToString()} k $k\n"
     }
 
     /**
@@ -161,6 +223,7 @@ object LineHeal {
         val reach = k + 3
         val ts = ArrayList<Double>(); val cs = ArrayList<Double>(); val ths = ArrayList<Double>()
         var hit = 0; var total = 0
+        var firstHit = -1.0; var lastHit = 0.0
         var t = 0.0
         while (t <= len) {
             total++
@@ -170,6 +233,7 @@ object LineHeal {
             val start = (0..2).flatMap { listOf(it, -it) }.firstOrNull { on(it) }
             if (start != null) {
                 hit++
+                if (firstHit < 0) firstHit = t; lastHit = t
                 var lo = start; while (lo > -reach && on(lo - 1)) lo--
                 var hi = start; while (hi < reach && on(hi + 1)) hi++
                 val thick = (hi - lo + 1).toDouble()
@@ -187,12 +251,15 @@ object LineHeal {
         val alpha = if (den != 0.0) (m * stc - st * sc) / den else 0.0
         val beta = (sc - alpha * st) / m
         val th = ths.sorted()[ths.size / 2]
-        if (th > k + 2) { reject[2]++; return null }
+        // a rule is thin, and as thick all the way: the foot of a row of small letters is neither
+        if (th > max(3.0, 0.6 * k + 1)) { reject[2]++; return null }
+        if (ths.count { abs(it - th) <= 1 } < 0.8 * ths.size) { reject[2]++; return null }
         var res = 0.0
         for (i in ts.indices) { val e = cs[i] - alpha * ts[i] - beta; res += e * e }
         if (sqrt(res / m) > th / 2 + 0.75) { reject[3]++; return null }                    // not one straight line
-        val px = x1 + beta * nx; val py = y1 + beta * ny
-        val qx = x2 + (alpha * len + beta) * nx; val qy = y2 + (alpha * len + beta) * ny
+        // its ends where its ink is: the Hough walk ran on the grown ink, a pixel or more past them
+        val px = x1 + firstHit * ux + (alpha * firstHit + beta) * nx; val py = y1 + firstHit * uy + (alpha * firstHit + beta) * ny
+        val qx = x1 + lastHit * ux + (alpha * lastHit + beta) * nx; val qy = y1 + lastHit * uy + (alpha * lastHit + beta) * ny
         // the line's cross-section: per offset from the fitted centre, the median darkness under the
         // paper over the clean samples — copied as is into a gap, so the join has the line's own
         // pixel thickness and shade
@@ -229,12 +296,14 @@ object LineHeal {
     }
 
     /**
-     * Along the line [p] from [t0] to [t1], step by step at its own angle: where the pen was, the line
-     * is drawn again with its own cross-section (its own pixel rows and shade). A missing stretch with print
-     * beside it on both sides (a text line between two pieces of a rule) is left as it is.
+     * Whether the break in the line [p] from [t0] to [t1] (positions along it) is one the pen made:
+     * not too long, the pen beside it (or so short a printed rule could not have it), no print on
+     * both sides (a text line between two rules), and no other line meeting it at either side (a
+     * box's corner: its edge ends there, the next box's edge is another line).
      */
-    private fun fill(dst: Mat, paper: Mat, p: Piece, t0: Double, t1: Double, maxGap: Int, k: Int,
-                     at: (Int, Int, Int) -> Boolean) {
+    private fun joinable(p: Piece, t0: Double, t1: Double, maxGap: Int, k: Int, at: (Int, Int, Int) -> Boolean): Boolean {
+        val gap = t1 - t0
+        if (gap > maxGap || gap > p.len) { refused[0]++; return false }
         val nx = -p.uy; val ny = p.ux
         val half = p.th / 2 + 0.5
         val band = p.th / 2 + k
@@ -244,89 +313,99 @@ object LineHeal {
             while (d <= span) { if (at((cx + d * nx).roundToInt(), (cy + d * ny).roundToInt(), f)) return true; d += 1.0 }
             return false
         }
-        val side = p.th / 2 + (k + 2) / 2.0
-        var t = t0
-        var runStart = Double.NaN; var printed = 0; var len = 0
-        fun close(end: Double) {
-            if (runStart.isNaN()) return
-            val n = end - runStart
-            if (n <= maxGap && n <= p.len && printed <= 0.3 * len) {
-                bridged++
-                log += "fill (%.0f,%.0f) +%.0f u (%.2f,%.2f) th %.1f prof %s\n".format(p.px + runStart * p.ux, p.py + runStart * p.uy, n, p.ux, p.uy, p.th, p.profile.joinToString(",") { it[1].toInt().toString() })
-                paint(dst, paper, p.px + (runStart - 0.5) * p.ux, p.py + (runStart - 0.5) * p.uy,
-                    p.px + (end + 0.5) * p.ux, p.py + (end + 0.5) * p.uy, p.th, p.profile, k, at, ext = 0.0)
-            } else refused[1]++
-            runStart = Double.NaN
+        val reach = p.th + 3
+        fun corner(t: Double): Boolean {
+            if (!hit(t, 0.0, half + 1, INK)) return false
+            val a = hit(t, -reach, 0.0, INK) && !hit(t, -reach, 0.0, ZONE)
+            val b = hit(t, reach, 0.0, INK) && !hit(t, reach, 0.0, ZONE)
+            return a || b
         }
-        var lastMissing = Double.NaN
+        var c = t0 - 4
+        while (c <= t1 + 4) { if (corner(c)) { refused[1]++; return false }; c += 1.0 }
+        val side = p.th / 2 + (k + 2) / 2.0
+        var pen = 0; var printed = 0; var n = 0
+        var t = t0
         while (t <= t1) {
-            // where the pen was, the line is redrawn whole: its ink there may be gone, dashes or
-            // thickened by what is left of the pen
-            val missing = hit(t, 0.0, band, ZONE)
-            if (missing) {
-                if (runStart.isNaN() || t - lastMissing > 2) { close(lastMissing); runStart = t; printed = 0; len = 0 }
-                len++
-                if (hit(t, -side, k / 2.0, PURE) && hit(t, side, k / 2.0, PURE)) printed++
-                lastMissing = t
-            }
+            n++
+            if (hit(t, 0.0, band, ZONE)) pen++
+            if (hit(t, -side, k / 2.0, PURE) && hit(t, side, k / 2.0, PURE)) printed++
             t += 1.0
         }
-        close(lastMissing)
+        if (printed > 0.3 * n) { refused[1]++; return false }
+        // the pen across most of it (a box's edge next to an answer is not crossed by it)
+        return pen >= 0.6 * n || gap <= 2 * k
     }
 
     /**
      * From a line's end (ex, ey), outwards along (dx, dy): across the pen's zone, dashes of the line
-     * (thin ink on the straight line) the erase left are collected; the walk stops at paper with no
-     * pen, or between print. The line is drawn on to the farthest dash.
+     * (ink on the straight line) the erase left; the walk stops at paper with no pen, between print,
+     * or at another line crossing. Returns how far the line truly goes on (0: it ends here).
      */
-    private fun extend(dst: Mat, paper: Mat, ex: Double, ey: Double, dx: Double, dy: Double, p: Piece,
-                       maxGap: Int, k: Int, at: (Int, Int, Int) -> Boolean) {
+    private fun reachEnd(ex: Double, ey: Double, dx: Double, dy: Double, th: Double, maxGap: Int, k: Int,
+                         at: (Int, Int, Int) -> Boolean): Int {
         val nx = -dy; val ny = dx
-        val half = p.th / 2 + 0.5
-        val reach = (p.th + 2).toInt() + 1
-        var lastInk = 0; var misses = 0; var pen = 0
+        val half = th / 2 + 1.5
+        val reach = (th + 2).toInt() + 1
+        val side = th / 2 + (k + 2) / 2.0
+        var lastInk = 0; var misses = 0; var pen = 0; var penAtLast = 0
         var t = 1
         while (t <= maxGap) {
             val cx = ex + t * dx; val cy = ey + t * dy
             fun f(d: Double, flag: Int) = at((cx + d * nx).roundToInt(), (cy + d * ny).roundToInt(), flag)
-            // print beside the line on both sides: a text line, the rule does not go on there
-            val side = p.th / 2 + (k + 2) / 2.0
             fun near(off: Double, flag: Int): Boolean {
                 var e = -k / 2.0
                 while (e <= k / 2.0) { if (f(off + e, flag)) return true; e += 1.0 }
                 return false
             }
             if (near(-side, PURE) && near(side, PURE)) break
-            // thin ink on the line: inside the line's thickness, paper just beyond it
             var onLine = false; var d = -half
             while (d <= half) { if (f(d, INK)) onLine = true; d += 1.0 }
-            // ink running on sideways: another line crossing (a box's corner) — the line ends there
-            if (onLine && (f(-reach.toDouble(), INK) || f(reach.toDouble(), INK))) break
-            val thin = onLine
+            // another line across the way ahead (the next box's edge): the line ends before it
+            var crossing = false
+            var a = -half
+            while (a <= half + 1 && !crossing) {
+                val sx = cx + a * dx; val sy = cy + a * dy
+                fun g(d: Double) = at((sx + d * nx).roundToInt(), (sy + d * ny).roundToInt(), INK) &&
+                    !at((sx + d * nx).roundToInt(), (sy + d * ny).roundToInt(), ZONE)
+                if (g(-reach.toDouble()) || g(reach.toDouble())) crossing = true
+                a += 1.0
+            }
+            if (crossing) break
             val inZone = f(0.0, ZONE)
             if (inZone) pen++
-            if (thin) { lastInk = t; misses = 0 }
+            if (onLine) { lastInk = t; penAtLast = pen; misses = 0 }
             else if (inZone) misses = 0
             else if (++misses > 2) break
             t++
         }
-        if (lastInk <= 1 || pen == 0) return
-        log += "extend (%.0f,%.0f) by %d u (%.2f,%.2f)\n".format(ex, ey, lastInk, dx, dy)
-        paint(dst, paper, ex, ey, ex + lastInk * dx, ey + lastInk * dy, p.th, p.profile, k, at)
+        return if (lastInk <= 1 || penAtLast < 0.6 * lastInk) 0 else lastInk
     }
 
-    /** Pixels in the band around a piece, off its straight line and near the handwriting, become paper. */
-    private fun clearOffLine(dst: Mat, paper: Mat, ax: Double, ay: Double, bx: Double, by: Double, th: Double,
-                             k: Int, at: (Int, Int, Int) -> Boolean) =
-        paint(dst, paper, ax, ay, bx, by, th, null, k, at)
+    /** Whether the pen was anywhere along the line from (ax, ay) to (bx, by). */
+    private fun touched(ax: Double, ay: Double, bx: Double, by: Double, th: Double, k: Int, at: (Int, Int, Int) -> Boolean): Boolean {
+        val len = hypot(bx - ax, by - ay)
+        val ux = (bx - ax) / len; val uy = (by - ay) / len
+        val band = th / 2 + k
+        var t = 0.0
+        while (t <= len) {
+            var d = -band
+            while (d <= band) {
+                if (at((ax + t * ux - d * uy).roundToInt(), (ay + t * uy + d * ux).roundToInt(), ZONE)) return true
+                d += 1.0
+            }
+            t += 2.0
+        }
+        return false
+    }
 
     /**
-     * Over the band of the straight line from (ax, ay) to (bx, by) (and [k] px past its ends): pixels
-     * off the line, in the clearing zone, become paper; with a [profile], the line itself is drawn
-     * with that cross-section (darkness under the paper at each offset from the centre).
+     * The line drawn as one straight stroke from (ax, ay) to (bx, by) with [profile] (darkness under
+     * the paper at each offset from the centre: the line's own pixel rows and shade). Around it, in
+     * its band: what is left of the old line beside the new one (ink a pixel or two off it) and, near
+     * the pen, any stray ink become paper — but never the pixels of a line square to it ([other]).
      */
     private fun paint(dst: Mat, paper: Mat, ax: Double, ay: Double, bx: Double, by: Double, th: Double,
-                      profile: Array<DoubleArray>?, k: Int, at: (Int, Int, Int) -> Boolean, ext: Double = k.toDouble()) {
+                      profile: Array<DoubleArray>, k: Int, at: (Int, Int, Int) -> Boolean, other: Int) {
         val len = hypot(bx - ax, by - ay)
         if (len < 1) return
         val ux = (bx - ax) / len; val uy = (by - ay) / len
@@ -336,21 +415,25 @@ object LineHeal {
         val y0 = max(0, floor(min(ay, by) - pad).toInt()); val y1 = min(dst.rows() - 1, ceil(max(ay, by) + pad).toInt())
         val pix = ByteArray(3); val pap = ByteArray(3)
         val dark = DoubleArray(3)
+        val reach = profile.size / 2
         for (y in y0..y1) for (x in x0..x1) {
             val t = (x - ax) * ux + (y - ay) * uy
-            if (t < -ext || t > len + ext) continue
+            if (t < -k || t > len + k) continue
             val d = -(x - ax) * uy + (y - ay) * ux
             if (abs(d) > band) continue
             var on = false
-            if (profile != null) {
-                // the cross-section's pixel row at d: the line's own rows, as many as it has
-                val reach = profile.size / 2
+            if (t >= 0 && t <= len) {
                 val i = d.roundToInt() + reach
                 for (ch in 0..2) dark[ch] = if (i in profile.indices) profile[i][ch] else 0.0
                 on = dark.any { it > 0.0 }
-            } else if (abs(d) <= th / 2 + 0.5) continue                   // the line itself: keep
-            val inZone = at(x, y, ZONE)
-            if (!on && (!inZone || (profile == null && !at(x, y, INK)))) continue
+            }
+            if (!on) {
+                if (at(x, y, other)) continue                                  // a line square to it
+                val ink = at(x, y, INK)
+                val oldLine = ink && abs(d) <= th / 2 + 2.5 && t >= 0 && t <= len && (at(x, y, ZONE) || !at(x, y, PURE) || at(x, y, LINE_H or LINE_V))
+                val stray = at(x, y, ZONE)
+                if (!oldLine && !stray) continue
+            }
             paper.get(y, x, pap)
             for (ch in 0..2) {
                 val p = (pap[ch].toInt() and 0xff).toDouble()
@@ -359,4 +442,5 @@ object LineHeal {
             dst.put(y, x, pix)
         }
     }
+
 }

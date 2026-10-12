@@ -1811,6 +1811,44 @@ inline void DetectByInkColor(const cv::Mat &full, double colorDelta, cv::Mat *ou
 /// matches them closely (same letter, same font and size), its pixels fill the erased part. A spot
 /// without a convincing match is left as it is. `original`: the page before the erase (same
 /// geometry) — a fill only ever goes where it had ink.
+// The search page of RepairPrintByExample (CV_32F) and its square, Fourier-transformed once
+// (zero-padded to a fast DFT size) for every window's masked match against it. Mirrors Spectra in
+// PrintRepair.kt.
+struct PageSpectra {
+    int cols, rows;
+    cv::Size dftSize;
+    cv::Mat page, pageSquared;
+
+    explicit PageSpectra(const cv::Mat &img)
+        : cols(img.cols), rows(img.rows),
+          dftSize(cv::getOptimalDFTSize(img.cols), cv::getOptimalDFTSize(img.rows)) {
+        page = Transform(img);
+        pageSquared = Transform(img.mul(img));
+    }
+
+    cv::Mat Transform(const cv::Mat &m) const {
+        cv::Mat padded = cv::Mat::zeros(dftSize, CV_32F);
+        m.copyTo(padded(cv::Rect(0, 0, m.cols, m.rows)));
+        cv::dft(padded, padded, 0, m.rows);
+        return padded;
+    }
+
+    // Masked TM_SQDIFF of `templ` over the page, up to a constant: sum m(I - T)^2 = sum m I^2
+    // - 2 sum m T I + sum m T^2, and the last term is the same at every spot, so where the minimum
+    // lies — all the search needs — is unchanged. Both correlations in one inverse transform against
+    // the spectra computed once, instead of matchTemplate's masked path (three full correlations,
+    // the page squared again, for every window).
+    void MaskedSqDiff(const cv::Mat &templ, const cv::Mat &mask, cv::Mat &res) const {
+        cv::Mat acc, cross;
+        cv::mulSpectrums(pageSquared, Transform(mask), acc, 0, true);   // correlation = conjugate product
+        cv::mulSpectrums(page, Transform(templ.mul(mask)), cross, 0, true);
+        cv::scaleAdd(cross, -2.0, acc, acc);
+        const int resW = cols - templ.cols + 1, resH = rows - templ.rows + 1;
+        cv::dft(acc, acc, cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_REAL_OUTPUT, resH);
+        res = acc(cv::Rect(0, 0, resW, resH)).clone();
+    }
+};
+
 inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, const cv::Mat &original, int k) {
     if (cv::countNonZero(erased) == 0) return;
     cv::Mat gray;
@@ -1876,6 +1914,7 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, const cv::
     const int sc = 2;
     cv::Mat inkH;
     cv::resize(inkF, inkH, cv::Size(), 1.0 / sc, 1.0 / sc, cv::INTER_AREA);
+    const PageSpectra spectra(inkH);
     cv::Mat erasedH;
     cv::resize(erased, erasedH, inkH.size(), 0, 0, cv::INTER_NEAREST);
     const int TH = T / sc;
@@ -1926,7 +1965,7 @@ inline void RepairPrintByExample(cv::Mat &dst, const cv::Mat &erased, const cv::
             cv::Mat maskH, res;
             cv::Mat knownH = ~erasedH(RH);
             knownH.convertTo(maskH, CV_32F, 1.0 / 255.0);
-            cv::matchTemplate(inkH, inkH(RH), res, cv::TM_SQDIFF, maskH);
+            spectra.MaskedSqDiff(inkH(RH), maskH, res);
             // the two best DISTINCT twins at search resolution: the best valid spot, then the
             // best valid spot clear of the first (not itself, not mostly erased)
             std::vector<cv::Point> twinsH;

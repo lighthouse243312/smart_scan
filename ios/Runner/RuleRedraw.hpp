@@ -192,10 +192,14 @@ inline void Apply(const cv::Mat &original, const cv::Mat &handwriting, const cv:
             if (pure.at<uchar>(y, x)) isPure[l]++;
         }
     }
+    // specks: a few pixels left in the band beside a rule the writing touched are pen residue
+    // whatever the mask says (anti-aliased stroke edges fall outside it); a letter is bigger
+    const int speck = 2 * k * k;
     std::vector<char> go(count, 0);
     for (int l = 1; l < count; l++)
         go[l] = isPure[l] <= 0.2 * cnt[l] &&
-                ((inZone[l] >= 0.85 * cnt[l] && inHw[l] >= 0.6 * cnt[l]) || (inZone[l] >= 0.4 * cnt[l] && inHw[l] >= 0.9 * cnt[l]));
+                ((inZone[l] >= 0.85 * cnt[l] && inHw[l] >= 0.6 * cnt[l]) || (inZone[l] >= 0.4 * cnt[l] && inHw[l] >= 0.9 * cnt[l]) ||
+                 (cnt[l] <= speck && inZone[l] >= 0.5 * cnt[l]));
     for (int y = 0; y < h; y++) {
         const int *lp = lab.ptr<int>(y);
         for (int x = 0; x < w; x++) if (go[lp[x]]) dst.at<cv::Vec3b>(y, x) = paper.at<cv::Vec3b>(y, x);

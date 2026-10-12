@@ -49,6 +49,12 @@ dependencies:
     sdk: flutter
   intl: any
   shared_preferences: ^2.5.6
+  firebase_core: ^4.15.0
+  cloud_firestore: ^6.10.0
+  firebase_messaging: ^16.7.0
+  firebase_crashlytics: ^5.4.0
+  package_info_plus: ^9.0.1
+  android_id: ^0.5.2+1
 dev_dependencies:
   flutter_test:
     sdk: flutter
