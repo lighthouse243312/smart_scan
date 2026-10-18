@@ -1,0 +1,89 @@
+{
+ "best_step": 450,
+ "val": {
+  "hw_recall": 0.9840975082719635,
+  "hw_precision": 0.8796173346209296,
+  "print_kept": 0.9649292883211682,
+  "iou_hw": 0.8672895527717183,
+  "iou_print": 0.9534568881004533
+ },
+ "test": {
+  "hw_recall": 0.9914012738851924,
+  "hw_precision": 0.9821738444548064,
+  "print_kept": 0.9993670692242514,
+  "iou_hw": 0.9738776787109379,
+  "iou_print": 0.9625953188153389
+ },
+ "test_pages": {
+  "p02": {
+   "hw_recall": 0.9914012738851924,
+   "hw_precision": 0.9821738444548064,
+   "print_kept": 0.9993670692242514,
+   "iou_hw": 0.9738776787109379,
+   "iou_print": 0.9625953188153389
+  }
+ },
+ "synthetic_test": {
+  "iou_print": 0.7064961929240656,
+  "iou_hw": 0.6974484565776758,
+  "hw_precision": 0.7945746511344173,
+  "hw_recall": 0.8508735810108863,
+  "print_to_hw_fp": 0.036797422623929536,
+  "overlap_print_recall": 0.3580802528514436,
+  "paper_to_hw_fp": 0.00281348631452563
+ },
+ "train_pages": [
+  "p01",
+  "p02",
+  "p03",
+  "p04",
+  "p05",
+  "p06",
+  "p07",
+  "p08",
+  "p09",
+  "p10",
+  "p11",
+  "p14",
+  "p15",
+  "p16",
+  "p17",
+  "p18",
+  "p19",
+  "p20",
+  "p21",
+  "p22",
+  "p23",
+  "p24",
+  "p26",
+  "p27",
+  "p29"
+ ],
+ "args": {
+  "init": "ink_segmenter_v46_torch.pt",
+  "steps": 600,
+  "bs": 16,
+  "real_frac": 0.7,
+  "lr": 5e-05,
+  "real_w": 2.0,
+  "all": true,
+  "paste": 0.5,
+  "hw_pos_w": 5.0,
+  "strike_frac": 0.0,
+  "focus": "p24:40",
+  "near_pen_print_w": 0.0,
+  "print_pos_w": 2.5,
+  "shape": 0.3,
+  "hard": 0.3,
+  "pen": 0.3,
+  "pen_print_neg": 1.0,
+  "ov_print_w": 6.0,
+  "pen_score_w": 0.0,
+  "recall_w": 4.0,
+  "gate_kept": 0.9,
+  "gate_prec": 0.5,
+  "val": "p24",
+  "test": "p02",
+  "out": "ink_segmenter_ovf"
+ }
+}

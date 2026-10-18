@@ -199,6 +199,9 @@ def _pen_render(x, m, rng):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+STRIKE_FRAC = 0.0   # extra share of marks forced to a strike-through (set from --strike-frac)
+
+
 def add_pen_marks(tile, rng):
     """answer marks drawn over real print: pen circles round single printed letters (often touching
     or crossing them), strike-throughs / underlines / scribbles across printed words, and ticks. Labelled exactly: the pen is handwriting; a printed
@@ -238,14 +241,14 @@ def add_pen_marks(tile, rng):
             wob = 1 + rng.uniform(0.02, 0.12) * np.sin(t * rng.uniform(1, 3) + rng.uniform(0, 6))
             rr = 1 + (t - a0) / sweep * rng.uniform(-0.15, 0.15)            # spiral: the ends miss
             P = np.stack([cx + rx * wob * rr * np.cos(t), cy + ry * wob * rr * np.sin(t)], 1)
-        elif rows and kind0 < 0.8:                   # strike-through / underline / scribble over printed words
+        elif rows and (kind0 < 0.8 or rng.random() < STRIKE_FRAC):   # strike-through / underline / scribble over printed words
             r = rows[rng.integers(len(rows))]
             ids = [j for j in r]
             a = int(rng.integers(len(ids))); b = min(len(ids), a + int(rng.integers(2, 8)))
             sel = ids[a:b]
             x0 = min(st[j, 0] for j in sel) - rng.uniform(0, 6); x1 = max(st[j, 0] + st[j, 2] for j in sel) + rng.uniform(0, 6)
             top = np.median([st[j, 1] for j in sel]); bot = np.median([st[j, 1] + st[j, 3] for j in sel])
-            kind = rng.random()
+            kind = rng.random() if rng.random() >= STRIKE_FRAC else 0.0
             t = np.linspace(0, 1, 120)
             if kind < 0.55:                          # strike-through: through the middle of the letters
                 ym = top + (bot - top) * rng.uniform(0.35, 0.65)
@@ -430,6 +433,9 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--paste", type=float, default=0.5, help="share of real tiles with pasted handwriting")
     ap.add_argument("--hw-pos-w", type=float, default=4.0)
+    ap.add_argument("--strike-frac", type=float, default=0.0, help="extra share of pen marks that are strike-throughs")
+    ap.add_argument("--focus", default="", help="pages sampled more often, e.g. p18,p22:3")
+    ap.add_argument("--near-pen-print-w", type=float, default=0.0, help="extra hw-negative weight on print within 4 px of pen")
     ap.add_argument("--print-pos-w", type=float, default=0.0)
     ap.add_argument("--shape", type=float, default=0.45, help="share of real tiles with synthetic printed outlines")
     ap.add_argument("--hard", type=float, default=0.0, help="share of real tiles centred on current errors")
@@ -453,7 +459,14 @@ def main():
     TEST[:] = [n for n in args.test.split(",") if n]
     held = set(VAL + TEST)
     train_names = names if args.all else [n for n in names if n not in held]
+    global STRIKE_FRAC
+    STRIKE_FRAC = args.strike_frac
     train = [train_page(n) for n in train_names]
+    if args.focus:   # pages with the errors still left: sampled more often (same objects, repeated)
+        f, reps = args.focus.split(":") if ":" in args.focus else (args.focus, "3")
+        fs = set(f.split(","))
+        train = train + [t for t in train for _ in range(int(reps) - 1) if t["name"] in fs]
+        print("focus pages", sorted(fs), "x", reps, "->", len(train), "page slots", flush=True)
     val = [load_page(n) for n in VAL]
     test = [load_page(n) for n in TEST]
     print("train pages:", train_names, " val:", VAL, " test:", TEST, flush=True)
@@ -506,6 +519,15 @@ def main():
             wp = yr[:, 0] * vr[:, 0]
             bp = torch.nn.functional.binary_cross_entropy_with_logits(logits[n_syn:, 0], yr[:, 0], reduction="none")
             l_real = l_real + args.print_pos_w * (bp * wp).sum() / wp.sum().clamp(min=1)
+        if args.near_pen_print_w > 0:  # printed letters right beside a pen mark (circled, ticked,
+            # struck through): the hw channel must stay off them — the erase would take the letter
+            near = torch.nn.functional.max_pool2d(yr[:, 1:2], 9, stride=1, padding=4)[:, 0]
+            touch = torch.nn.functional.max_pool2d(yr[:, 1:2], 5, stride=1, padding=2)[:, 0]
+            # a ring 2-4 px off the pen: the printed letter's body beside it, not the pixels where pen
+            # and a drawing's line meet (penalising those teaches the model to shun pen near print)
+            wq = yr[:, 0] * (1 - yr[:, 1]) * near * (1 - touch) * vr[:, 1]
+            bq = torch.nn.functional.binary_cross_entropy_with_logits(logits[n_syn:, 1], yr[:, 1], reduction="none")
+            l_real = l_real + args.near_pen_print_w * (bq * wq).sum() / wq.sum().clamp(min=1)
         loss = l_syn + args.real_w * l_real
         opt.zero_grad(set_to_none=True)
         loss.backward()

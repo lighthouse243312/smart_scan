@@ -134,6 +134,9 @@ def ink_chroma(rgb, ink):
     return np.where(ink, np.maximum(d, s), 0)
 
 
+stats = {}
+
+
 def build(page, overrides):
     src = cv2.imread(os.path.join(BATCH, page + ".jpg"), cv2.IMREAD_COLOR)[..., ::-1]
     rgb, s = resize_long(np.ascontiguousarray(src))
@@ -292,8 +295,32 @@ def build(page, overrides):
     rule_ov = lines & (cv2.dilate(hw.astype(np.uint8), np.ones((13, 13), np.uint8)) > 0)
     v_print = v_print & ~rule_ov
     v_hw = v_hw & ~rule_ov
-    # pen crossing printed text: hw pixels touching print are overlap, not scored
-    v_hw = v_hw & ~(hw & (cv2.dilate(print_.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0))
+    # ── pen vs print, case by case (each ink pixel falls in exactly one) ──
+    #  A. pure handwriting: pen with no print under or right beside it (2 px of a printed glyph's
+    #     core) — 100% handwriting: hw = 1 AND print = 0, both scored
+    #  B. overlap: pen crossing printed text — the only place print may lie under pen: hw = 1
+    #     scored; print unknown on a real photo (which pixels of the glyph the pen hides), unscored
+    #  C. pure print: hw = 0 and print = 1, both scored (set above)
+    #  D. pen on a printed rule: neither scored (the erase keeps and redraws the rule; set above)
+    text = print_ & ~ign & ~(cv2.dilate(lines.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)   # printed text (scored, not rules: D)
+    # a printed glyph the pen crosses stands mostly clear of the pen; slivers of the pen's own rim
+    # that the automatic rules left as "print" lie wholly along it — they are not print under pen
+    pen_zone = cv2.dilate(hw.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    nt, lt = cv2.connectedComponents(text.astype(np.uint8), connectivity=8)
+    clear = np.bincount(lt.ravel(), (text & ~pen_zone).ravel().astype(np.float64), nt)
+    size = np.bincount(lt.ravel(), text.ravel().astype(np.float64), nt)
+    glyph = (clear >= 0.3 * np.maximum(size, 1)) & (size >= 6); glyph[0] = False
+    text = glyph[lt]
+    print_near = cv2.dilate(text.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    overlap = hw & print_near
+    pure_hw = hw & ~print_near
+    base = valid & ~unk & ~loose_hw & ~rule_ov
+    v_print = (v_print & ~overlap) | (pure_hw & base)          # A: print 0 scored; B: unscored
+    v_hw = v_hw | (overlap & base & ~band)                      # B: the pen itself is scored
+    stats["overlap"] = int(overlap.sum()); stats["pure_hw"] = int(pure_hw.sum())
+    # hand-painted handwriting is the truth: always scored as handwriting, whatever the automatic
+    # rules above say (a pen strike-through is a long thin run, i.e. a "rule" to them)
+    v_hw = v_hw | (brush_hw & valid)
     y = print_.astype(np.uint8) | (hw.astype(np.uint8) << 1)
     v = v_print.astype(np.uint8) | (v_hw.astype(np.uint8) << 1)
     os.makedirs(OUT, exist_ok=True)
@@ -315,7 +342,7 @@ def main():
     pages = sys.argv[1:] or sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(BATCH, "*.jpg")))
     for p in pages:
         h, pr = build(p, overrides)
-        print(f"{p}: hw {h} px, print {pr} px")
+        print(f"{p}: hw {h} px, print {pr} px, pure hw (A) {stats.get('pure_hw')} px, overlap (B) {stats.get('overlap')} px")
 
 
 if __name__ == "__main__":
