@@ -51,6 +51,17 @@ object PenComponentVote {
      */
     /** Dev switch for comparing with/without the vote (InkHarness `-e vote 0`). */
     @JvmStatic var enabled = true
+    /** Dev switch (InkHarness `-e ruleoff 0`): the model's average over the whole piece, rules included. */
+    @JvmStatic var ruleOff = true
+    /** Dev switch (InkHarness `-e bigsure 0`). */
+    @JvmStatic var bigSure = true
+    /** Dev probe (InkHarness `-e probe x,y`): the decision on the ink piece at that pixel. */
+    @JvmStatic var probe: IntArray? = null
+    @JvmStatic var report = ""
+    /** A piece of a mixed component the model is this sure of is handwriting, whatever its colour. */
+    @JvmStatic var PIECE_SURE = 0.8
+    /** ...or this sure, when the model is [PIECE_SURE] sure of the whole stroke group it was cut from. */
+    @JvmStatic var PIECE_IN_SURE = 0.6
 
     fun apply(src: Mat, handwriting: Mat, print: Mat, overlap: Mat, modelHw: Mat?) {
         if (!enabled) return
@@ -291,11 +302,14 @@ object PenComponentVote {
         try {
             val st = IntArray(n * 5); stats.get(0, 0, st)
             val cntV = IntArray(n); val cntP = IntArray(n); val cntN = IntArray(n); val cntNear = IntArray(n); val sumMh = DoubleArray(n)
+            // the model's view is taken off the printed rules: a black-pen answer written on its line
+            // is one piece with the line, and the long line would outvote the writing
+            val offRule = IntArray(n); val rRow = ByteArray(w)
             val lab = IntArray(w); val vRow = ByteArray(w); val pRow = ByteArray(w); val nRow = ByteArray(w); val mRow = FloatArray(w)
             val sRow0 = ByteArray(w)
             for (y in 0 until h) {
                 labels.get(y, 0, lab); valid.get(y, 0, vRow); penSeed.get(y, 0, pRow); neutSeed.get(y, 0, nRow)
-                penSide.get(y, 0, sRow0)
+                penSide.get(y, 0, sRow0); rule.get(y, 0, rRow)
                 modelHw?.get(y, 0, mRow)
                 for (x in 0 until w) {
                     val l = lab[x]; if (l == 0) continue
@@ -303,6 +317,8 @@ object PenComponentVote {
                     if (vRow[x].toInt() != 0) cntV[l]++
                     if (pRow[x].toInt() != 0) cntP[l]++
                     if (nRow[x].toInt() != 0) cntN[l]++
+                    if (ruleOff && rRow[x].toInt() != 0) continue
+                    offRule[l]++
                     if (modelHw != null) sumMh[l] += mRow[x]
                 }
             }
@@ -322,11 +338,15 @@ object PenComponentVote {
                 val big = cw > 12 * k && ch > 12 * k
                 val fill = area.toFloat() / max(1, cw * ch)
                 val thinRule = ch <= 2 * k + 1 && cw >= 6 * ch
-                val mh = sumMh[l] / max(1, area)
+                val mh = sumMh[l] / max(1, offRule[l])
                 val neutShare = cntN[l].toFloat() / cntV[l]
                 val near = cntNear[l].toFloat() / max(1, area)
                 fills[l] = fill; ps[l] = p
                 cat[l] = when {
+                    // large but sparse, and the model sure it is writing (off the rules): a black-pen
+                    // answer fused with the printed arrow, its line and a red tick — not a picture;
+                    // the detectors' decision stands
+                    bigSure && big && fill <= 0.3f && mh >= 0.8 -> 0
                     // large and neutral, or large and solid (handwriting strokes are sparse): a picture
                     // or a printed frame — kept, except pen pieces written into it (a signature
                     // touching the header box)
@@ -351,6 +371,12 @@ object PenComponentVote {
                     else -> 3
                 }
             }
+            probe?.let { (px, py) ->
+                val pl = IntArray(1); labels.get(py, px, pl); val l = pl[0]
+                if (l > 0) report = "vote probe: cat ${cat[l]} area ${st[l * 5 + Imgproc.CC_STAT_AREA]} w ${st[l * 5 + Imgproc.CC_STAT_WIDTH]} h ${st[l * 5 + Imgproc.CC_STAT_HEIGHT]} " +
+                    "valid ${cntV[l]} pen ${cntP[l]} neutral ${cntN[l]} near ${cntNear[l]} mh %.2f offRule ${offRule[l]}\n".format(sumMh[l] / max(1, offRule[l]))
+                else report = "vote probe: no ink\n"
+            }
             // inside a picture (big and dense — not a sparse table or box frame): its small parts that
             // are not pen-coloured (eyes, cheeks) are the picture, whatever the model thinks
             val pictures = (1 until n).filter { cat[it].toInt() == 4 && fills[it] >= 0.25f }
@@ -371,7 +397,7 @@ object PenComponentVote {
             // whole — per-pixel nearest colour is noisy on a dark pen clipped all but its rims, and
             // the upstream "print under the pen" guess does not apply to a piece that is all pen
             val nPieces: Int
-            val penPiece: BooleanArray; val neutralPiece: BooleanArray; val halfPenPiece: BooleanArray
+            val penPiece: BooleanArray; val neutralPiece: BooleanArray; val halfPenPiece: BooleanArray; val modelPiece: BooleanArray
             run {
                 val inPen = Mat(h, w, CvType.CV_8U); val row = ByteArray(w)
                 for (y in 0 until h) {
@@ -386,12 +412,14 @@ object PenComponentVote {
                 inPen.release()
                 val pv = IntArray(nPieces); val pp = IntArray(nPieces); val pn = IntArray(nPieces)
                 val area = IntArray(nPieces); val near = IntArray(nPieces); val sRow = ByteArray(w)
+                val pm = DoubleArray(nPieces); val owner = IntArray(nPieces); val cl = IntArray(w)
                 for (y in 0 until h) {
                     pieces.get(y, 0, lab); valid.get(y, 0, vRow); penSeed.get(y, 0, pRow); neutSeed.get(y, 0, nRow)
-                    penSide.get(y, 0, sRow)
+                    penSide.get(y, 0, sRow); modelHw?.get(y, 0, mRow); labels.get(y, 0, cl)
                     for (x in 0 until w) {
                         val l = lab[x]; if (l == 0) continue
-                        area[l]++
+                        area[l]++; owner[l] = cl[x]
+                        if (modelHw != null) pm[l] += mRow[x]
                         if (sRow[x].toInt() != 0) near[l]++
                         if (vRow[x].toInt() != 0) pv[l]++
                         if (pRow[x].toInt() != 0) pp[l]++
@@ -408,6 +436,20 @@ object PenComponentVote {
                 }
                 neutralPiece = BooleanArray(nPieces) { it > 0 && pv[it] >= 5 && pn[it] >= 0.6f * pv[it] && pp[it] <= 0.1f * pv[it] }
                 halfPenPiece = BooleanArray(nPieces) { it > 0 && pv[it] >= 5 && pp[it] >= 0.5f * pv[it] }
+                // a dark pen photographed near black has the print's colour: its letters, cut off the
+                // rule they were written on, are judged by the model instead when it is sure (a bold
+                // printed letter fused with pen: ≤ 0.56)
+                modelPiece = BooleanArray(nPieces) {
+                    if (it == 0 || modelHw == null || area[it] < 5) return@BooleanArray false
+                    val o = owner[it]
+                    val groupSure = sumMh[o] / max(1, offRule[o]) >= PIECE_SURE
+                    pm[it] / area[it] >= (if (groupSure) PIECE_IN_SURE else PIECE_SURE)
+                }
+                probe?.let { (px, py) ->
+                    val pl = IntArray(1); pieces.get(py, px, pl); val l = pl[0]
+                    report += if (l > 0) "vote piece: area ${area[l]} valid ${pv[l]} pen ${pp[l]} neutral ${pn[l]} near ${near[l]} mh %.2f\n".format(pm[l] / area[l])
+                        else "vote piece: none (rule or not pen-touched)\n"
+                }
             }
             val hRow = ByteArray(w); val prRow = ByteArray(w); val oRow = ByteArray(w)
             val sideRow = ByteArray(w); val ruleRow = ByteArray(w); val pieceRow = IntArray(w); val underRow = ByteArray(w)
@@ -430,6 +472,7 @@ object PenComponentVote {
                         // the rest of the picture/frame is print
                         c == 4 && halfPenPiece[piece] && sideRow[x].toInt() != 0 -> { hRow[x] = on; prRow[x] = off; oRow[x] = off }
                         c == 4 -> { hRow[x] = off; prRow[x] = on; oRow[x] = off }
+                        c == 3 && modelPiece[piece] -> { hRow[x] = on; if (oRow[x].toInt() == 0) prRow[x] = off }
                         c == 3 && neutralPiece[piece] -> { hRow[x] = off; prRow[x] = on }
                         c == 2 || (c == 1 && isRule) -> { hRow[x] = off; prRow[x] = on; oRow[x] = off }
                         c == 1 -> { hRow[x] = on; prRow[x] = off; oRow[x] = off }

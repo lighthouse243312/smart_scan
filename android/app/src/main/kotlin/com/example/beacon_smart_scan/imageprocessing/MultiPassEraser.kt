@@ -93,6 +93,7 @@ object MultiPassEraser {
                     }
                     RuleRedraw.apply(analysis, ref.handwriting, ref.print, dst)
                     LineHeal.apply(dst, ref.handwriting, ref.print)
+                    SpeckClean.apply(dst, ref.handwriting, ref.print)
                     ImageIO.writeOrThrow(dst, outputPath)
                 } finally {
                     dst.release(); analysis.release(); ref.release()

@@ -26,6 +26,10 @@ object StrikeThrough {
      * handwriting left on 2). Dev switch: InkHarness `-e strike 1`.
      */
     @JvmStatic var enabled = false
+    /** Dev switch (InkHarness `-e strikeslant 0`): straight runs only. */
+    @JvmStatic var slanted = true
+    /** A strike is at least this many stroke units long. */
+    @JvmStatic var MIN_LEN = 3
 
     /** [src]: the page (BGR); [handwriting] / [print] / [overlap]: CV_8UC1 255 = set, updated in place. */
     fun apply(src: Mat, handwriting: Mat, print: Mat, overlap: Mat) {
@@ -42,8 +46,15 @@ object StrikeThrough {
             Imgproc.threshold(g, ink, 40.0, 255.0, Imgproc.THRESH_BINARY)
             listOf(g, bg, kernel).forEach { it.release() }
         }
+        // a hand-drawn strike leans and steps a pixel from row to row: the run is taken on the ink
+        // grown a pixel up and down, then cut back to the ink itself
         val run = Mat(); val hk = Mat.ones(1, 3 * k, CvType.CV_8U)
-        Imgproc.morphologyEx(ink, run, Imgproc.MORPH_OPEN, hk); hk.release(); ink.release()
+        if (slanted) {
+            val grown = Mat(); Imgproc.dilate(ink, grown, Mat.ones(3, 1, CvType.CV_8U))
+            Imgproc.morphologyEx(grown, run, Imgproc.MORPH_OPEN, hk); grown.release()
+            Core.bitwise_and(run, ink, run)
+        } else Imgproc.morphologyEx(ink, run, Imgproc.MORPH_OPEN, hk)
+        hk.release(); ink.release()
         val labels = Mat(); val stats = Mat(); val cents = Mat()
         val n = Imgproc.connectedComponentsWithStats(run, labels, stats, cents, 8, CvType.CV_32S)
         run.release(); cents.release()
@@ -68,7 +79,7 @@ object StrikeThrough {
         for (l in 1 until n) {
             val x0 = st[l * 5 + Imgproc.CC_STAT_LEFT]; val y0 = st[l * 5 + Imgproc.CC_STAT_TOP]
             val bw = st[l * 5 + Imgproc.CC_STAT_WIDTH]; val bh = st[l * 5 + Imgproc.CC_STAT_HEIGHT]
-            if (bw < 6 * k || bh > 2 * k) continue
+            if (bw < MIN_LEN * k || bh > 2 * k) continue
             val top = IntArray(bw) { Int.MAX_VALUE }; val bot = IntArray(bw) { -1 }
             for (y in y0 until y0 + bh) for (x in x0 until x0 + bw) if (lab[y * w + x] == l) {
                 val c = x - x0; top[c] = min(top[c], y); bot[c] = max(bot[c], y)

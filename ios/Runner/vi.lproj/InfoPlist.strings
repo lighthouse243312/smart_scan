@@ -1,0 +1,4 @@
+/* Permission prompts */
+"NSCameraUsageDescription" = "Smart Scan dùng camera để quét tài liệu giấy của bạn.";
+"NSPhotoLibraryUsageDescription" = "Smart Scan cho phép bạn chọn ảnh trong thư viện để chuyển thành tài liệu sạch, rõ nét.";
+"NSPhotoLibraryAddUsageDescription" = "Smart Scan lưu các trang đã quét vào thư viện ảnh khi bạn chọn Lưu.";

@@ -33,14 +33,16 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>Ứng dụng cần quyền truy cập camera để quét tài liệu</string>
+	<string>Smart Scan uses the camera to scan your paper documents.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>Ứng dụng cần quyền lưu ảnh tài liệu đã quét vào thư viện ảnh</string>
+	<string>Smart Scan saves your scanned pages to your photo library when you choose Save.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Ứng dụng cần quyền truy cập thư viện ảnh để chọn/lưu tài liệu đã quét</string>
+	<string>Smart Scan lets you pick photos from your library to turn them into clean documents.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

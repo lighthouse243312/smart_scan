@@ -362,7 +362,10 @@ object PrintRestore {
         val tallBand = dilate(text.core, w0, h0, 2 * gh, (3 * gh) or 1)
         val cdPrintT = percentile(values(and(text.core, dark70)) { cd(pg, it, a0, b0) }, 90.0)
         val faded = where(n0) { inkN[it].toInt() != 0 && pg.dE(it) < 0.6f * pg.dN(it) }
-        val f = Components(and(faded, not(ruleGap)), w0, h0)
+        // a pen line struck through printed words is fused with them: taken out first, so the words
+        // come back and the line through them stays erased
+        val strikes = if (keepStrikesOut) strikeLines(faded, inkN, hwMask, gh, w0, h0) else ByteArray(n0)
+        val f = Components(and(faded, not(ruleGap), not(strikes)), w0, h0)
         val done = BooleanArray(f.n)
         repeat(3) {                              // a restored glyph extends the band
             for (i in 1 until f.n) {
@@ -387,6 +390,38 @@ object PrintRestore {
             band = or(band, dilate(restore, w0, h0, 4 * gh, gh or 1))
         }
         return band
+    }
+
+    /** Off until measured on pages with pen strikes through print (InkHarness `-e strikeout 1`). */
+    @JvmStatic var keepStrikesOut = false
+
+    /**
+     * Pen lines struck through printed words, among the erased ink [faded]: horizontal runs longer
+     * than a letter ([gh] the text height), thin, inside the handwriting, with the original ink right
+     * above AND right below along most of their length — through the middle of the letters. An
+     * underline or a blank has letters on one side only.
+     */
+    private fun strikeLines(faded: ByteArray, inkN: ByteArray, hwMask: ByteArray, gh: Int, w: Int, h: Int): ByteArray {
+        val runs = and(morph(faded, w, h, Imgproc.MORPH_OPEN, max(3, (1.5 * gh).toInt()), 1), hwMask)
+        val c = Components(runs, w, h)
+        val out = ByteArray(w * h)
+        val reach = max(2, gh / 2)
+        for (i in 1 until c.n) {
+            if (c.bh[i] > max(3, (0.4 * gh).toInt())) continue
+            var through = 0
+            for (x in c.bx[i] until c.bx[i] + c.bw[i]) {
+                var above = false; var below = false
+                for (d in 1..reach) {
+                    val ya = c.by[i] - d; val yb = c.by[i] + c.bh[i] - 1 + d
+                    if (ya >= 0 && inkN[ya * w + x].toInt() != 0) above = true
+                    if (yb < h && inkN[yb * w + x].toInt() != 0) below = true
+                }
+                if (above && below) through++
+            }
+            if (through >= 0.5 * c.bw[i]) c.paint(i, out)
+        }
+        // the line's soft rim with it
+        return and(dilate(out, w, h, 3, 3), faded)
     }
 
     /** ── pen the eraser left ── the pixels to clear to paper. */

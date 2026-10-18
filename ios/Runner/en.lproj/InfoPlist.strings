@@ -1,0 +1,4 @@
+/* Permission prompts */
+"NSCameraUsageDescription" = "Smart Scan uses the camera to scan your paper documents.";
+"NSPhotoLibraryUsageDescription" = "Smart Scan lets you pick photos from your library to turn them into clean documents.";
+"NSPhotoLibraryAddUsageDescription" = "Smart Scan saves your scanned pages to your photo library when you choose Save.";

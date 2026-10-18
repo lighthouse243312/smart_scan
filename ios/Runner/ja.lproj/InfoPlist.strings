@@ -1,0 +1,4 @@
+/* Permission prompts */
+"NSCameraUsageDescription" = "Smart Scan は紙の書類をスキャンするためにカメラを使用します。";
+"NSPhotoLibraryUsageDescription" = "Smart Scan はライブラリの写真を選んで、きれいな書類に変換します。";
+"NSPhotoLibraryAddUsageDescription" = "「保存」を選ぶと、Smart Scan はスキャンしたページを写真ライブラリに保存します。";

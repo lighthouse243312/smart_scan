@@ -629,8 +629,15 @@ static void StrokeVote(cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap, c
 // tails grown from the colour-found strokes, and whole pen strokes the colour of the print that it
 // is sure of. Print it sees under the new handwriting is remembered as overlap, to be redrawn.
 
-static const double kFinishSureHw = 0.7, kFinishMaxPrint = 0.4, kFinishUnderPen = 0.5;
+static const double kFinishSureHw = 0.7, kFinishMaxPrint = 1.0, kFinishUnderPen = 0.5;
 static const double kVetoPrint = 0.6, kVetoHw = 0.2, kRulePrint = 0.5, kRuleHw = 0.3;
+// a colour stroke's pixels the model sees as plain print (this much print, this little pen) are
+// print once they are this share of the stroke
+static const double kPixelPrint = 0.6, kPixelHw = 0.2, kPixelShare = 0.02;
+// a whole stroke among the rest is taken only when the model sees handwriting this far above print
+static const double kFinishSureMargin = 0.2;
+static const int kFinishRimSteps = 3;
+static const double kFinishRimThr = 0.1;
 static const int kFinishGrowSteps = 40;
 
 /// Mean of [a] and [b] per connected component of [mask]; returns labels and the per-label means.
@@ -656,10 +663,24 @@ static void ModelFinish(cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap, 
         const int n = ComponentMeans(handwriting, modelHw, modelPrint, labels, area, mh, mp);
         std::vector<char> veto(n, 0);
         for (int i = 1; i < n; i++) veto[i] = mp[i] >= kVetoPrint && mh[i] <= kVetoHw;
+        // printed letters a pen line crossed or circled join the pen's stroke, and the colour test puts
+        // the whole word in the handwriting: where the model sees plain print in such a stroke, those
+        // pixels are print — the pen's own pixels stay handwriting
+        auto plainPrint = [&](int y, int x) {
+            return modelPrint.at<float>(y, x) >= kPixelPrint && modelHw.at<float>(y, x) <= kPixelHw;
+        };
+        std::vector<int> sure(n, 0);
+        for (int y = 0; y < labels.rows; y++) {
+            const int *l = labels.ptr<int>(y);
+            for (int x = 0; x < labels.cols; x++) if (l[x] && plainPrint(y, x)) sure[l[x]]++;
+        }
+        std::vector<char> split(n, 0);
+        for (int i = 1; i < n; i++) split[i] = !veto[i] && sure[i] >= kPixelShare * area[i];
         for (int y = 0; y < labels.rows; y++) {
             const int *l = labels.ptr<int>(y);
             uchar *hw = handwriting.ptr<uchar>(y), *pr = print.ptr<uchar>(y), *ov = overlap.ptr<uchar>(y);
-            for (int x = 0; x < labels.cols; x++) if (veto[l[x]]) { hw[x] = 0; pr[x] = 255; ov[x] = 0; }
+            for (int x = 0; x < labels.cols; x++)
+                if (veto[l[x]] || (split[l[x]] && plainPrint(y, x))) { hw[x] = 0; pr[x] = 255; ov[x] = 0; }
         }
     }
     // 2. long straight runs (a coloured grid / answer line fused with the writing), pixel by pixel
@@ -691,12 +712,22 @@ static void ModelFinish(cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap, 
         cv::Mat labels; std::vector<int> area; std::vector<double> mh, mp;
         const int n = ComponentMeans(rest, modelHw, modelPrint, labels, area, mh, mp);
         std::vector<char> take(n, 0);
-        for (int i = 1; i < n; i++) take[i] = area[i] >= minArea && mh[i] >= kFinishSureHw && mp[i] < kFinishMaxPrint;
+        // (an outline of a printed drawing — a cloud's arcs — can read as pen to the model, but never
+        // by such a margin over print)
+        for (int i = 1; i < n; i++)
+            take[i] = area[i] >= minArea && mh[i] >= kFinishSureHw && mp[i] < kFinishMaxPrint && mh[i] - mp[i] >= kFinishSureMargin;
         for (int y = 0; y < labels.rows; y++) {
             const int *l = labels.ptr<int>(y);
             uchar *g = grown.ptr<uchar>(y);
             for (int x = 0; x < labels.cols; x++) if (take[l[x]]) g[x] = 255;
         }
+    }
+    // rims and thin ends of the strokes found: ink right next to a stroke that the model leans to
+    // as pen (above kFinishRimThr) and does not see as print goes with it (kFinishRimSteps px)
+    {
+        const cv::Mat rim = (modelHw > kFinishRimThr) & (modelPrint < 0.5) & ink;
+        cv::Mat nx;
+        for (int i = 0; i < kFinishRimSteps; i++) { cv::dilate(grown, nx, k3); grown |= (nx & rim); }
     }
     // what the model added: no longer print, except print it sees under the pen (redrawn)
     const cv::Mat added = grown & ~colourHw;
@@ -704,6 +735,121 @@ static void ModelFinish(cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap, 
     print = (print & ~added) | under;
     overlap |= under;
     handwriting = grown;
+    // a pen stroke on a grainy photo comes out speckled: ink the stroke closes over (a 3×3 closing) is
+    // the stroke's too — unless the model sees print there and no pen (a printed letter it touches)
+    cv::Mat closed;
+    cv::morphologyEx(handwriting, closed, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
+    closed &= ink & ~((modelPrint > kVetoPrint) & (modelHw < kVetoHw));
+    handwriting |= closed;
+    print &= ~closed;
+}
+
+// MARK: - Isolated print (mirror IsolatedPrint.kt on Android)
+//
+// Second look at what the first pass left beside the handwriting it found: only pieces of "print"
+// touching the found strokes' surroundings are judged. Printed text never stands alone — a letter
+// has its word beside it, a word its line, a digit its label. Such a letter-sized piece with no
+// other print within a text height of it is a pen leftover the detectors missed (a black-pen dot, a
+// short tick, a scribble, the tail of a stroke cut off from it) and becomes handwriting — unless it
+// is a letter or digit after all: a typeset page repeats its glyphs, so a lone printed "5" has a
+// twin of the same shape and size among the page's other print, and a scribble has none; a glyph
+// the page has only once the model still sees as print. Specks are not judged, and neither are
+// pieces larger than a few letters. Rules are not text: a pen piece standing on an answer line is
+// judged without the line, and only the piece (never the line) becomes handwriting.
+
+static const double kIsoReach = 1.0, kIsoMaxSize = 1.5, kIsoMinSize = 0.4, kIsoTwinIou = 0.6, kIsoSurePrint = 0.6;
+static const int kIsoLeftoverUnits = 2;
+
+static void IsolatedPrint(cv::Mat &handwriting, cv::Mat &print, const cv::Mat &overlap, const cv::Mat &modelPrint, int minArea) {
+    const int W = handwriting.cols, H = handwriting.rows;
+    const int unit = inkanalysis::StrokeUnit(handwriting);
+    // print as the mask will show it: none of the pen's pixels; print under the pen counts
+    cv::Mat allPrint = (print & ~handwriting) | overlap;
+    RemoveSmallComponents(allPrint, std::max(3, minArea / 4));   // paper specks are not print
+    // rules (answer lines, table grid): long straight runs, taken out of the print first
+    {
+        const int len = std::max(15, std::max(W, H) / 60);
+        cv::Mat h, v;
+        cv::morphologyEx(allPrint, h, cv::MORPH_OPEN, cv::Mat::ones(1, len, CV_8U));
+        cv::morphologyEx(allPrint, v, cv::MORPH_OPEN, cv::Mat::ones(len, 1, CV_8U));
+        cv::Mat rules = h | v;
+        cv::dilate(rules, rules, cv::Mat::ones(3, 3, CV_8U));
+        allPrint &= ~rules;
+        RemoveSmallComponents(allPrint, std::max(3, minArea / 4));
+    }
+    cv::Mat labels, stats, cents;
+    const int n = cv::connectedComponentsWithStats(allPrint, labels, stats, cents, 8, CV_32S);
+    if (n < 50) return;   // too little print to know how it stands
+    auto S = [&](int i, int f) { return stats.at<int>(i, f); };
+    // text height: the median letter (pieces of a letter's size, not specks or grid dots)
+    std::vector<int> hs;
+    for (int i = 1; i < n; i++) if (S(i, cv::CC_STAT_AREA) >= std::max(minArea, 4 * unit * unit)) hs.push_back(S(i, cv::CC_STAT_HEIGHT));
+    if (hs.empty()) return;
+    std::sort(hs.begin(), hs.end());
+    const double cap = hs[hs.size() / 2];
+    // pieces closer than the reach join one group; a group of one is a piece alone
+    const int r = std::max(1, (int)std::lround(kIsoReach * cap / 2));
+    cv::Mat near, groups;
+    cv::dilate(allPrint, near, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * r + 1, 2 * r + 1)));
+    const int g = cv::connectedComponents(near, groups, 8, CV_32S);
+    std::vector<int> members(g, 0), groupOf(n, -1);
+    cv::Mat rim;
+    const int d = 2 * kIsoLeftoverUnits * unit + 1;
+    cv::dilate(handwriting, rim, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(d, d)));
+    std::vector<char> touchesPen(n, 0), underPen(n, 0);
+    std::vector<double> sumPr(n, 0);
+    for (int y = 0; y < H; y++) {
+        const int *lp = labels.ptr<int>(y), *gp = groups.ptr<int>(y);
+        const uchar *rp = rim.ptr<uchar>(y), *op = overlap.ptr<uchar>(y);
+        const float *pp = modelPrint.ptr<float>(y);
+        for (int x = 0; x < W; x++) {
+            const int l = lp[x]; if (!l) continue;
+            if (groupOf[l] < 0) { groupOf[l] = gp[x]; members[gp[x]]++; }
+            if (rp[x]) touchesPen[l] = 1;
+            if (op[x]) underPen[l] = 1;
+            sumPr[l] += pp[x];
+        }
+    }
+    auto h = [&](int i) { return S(i, cv::CC_STAT_HEIGHT); };
+    auto w = [&](int i) { return S(i, cv::CC_STAT_WIDTH); };
+    std::vector<char> alone(n, 0);
+    for (int i = 1; i < n; i++)
+        alone[i] = members[groupOf[i]] == 1 && !underPen[i] && touchesPen[i] &&
+                   h(i) <= kIsoMaxSize * cap && w(i) <= kIsoMaxSize * cap &&
+                   std::max(h(i), w(i)) >= kIsoMinSize * cap &&
+                   sumPr[i] / S(i, cv::CC_STAT_AREA) < kIsoSurePrint;
+    // a letter or digit after all: a twin among the print that stands with other print
+    std::vector<int> ref;
+    for (int i = 1; i < n; i++)
+        if (!alone[i] && members[groupOf[i]] > 1 && S(i, cv::CC_STAT_AREA) >= minArea && h(i) <= kIsoMaxSize * cap && w(i) <= kIsoMaxSize * cap)
+            ref.push_back(i);
+    std::sort(ref.begin(), ref.end(), [&](int a, int b) { return h(a) < h(b); });
+    auto iou = [&](int i, int j) {
+        const int xi = S(i, cv::CC_STAT_LEFT), yi = S(i, cv::CC_STAT_TOP), xj = S(j, cv::CC_STAT_LEFT), yj = S(j, cv::CC_STAT_TOP);
+        int inter = 0, uni = 0;
+        for (int yy = 0; yy < h(i); yy++) for (int xx = 0; xx < w(i); xx++) {
+            const bool a = labels.at<int>(yi + yy, xi + xx) == i;
+            const bool b = labels.at<int>(yj + yy * h(j) / h(i), xj + xx * w(j) / w(i)) == j;
+            if (a && b) inter++;
+            if (a || b) uni++;
+        }
+        return uni ? (double)inter / uni : 0.0;
+    };
+    for (int i = 1; i < n; i++) {
+        if (!alone[i]) continue;
+        const int hLo = (int)std::floor(h(i) * 0.85), hHi = (int)std::ceil(h(i) * 1.18);
+        auto it = std::lower_bound(ref.begin(), ref.end(), hLo, [&](int a, int v) { return h(a) < v; });
+        for (; it != ref.end() && h(*it) <= hHi; ++it) {
+            const int j = *it;
+            if (w(j) < 0.82 * w(i) || w(j) > 1.22 * w(i)) continue;
+            if (iou(i, j) >= kIsoTwinIou) { alone[i] = 0; break; }
+        }
+    }
+    for (int y = 0; y < H; y++) {
+        const int *lp = labels.ptr<int>(y);
+        uchar *hp = handwriting.ptr<uchar>(y), *pr = print.ptr<uchar>(y);
+        for (int x = 0; x < W; x++) if (alone[lp[x]]) { hp[x] = 255; pr[x] = 0; }
+    }
 }
 
 // MARK: - Strike-throughs (mirror StrikeThrough.kt on Android)
@@ -916,6 +1062,7 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     inkanalysis::PenComponentVote(src, combinedHw, combinedPrint, overlap, handwritingProb);
     ModelFinish(combinedHw, combinedPrint, overlap, ink, handwritingProb, printProb, threshold, MinSpeckleArea(src));
     // StrikeThrough(src, combinedHw, combinedPrint, overlap);   // off, see StrikeThrough.kt
+    IsolatedPrint(combinedHw, combinedPrint, overlap, printProb, MinSpeckleArea(src));
 
     if (!WriteMaskFile(combinedHw, combinedPrint, overlap, maskPath, error)) return nil;
     return Coverage(combinedHw);

@@ -3732,9 +3732,13 @@ inline void PenComponentVote(const cv::Mat &src, cv::Mat &handwriting, cv::Mat &
     auto S = [&](int l, int f) { return stats.at<int>(l, f); };
     std::vector<int> cntV(n, 0), cntP(n, 0), cntN(n, 0), cntNear(n, 0);
     std::vector<double> sumMh(n, 0);
+    // the model's view is taken off the printed rules: a black-pen answer written on its line is one
+    // piece with the line, and the long line would outvote the writing
+    std::vector<int> offRule(n, 0);
     for (int y = 0; y < H; y++) {
         const int *lp = labels.ptr<int>(y);
         const uchar *vp = valid.ptr<uchar>(y), *pp = penSeed.ptr<uchar>(y), *np = neutSeed.ptr<uchar>(y), *sp = penSide.ptr<uchar>(y);
+        const uchar *rp = rule.ptr<uchar>(y);
         const float *mp = haveModel ? modelHw.ptr<float>(y) : nullptr;
         for (int x = 0; x < W; x++) {
             const int l = lp[x]; if (!l) continue;
@@ -3742,6 +3746,8 @@ inline void PenComponentVote(const cv::Mat &src, cv::Mat &handwriting, cv::Mat &
             if (vp[x]) cntV[l]++;
             if (pp[x]) cntP[l]++;
             if (np[x]) cntN[l]++;
+            if (rp[x]) continue;
+            offRule[l]++;
             if (mp) sumMh[l] += mp[x];
         }
     }
@@ -3761,13 +3767,17 @@ inline void PenComponentVote(const cv::Mat &src, cv::Mat &handwriting, cv::Mat &
         const bool big = cw > 12 * k && ch > 12 * k;
         const float fill = (float)area / std::max(1, cw * ch);
         const bool thinRule = ch <= 2 * k + 1 && cw >= 6 * ch;
-        const double mh = sumMh[l] / std::max(1, area);
+        const double mh = sumMh[l] / std::max(1, offRule[l]);
         const float neutShare = (float)cntN[l] / cntV[l];
         const float nearPen = (float)cntNear[l] / std::max(1, area);
         fills[l] = fill; ps[l] = p;
         // large and neutral, or large and solid (handwriting strokes are sparse): a picture or a
         // printed frame — kept, except pen pieces written into it (a signature touching the header box)
-        if (big && (p < 0.5f || fill > 0.3f)) cat[l] = 4;
+        // ...but large and sparse with the model sure it is writing (off the rules): a black-pen answer
+        // fused with the printed arrow, its line and a red tick — not a picture; the detectors' decision
+        // stands
+        if (big && fill <= 0.3f && mh >= 0.8) cat[l] = 0;
+        else if (big && (p < 0.5f || fill > 0.3f)) cat[l] = 4;
         // whole-component pen only when nothing in it is confidently print-coloured: a bold printed
         // hint letter fused with the pen letters beside it is clipped (colourless) but for its rims
         else if (p >= 0.9f && cntN[l] <= std::max(3.0f, 0.02f * cntV[l])) cat[l] = 1;

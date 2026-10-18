@@ -106,9 +106,12 @@ object InkSegmenter {
             val (hw, outPrint, overlap) = InkAnalysis.detectByInkColor(src, colorDelta, printProb, handwritingProb)
             releasing(hw, outPrint, overlap) {
                 PenComponentVote.apply(src, hw, outPrint, overlap, handwritingProb)
-                ModelFinish.apply(hw, outPrint, overlap, ink, handwritingProb, printProb, threshold,
+                ModelFinish.apply(src, hw, outPrint, overlap, ink, handwritingProb, printProb, threshold,
                     HandwritingMask.minSpeckleArea(src))
                 StrikeThrough.apply(src, hw, outPrint, overlap)
+                IsolatedPrint.apply(hw, outPrint, overlap, printProb, HandwritingMask.minSpeckleArea(src))
+                TickOverPrint.apply(src, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
+                LoopArcs.apply(ink, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
                 HandwritingMask.write(hw, outPrint, overlap, maskPath)
                 HandwritingMask.result(maskPath, hw)
             }

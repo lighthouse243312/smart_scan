@@ -26,8 +26,14 @@ import kotlin.math.sqrt
  * Mirrors LineHeal in ios/Runner/ImageProcessingOpenCV.mm.
  */
 object LineHeal {
-    /** Dev switch (InkHarness `-e lineheal 0`). */
-    @JvmStatic var enabled = true
+    /**
+     * Off: measured on the erased output of 21 labelled pages (3 passes, as the app), healing took
+     * print away — grid paper's lines beside the handwriting, table edges — print kept 97.8% with
+     * it, 99.3% without, for 0.2 points of handwriting. Dev switch: InkHarness `-e lineheal 1`.
+     */
+    @JvmStatic var enabled = false
+    /** Dev switch (InkHarness `-e healtext 0`): also draw lines that run through text. */
+    @JvmStatic var notThroughText = true
     /** Dev counters of the last run (InkHarness report). */
     @JvmStatic var stats = ""
     private val reject = IntArray(6)
@@ -199,6 +205,10 @@ object LineHeal {
             val bx = l.bx + eb * ux; val by = l.by + eb * uy
             // only a line the pen touched is drawn again
             if (!l.broken && ea == 0 && eb == 0 && !touched(ax, ay, bx, by, l.th, k, ::at)) continue
+            // a rule runs under or between the text, never through it: ink right above AND right
+            // below it along much of its length is a stroke across letters (a pen strike-through, the
+            // tops of a row of letters), not a printed line
+            if (notThroughText && throughText(ax, ay, bx, by, l.th, k, ::at)) { refused[1]++; continue }
             bridged++
             log += "line (%.0f,%.0f)-(%.0f,%.0f) th %.1f ends +%d +%d\n".format(ax, ay, bx, by, l.th, ea, eb)
             paint(dst, paper, ax, ay, bx, by, l.th, l.profile, k, at = ::at, other = if (l.horizontal) LINE_V else LINE_H)
@@ -379,6 +389,34 @@ object LineHeal {
             t++
         }
         return if (lastInk <= 1 || penAtLast < 0.6 * lastInk) 0 else lastInk
+    }
+
+    /** Share of a line's length with print or ink right above and right below it at which it runs through text. */
+    private const val THROUGH_TEXT = 0.25
+
+    /** Whether the line from (ax, ay) to (bx, by) has ink or print right beside it on both sides along much of it. */
+    private fun throughText(ax: Double, ay: Double, bx: Double, by: Double, th: Double, k: Int, at: (Int, Int, Int) -> Boolean): Boolean {
+        val len = hypot(bx - ax, by - ay); if (len < 1) return false
+        val ux = (bx - ax) / len; val uy = (by - ay) / len
+        val lo = th / 2 + 1.5; val hi = th / 2 + k + 1
+        var both = 0; var n = 0
+        var t = 0.0
+        while (t <= len) {
+            n++
+            val cx = ax + t * ux; val cy = ay + t * uy
+            fun side(sign: Int): Boolean {
+                var d = lo
+                while (d <= hi) {
+                    val x = (cx - sign * d * uy).roundToInt(); val y = (cy + sign * d * ux).roundToInt()
+                    if (at(x, y, INK or PURE) && !at(x, y, ZONE)) return true
+                    d += 1.0
+                }
+                return false
+            }
+            if (side(1) && side(-1)) both++
+            t += 1.0
+        }
+        return both > THROUGH_TEXT * n
     }
 
     /** Whether the pen was anywhere along the line from (ax, ay) to (bx, by). */

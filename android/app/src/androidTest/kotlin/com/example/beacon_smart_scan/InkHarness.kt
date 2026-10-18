@@ -94,12 +94,40 @@ class InkHarness : Instrumentation() {
             com.example.beacon_smart_scan.imageprocessing.PrintRetypeset.enabled = args.getString("retypeset") != "0"
             com.example.beacon_smart_scan.imageprocessing.PrintRecognition.enabled = args.getString("recognition") != "0"
             com.example.beacon_smart_scan.imageprocessing.StrokeVote.enabled = args.getString("strokevote") != "0"
-            com.example.beacon_smart_scan.imageprocessing.LineHeal.enabled = args.getString("lineheal") != "0"
+            com.example.beacon_smart_scan.imageprocessing.LineHeal.enabled = args.getString("lineheal") == "1"
+            com.example.beacon_smart_scan.imageprocessing.ModelFinish.useSlant = args.getString("slant") == "1"
+            com.example.beacon_smart_scan.imageprocessing.TickOverPrint.enabled = args.getString("tick") == "1"
+            com.example.beacon_smart_scan.imageprocessing.LoopArcs.enabled = args.getString("arcs") == "1"
+            com.example.beacon_smart_scan.imageprocessing.SpeckClean.enabled = args.getString("speck") != "0"
+            args.getString("isogroup")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.MAX_LEFTOVER_GROUP = it.toInt() }
+            com.example.beacon_smart_scan.imageprocessing.StrikeThrough.slanted = args.getString("strikeslant") != "0"
+            args.getString("strikelen")?.let { com.example.beacon_smart_scan.imageprocessing.StrikeThrough.MIN_LEN = it.toInt() }
+            com.example.beacon_smart_scan.imageprocessing.PrintRestore.keepStrikesOut = args.getString("strikeout") == "1"
             com.example.beacon_smart_scan.imageprocessing.HandwritingMask.consistent = args.getString("consistent") != "0"
             com.example.beacon_smart_scan.imageprocessing.RuleRedraw.enabled = args.getString("rules") != "0"
             com.example.beacon_smart_scan.imageprocessing.HandwritingMask.touchCheck = args.getString("touch") != "0"
             com.example.beacon_smart_scan.imageprocessing.StrokeVote.pieces = args.getString("pieces") != "0"
             com.example.beacon_smart_scan.imageprocessing.StrikeThrough.enabled = args.getString("strike") == "1"
+            com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.enabled = args.getString("isolated") != "0"
+            com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.nearPen = args.getString("isonear") != "0"
+            com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.glyphs = args.getString("isoglyph") != "0"
+            args.getString("isoprint")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.SURE_PRINT = it.toDouble() }
+            com.example.beacon_smart_scan.imageprocessing.LineHeal.notThroughText = args.getString("healtext") != "0"
+            com.example.beacon_smart_scan.imageprocessing.ModelFinish.pixelVeto = args.getString("pixveto") != "0"
+            args.getString("grow")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.GROW_STEPS = it.toInt() }
+            com.example.beacon_smart_scan.imageprocessing.ModelFinish.takeSure = args.getString("sure") != "0"
+            args.getString("margin")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.SURE_MARGIN = it.toDouble() }
+            args.getString("maxprint")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.MAX_PRINT = it.toDouble() }
+            args.getString("rim")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.RIM_STEPS = it.toInt() }
+            args.getString("rimthr")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.RIM_THR = it.toDouble() }
+            com.example.beacon_smart_scan.imageprocessing.PenComponentVote.ruleOff = args.getString("ruleoff") != "0"
+            com.example.beacon_smart_scan.imageprocessing.PenComponentVote.probe = args.getString("probe")?.split(",")?.map { it.toInt() }?.toIntArray()
+            com.example.beacon_smart_scan.imageprocessing.PenComponentVote.bigSure = args.getString("bigsure") != "0"
+            args.getString("piecesure")?.let { com.example.beacon_smart_scan.imageprocessing.PenComponentVote.PIECE_SURE = it.toDouble() }
+            args.getString("piecein")?.let { com.example.beacon_smart_scan.imageprocessing.PenComponentVote.PIECE_IN_SURE = it.toDouble() }
+            com.example.beacon_smart_scan.imageprocessing.ModelFinish.fillHoles = args.getString("holes") != "0"
+            args.getString("pixshare")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.PIXEL_SHARE = it.toDouble() }
+            args.getString("isoreach")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.REACH = it.toDouble() }
             val mask = "${base}_mask.png"
             if (args.getString("layers") == "1") {
                 // the two detectors separately: model probabilities and the colour method's layers
@@ -125,6 +153,11 @@ class InkHarness : Instrumentation() {
             if (args.getString("erase") != "0" && (args.getString("passes")?.toInt() ?: 1) <= 1) MaskEraser.erase(clean, input, mask, "${base}_erased.png")
             val t2 = System.currentTimeMillis()
             val report = StringBuilder("mask ${t1 - t0} ms, erase ${t2 - t1} ms, coverage ${result["coverage"]}\n")
+            report.append(com.example.beacon_smart_scan.imageprocessing.ModelFinish.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.PenComponentVote.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.TickOverPrint.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.LoopArcs.report)
             // -e passes N: the app's multi-pass erase (lib/state/scan_session.dart eraseHandwriting)
             com.example.beacon_smart_scan.imageprocessing.LineHeal.stats = ""
             val passes = args.getString("passes")?.toInt() ?: 1

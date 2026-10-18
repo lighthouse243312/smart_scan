@@ -1,0 +1,4 @@
+/* Permission prompts */
+"NSCameraUsageDescription" = "Smart Scan 使用相机扫描您的纸质文档。";
+"NSPhotoLibraryUsageDescription" = "Smart Scan 允许您从相册中选择照片，将其转换为清晰的文档。";
+"NSPhotoLibraryAddUsageDescription" = "当您选择“保存”时，Smart Scan 会将扫描的页面保存到您的相册。";

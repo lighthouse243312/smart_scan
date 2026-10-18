@@ -1,0 +1,4 @@
+/* Permission prompts */
+"NSCameraUsageDescription" = "Smart Scan utilise l’appareil photo pour numériser vos documents papier.";
+"NSPhotoLibraryUsageDescription" = "Smart Scan vous permet de choisir des photos de votre photothèque pour les transformer en documents nets.";
+"NSPhotoLibraryAddUsageDescription" = "Smart Scan enregistre les pages numérisées dans votre photothèque lorsque vous choisissez Enregistrer.";
