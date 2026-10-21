@@ -126,9 +126,12 @@ class InkHarness : Instrumentation() {
             args.getString("piecesure")?.let { com.example.beacon_smart_scan.imageprocessing.PenComponentVote.PIECE_SURE = it.toDouble() }
             args.getString("piecein")?.let { com.example.beacon_smart_scan.imageprocessing.PenComponentVote.PIECE_IN_SURE = it.toDouble() }
             com.example.beacon_smart_scan.imageprocessing.ModelFinish.fillHoles = args.getString("holes") != "0"
+            com.example.beacon_smart_scan.imageprocessing.ModelFinish.colourVeto = args.getString("colveto") != "0"
+            com.example.beacon_smart_scan.imageprocessing.ModelFinish.ruleVeto = args.getString("ruleveto") != "0"
             args.getString("pixshare")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.PIXEL_SHARE = it.toDouble() }
             args.getString("isoreach")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.REACH = it.toDouble() }
             val mask = "${base}_mask.png"
+            com.example.beacon_smart_scan.imageprocessing.InkSegmenter.stageDump = if (args.getString("stages") == "1") base else null
             if (args.getString("layers") == "1") {
                 // the two detectors separately: model probabilities and the colour method's layers
                 val src = ImageIO.readOrThrow(input)

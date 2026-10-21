@@ -1,0 +1,109 @@
+{
+ "best_step": 450,
+ "val": {
+  "hw_recall": 0.9409564520438018,
+  "hw_precision": 0.898867650811975,
+  "print_kept": 0.9916271793478808,
+  "iou_hw": 0.8508760776135995,
+  "iou_print": 0.9716283455969016
+ },
+ "test": {
+  "hw_recall": 0.9867888515844065,
+  "hw_precision": 0.9699377281511593,
+  "print_kept": 0.9954250561116663,
+  "iou_hw": 0.9575040164226954,
+  "iou_print": 0.9808021627712311
+ },
+ "test_pages": {
+  "p02": {
+   "hw_recall": 0.9968152866240451,
+   "hw_precision": 0.9927053599744698,
+   "print_kept": 0.9997958287820166,
+   "iou_hw": 0.9895668668983576,
+   "iou_print": 0.9877008671550894
+  },
+  "p11": {
+   "hw_recall": 0.9925125681890049,
+   "hw_precision": 0.9895488962353642,
+   "print_kept": 0.9996957712199575,
+   "iou_hw": 0.982216576690909,
+   "iou_print": 0.9758122401440841
+  },
+  "p19": {
+   "hw_recall": 0.9824190350296773,
+   "hw_precision": 0.9946466809421176,
+   "print_kept": 0.9980851858770784,
+   "iou_hw": 0.9772518080209746,
+   "iou_print": 0.9186282555176039
+  },
+  "p26": {
+   "hw_recall": 0.9898323548992015,
+   "hw_precision": 0.9949507239323216,
+   "print_kept": 0.9991340963527301,
+   "iou_hw": 0.9848849813320191,
+   "iou_print": 0.9956974574619107
+  },
+  "p29": {
+   "hw_recall": 0.9802736651270781,
+   "hw_precision": 0.9091273018414368,
+   "print_kept": 0.9867884191727609,
+   "iou_hw": 0.8927939615520347,
+   "iou_print": 0.9742817243786951
+  }
+ },
+ "synthetic_test": {
+  "iou_print": 0.6367806167570594,
+  "iou_hw": 0.6826639682334875,
+  "hw_precision": 0.7773739588225723,
+  "hw_recall": 0.8485597694117343,
+  "print_to_hw_fp": 0.03258702213780759,
+  "overlap_print_recall": 0.4130307819156175,
+  "paper_to_hw_fp": 0.0034595539086555668
+ },
+ "train_pages": [
+  "p01",
+  "p03",
+  "p05",
+  "p07",
+  "p08",
+  "p09",
+  "p10",
+  "p14",
+  "p15",
+  "p17",
+  "p18",
+  "p20",
+  "p21",
+  "p23",
+  "p27"
+ ],
+ "args": {
+  "init": "ink_segmenter_v46_torch.pt",
+  "steps": 3000,
+  "bs": 16,
+  "real_frac": 0.55,
+  "lr": 5e-05,
+  "real_w": 2.0,
+  "all": false,
+  "paste": 0.6,
+  "hw_pos_w": 5.0,
+  "paste_under": true,
+  "ov_score_w": 1.0,
+  "strike_frac": 0.0,
+  "focus": "p24,p22,p18,p25,p20:4",
+  "near_pen_print_w": 0.7,
+  "print_pos_w": 2.5,
+  "shape": 0.5,
+  "hard": 0.5,
+  "pen": 0.7,
+  "pen_print_neg": 0.3,
+  "ov_print_w": 12.0,
+  "pen_score_w": 0.5,
+  "recall_w": 4.0,
+  "gate_kept": 0.985,
+  "gate_prec": 0.88,
+  "val": "p04,p06,p16,p22,p24",
+  "test": "p02,p11,p19,p26,p29",
+  "out": "ink_segmenter_v49"
+ }
+}

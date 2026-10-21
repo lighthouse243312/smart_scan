@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 
 ML_DIR = os.path.dirname(os.path.abspath(__file__))
-BATCH = os.path.join(ML_DIR, "real", "batch2")
+BATCH = os.path.join(ML_DIR, "real", os.environ.get("LABEL_BATCH", "batch2"))
 OUT = os.path.join(BATCH, "labels")
 PREVIEW = os.path.join(ML_DIR, "preview")
 LONG = 1536
@@ -138,7 +138,9 @@ stats = {}
 
 
 def build(page, overrides):
-    src = cv2.imread(os.path.join(BATCH, page + ".jpg"), cv2.IMREAD_COLOR)[..., ::-1]
+    sp = os.path.join(BATCH, page + ".jpg")
+    if not os.path.exists(sp): sp = os.path.join(BATCH, page + ".png")
+    src = cv2.imread(sp, cv2.IMREAD_COLOR)[..., ::-1]
     rgb, s = resize_long(np.ascontiguousarray(src))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     contrast = paper_level(gray).astype(np.int16) - gray.astype(np.int16)
@@ -153,7 +155,7 @@ def build(page, overrides):
         faint_pen = cv2.morphologyEx(faint_pen.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
         ink = ink | faint_pen
         ch = np.where(faint_pen, ch_f, ch)
-    chroma_pen = next((o["chroma_pen"] for o in overrides.get(page, []) if "chroma_pen" in o), CHROMA_PEN)
+    chroma_pen = next((o["chroma_pen"] for o in overrides.get(page, []) if "chroma_pen" in o), float(os.environ.get("LABEL_CHROMA_PEN", CHROMA_PEN)))
     pen = ink & (ch > chroma_pen)
     lines = ruled_lines(ink)
     v6p = os.path.join(OUT, page + "_v6.npy")
@@ -164,6 +166,14 @@ def build(page, overrides):
     cnt = np.bincount(lab.ravel(), minlength=n).astype(np.float32) + 1e-6
     f_pen = np.bincount(lab.ravel(), weights=pen.ravel().astype(np.float32), minlength=n) / cnt
     is_pen = f_pen > next((o["pen_frac"] for o in overrides.get(page, []) if "pen_frac" in o), 0.5)
+    if chroma_pen < CHROMA_PEN:
+        # a low colour bar (blue-black ballpoint) also passes grey printed pictures and a grey page
+        # edge: there a stroke counts as pen only when strongly coloured, or when the model sees
+        # some handwriting in it (it only vetoes, it does not decide)
+        hi = ink & (ch > CHROMA_PEN)
+        f_hi = np.bincount(lab.ravel(), weights=hi.ravel().astype(np.float32), minlength=n) / cnt
+        m_hw = np.bincount(lab.ravel(), weights=phw.ravel(), minlength=n) / cnt
+        is_pen = (f_hi > 0.5) | (is_pen & (m_hw > 0.2))
     is_pen[0] = False
     hw = (strokes & (phw > 0.4)) | (is_pen[lab] & strokes)
     # shape evidence: whole strokes the fine-tuned model (v20, trained on these pages' corrected
@@ -207,6 +217,26 @@ def build(page, overrides):
         ign |= dm
         hw &= ~dm
 
+    # cautious batches (labels from the model's hints only): ink the model is not clearly calling print
+    # and not handwriting is neither — left unscored rather than taught as print (LABEL_CAUTIOUS=1)
+    if os.environ.get("LABEL_CAUTIOUS") == "1":
+        # but print the model clearly reads as print stays scored as print — it is exactly the print
+        # beside the pen that must be taught not to erase (unscoring it let the next model spill there)
+        pprint = np.load(v6p).astype(np.float32)[..., 0] if os.path.exists(v6p) else np.zeros(ink.shape, np.float32)
+        unk |= ink & ~hw & (phw > 0.15) & ~((pprint > 0.6) & (phw < 0.5))
+    # coloured pictures and colour blocks (printed illustrations, a torn-page edge): dense colour,
+    # not pen — pen strokes are thin and sparse in their box. Not scored (opt-in: AUTO_PICTURES=1)
+    if os.environ.get("AUTO_PICTURES") == "1":
+        blob = cv2.morphologyEx((pen | hw).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        nb, lb, sb, _ = cv2.connectedComponentsWithStats(blob, connectivity=8)
+        for i in range(1, nb):
+            bx, by, bw, bh, ba = sb[i]
+            sel = lb[by:by + bh, bx:bx + bw] == i
+            dens = (hw[by:by + bh, bx:bx + bw] & sel).sum() / max(1, bw * bh)
+            solid = (pen[by:by + bh, bx:bx + bw] & sel).sum() / max(1, sel.sum())
+            if bw * bh >= 2500 and dens >= 0.22 and solid >= 0.5:
+                ign[by:by + bh, bx:bx + bw] |= sel
+                hw[by:by + bh, bx:bx + bw] &= ~sel
     for o in overrides.get(page, []):
         if "r" not in o:
             continue
@@ -287,13 +317,17 @@ def build(page, overrides):
     # faint ink right around handwriting (anti-aliased stroke edge) is neither scored as hw nor
     # as paper: the erase may or may not take it, both are fine
     band |= cv2.dilate(hw.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool) & (contrast > INK_MARGIN // 2) & ~core & ~hw
-    v_print = valid & ~hw & ~band & ~faint & ~ring & ~loose_hw
+    # a printed letter's dark core right beside the pen is print for sure: only the band's faint rim
+    # is left unscored for print (unscoring the core taught nothing about print next to the pen,
+    # and a model then spilled the erase onto it)
+    v_print = valid & ~hw & ~(band & ~core) & ~faint & ~ring & ~loose_hw
     # pen crossing a printed rule: overlap pixel, not scored for hw (the erase keeps the rule)
     v_hw = valid & ~band & ~unk & ~loose_hw & ~(hw & cv2.dilate(lines.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool))
     v_print = v_print & ~unk
     # printed rule pixels touching handwriting: overlap, not scored for print either
     rule_ov = lines & (cv2.dilate(hw.astype(np.uint8), np.ones((13, 13), np.uint8)) > 0)
-    v_print = v_print & ~rule_ov
+    # (for print: only where the pen actually crosses the rule; the rule beyond is print)
+    v_print = v_print & ~(lines & (cv2.dilate(hw.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0))
     v_hw = v_hw & ~rule_ov
     # ── pen vs print, case by case (each ink pixel falls in exactly one) ──
     #  A. pure handwriting: pen with no print under or right beside it (2 px of a printed glyph's
@@ -339,7 +373,7 @@ def build(page, overrides):
 def main():
     ov_p = os.path.join(BATCH, "overrides.json")
     overrides = json.load(open(ov_p)) if os.path.exists(ov_p) else {}
-    pages = sys.argv[1:] or sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(BATCH, "*.jpg")))
+    pages = sys.argv[1:] or sorted(os.path.basename(p)[:-4] for p in (glob.glob(os.path.join(BATCH, "*.jpg")) + glob.glob(os.path.join(BATCH, "*.png"))))
     for p in pages:
         h, pr = build(p, overrides)
         print(f"{p}: hw {h} px, print {pr} px, pure hw (A) {stats.get('pure_hw')} px, overlap (B) {stats.get('overlap')} px")

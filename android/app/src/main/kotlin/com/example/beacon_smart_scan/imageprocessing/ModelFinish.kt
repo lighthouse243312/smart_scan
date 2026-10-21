@@ -59,6 +59,10 @@ object ModelFinish {
     /** Dev switch (InkHarness `-e pixveto 0`). */
     @JvmStatic var pixelVeto = true
 
+    /** Dev switches (InkHarness `-e colveto 0`, `-e ruleveto 0`). */
+    @JvmStatic var colourVeto = true
+    @JvmStatic var ruleVeto = true
+
     /** Dev switch (InkHarness `-e slant 0`). */
     @JvmStatic var useSlant = false
     /** Dev switch (InkHarness `-e sure 0`): no whole confident strokes among the rest. */
@@ -71,8 +75,8 @@ object ModelFinish {
      * in place. [ink]: the page's ink. [modelHw] / [modelPrint]: CV_32F probabilities.
      */
     fun apply(src: Mat, handwriting: Mat, print: Mat, overlap: Mat, ink: Mat, modelHw: Mat, modelPrint: Mat, threshold: Double, minArea: Int) {
-        vetoColouredPrint(handwriting, print, overlap, modelHw, modelPrint)
-        vetoPrintedRules(handwriting, print, overlap, modelHw, modelPrint)
+        if (colourVeto) vetoColouredPrint(handwriting, print, overlap, modelHw, modelPrint)
+        if (ruleVeto) vetoPrintedRules(handwriting, print, overlap, modelHw, modelPrint)
         val modelSays = Mat(); val free = Mat(); val notHw = Mat()
         // the strokes are judged by the model above its threshold, or by the slant above MAYBE_HW
         Core.compare(modelHw, Scalar(if (useSlant) minOf(threshold, MAYBE_HW) else threshold), modelSays, Core.CMP_GT)

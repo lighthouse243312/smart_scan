@@ -34,6 +34,7 @@ from train_ink_seg import augment, evaluate, fmt, load, loss_fn, to_targets
 
 ML_DIR = os.path.dirname(os.path.abspath(__file__))
 LABELS = os.path.join(ML_DIR, "real", "batch2", "labels")
+LABEL_DIRS = [LABELS, os.path.join(ML_DIR, "real", "batch3", "labels")]
 PREVIEW = os.path.join(ML_DIR, "preview")
 DEV = "mps" if torch.backends.mps.is_available() else "cpu"
 VAL = ["p04"]
@@ -42,11 +43,11 @@ CRITERIA = ["hw_recall", "hw_precision", "print_kept", "iou_hw", "iou_print"]
 
 
 def all_pages():
-    return sorted(f[:-4] for f in os.listdir(LABELS) if f.endswith(".npz"))
+    return sorted(f[:-4] for d in LABEL_DIRS if os.path.isdir(d) for f in os.listdir(d) if f.endswith(".npz"))
 
 
 def load_page(name):
-    d = np.load(os.path.join(LABELS, name + ".npz"))
+    d = np.load(next(os.path.join(dd, name + ".npz") for dd in LABEL_DIRS if os.path.exists(os.path.join(dd, name + ".npz"))))
     y = np.stack([(d["y"] & 1) > 0, (d["y"] & 2) > 0], -1).astype(np.float32)
     v = np.stack([(d["valid"] & 1) > 0, (d["valid"] & 2) > 0], -1).astype(np.float32)
     return {"name": name, "images": [d["image"]], "y": y, "valid": v,
@@ -81,6 +82,9 @@ def tile_paper(x):
     return np.maximum(bg.astype(np.float32), 1)
 
 
+PASTE_UNDER = False   # score print under the pasted pen (set from --paste-under)
+
+
 def paste_hw(dst, src, rng):
     """multiply-blend the handwriting strokes of tile `src` onto tile `dst` (x, y, v tuples).
     Ink darkness comes from the source pixel vs its local paper level; the pen colour is kept
@@ -109,7 +113,14 @@ def paste_hw(dst, src, rng):
     v = vd.copy()
     band = cv2.dilate(new_hw.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & ~new_hw
     v[..., 1] = v[..., 1] * ~band
-    v[..., 0] = v[..., 0] * ~(band | new_hw)        # print under fresh ink: not scored
+    if PASTE_UNDER:
+        # the destination's print is known exactly under the pasted pen: it stays print there and is
+        # scored, so the model learns to see the print a real stroke hides from the print around it;
+        # pen over paper is scored "not print"; only the anti-aliased rim is left out
+        v[..., 0] = v[..., 0] * ~band
+        v[..., 0] = np.maximum(v[..., 0], new_hw.astype(np.float32))
+    else:
+        v[..., 0] = v[..., 0] * ~(band | new_hw)    # print under fresh ink: not scored
     return np.clip(out, 0, 255).astype(np.uint8), y, v
 
 
@@ -295,6 +306,28 @@ def pen_val_set(pages, n=96, seed=7):
     return out
 
 
+def paste_val_set(dst_pages, src_pages, n=96, seed=21):
+    """fixed tiles: real pen strokes of other pages pasted over the print of `dst_pages`, the print
+    under the pen labelled exactly (PASTE_UNDER semantics) — the checkpoint choice sees how much print
+    the model still finds under a real stroke."""
+    global PASTE_UNDER
+    keep, PASTE_UNDER = PASTE_UNDER, True
+    rng = np.random.default_rng(seed); out = []
+    while len(out) < n:
+        a = dst_pages[rng.integers(len(dst_pages))]
+        if not len(a["print_pts"]): continue
+        hold = a["hw_pts"]; a["hw_pts"] = a["print_pts"]; dst = sample_real_tile(a, rng); a["hw_pts"] = hold
+        b = src_pages[rng.integers(len(src_pages))]
+        if b["name"] == a["name"]: continue
+        src = sample_real_tile(b, rng)
+        dx, dy = rng.integers(-40, 41, 2)
+        src = tuple(np.roll(t, (dy, dx), (0, 1)) for t in src)
+        t = paste_hw(dst, src, rng)
+        if ((t[1][..., 0] > .5) & (t[1][..., 1] > .5)).sum() >= 40: out.append(t)
+    PASTE_UNDER = keep
+    return out
+
+
 @torch.no_grad()
 def pen_eval(model, tiles, thr=0.5):
     """on drawn pen marks: pen erased (recall), print under the pen kept as print (recall of the
@@ -411,6 +444,21 @@ def real_eval(model, pages, thr=0.5, keep=False):
     return acc.result(), per, probs
 
 
+def matched_eval(model, pages, budget):
+    """recall of handwriting (and of pen touching print) at the threshold where the model loses
+    `budget` printed pixels on these pages — models compared at equal print loss, not at one
+    threshold (a model can trade print for recall just by shifting its bias)."""
+    hp, hn, pp_, tp = [], [], [], []
+    for p in pages:
+        pr = predict_page(model, p["images"][0], DEV)[..., 1]
+        yh, yp = p["y"][..., 1] > .5, p["y"][..., 0] > .5; vh, vp = p["valid"][..., 1] > .5, p["valid"][..., 0] > .5
+        touch = yh & vh & (cv2.dilate((yp & ~yh).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
+        hp.append(pr[yh & vh]); pp_.append(pr[yp & ~yh & vp]); tp.append(pr[touch])
+    hp, pp_, tp = np.concatenate(hp), np.concatenate(pp_), np.concatenate(tp)
+    thr = np.sort(pp_)[::-1][min(int(budget), len(pp_) - 1)]
+    return {"thr": float(thr), "hw_recall": float((hp > thr).mean()), "pen_on_print": float((tp > thr).mean()) if len(tp) else 0.0}
+
+
 def rfmt(r):
     return "  ".join(f"{k}={r[k]:.4f}" for k in CRITERIA)
 
@@ -433,6 +481,13 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--paste", type=float, default=0.5, help="share of real tiles with pasted handwriting")
     ap.add_argument("--hw-pos-w", type=float, default=4.0)
+    ap.add_argument("--eval-every", type=int, default=150)
+    ap.add_argument("--exclude", default="", help="train pages whose name starts with one of these (comma list) are left out")
+    ap.add_argument("--matched", action="store_true", help="choose the checkpoint by recall at the init model's print loss (at --app-thr)")
+    ap.add_argument("--app-thr", type=float, default=0.44)
+    ap.add_argument("--paste-under", action="store_true", help="score print under pasted real pen strokes")
+    ap.add_argument("--ov-hw-w", type=float, default=0.0, help="extra weight on real pen pixels lying over / against print (strike-throughs, circles through letters)")
+    ap.add_argument("--ov-score-w", type=float, default=0.0, help="weight of print found under pasted real pen in checkpoint choice")
     ap.add_argument("--strike-frac", type=float, default=0.0, help="extra share of pen marks that are strike-throughs")
     ap.add_argument("--focus", default="", help="pages sampled more often, e.g. p18,p22:3")
     ap.add_argument("--near-pen-print-w", type=float, default=0.0, help="extra hw-negative weight on print within 4 px of pen")
@@ -459,8 +514,11 @@ def main():
     TEST[:] = [n for n in args.test.split(",") if n]
     held = set(VAL + TEST)
     train_names = names if args.all else [n for n in names if n not in held]
-    global STRIKE_FRAC
+    if args.exclude:
+        train_names = [n for n in train_names if not any(n.startswith(e) for e in args.exclude.split(","))]
+    global STRIKE_FRAC, PASTE_UNDER
     STRIKE_FRAC = args.strike_frac
+    PASTE_UNDER = args.paste_under
     train = [train_page(n) for n in train_names]
     if args.focus:   # pages with the errors still left: sampled more often (same objects, repeated)
         f, reps = args.focus.split(":") if ":" in args.focus else (args.focus, "3")
@@ -486,7 +544,20 @@ def main():
     pen_tiles = pen_val_set([train_page(n) for n in VAL]) if args.pen > 0 else None
     if pen_tiles is not None:
         print(f"BEFORE pen marks: {pen_eval(model, pen_tiles)}", flush=True)
+    paste_tiles = paste_val_set([train_page(n) for n in VAL], train) if args.ov_score_w > 0 else None
+    if paste_tiles is not None:
+        print(f"BEFORE real pen pasted: {pen_eval(model, paste_tiles)}", flush=True)
 
+    budget = None
+    if args.matched:
+        # the init model's print loss on the val pages at the app's threshold: the budget
+        lost = 0
+        for p in val:
+            pr = predict_page(model, p["images"][0], DEV)[..., 1]
+            lost += int(((pr > args.app_thr) & (p["y"][..., 0] > .5) & (p["y"][..., 1] < .5) & (p["valid"][..., 0] > .5)).sum())
+        budget = lost
+        m0 = matched_eval(model, val, budget)
+        print(f"BEFORE matched (print budget {budget} px): {m0}", flush=True)
     n_real = int(round(args.bs * args.real_frac))
     n_syn = args.bs - n_real
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=1e-4)
@@ -515,6 +586,13 @@ def main():
             wn = yr[:, 1] * (1 - yr[:, 0]) * vr[:, 0]
             bn = torch.nn.functional.binary_cross_entropy_with_logits(logits[n_syn:, 0], yr[:, 0], reduction="none")
             l_real = l_real + args.pen_print_neg * (bn * wn).sum() / wn.sum().clamp(min=1)
+        if args.ov_hw_w > 0:  # pen over print on the real pages: the strike-through, the circle through
+            # a letter — the pen pixels that touch print are what the erase most needs and the rarest
+            prt = yr[:, 0:1] * (1 - yr[:, 1:2])
+            near_print = torch.nn.functional.max_pool2d(prt, 3, stride=1, padding=1)[:, 0]
+            wo = yr[:, 1] * near_print * vr[:, 1]
+            bo = torch.nn.functional.binary_cross_entropy_with_logits(logits[n_syn:, 1], yr[:, 1], reduction="none")
+            l_real = l_real + args.ov_hw_w * (bo * wo).sum() / wo.sum().clamp(min=1)
         if args.print_pos_w > 0:  # extra weight on real printed pixels (thin rules, box sides)
             wp = yr[:, 0] * vr[:, 0]
             bp = torch.nn.functional.binary_cross_entropy_with_logits(logits[n_syn:, 0], yr[:, 0], reduction="none")
@@ -539,14 +617,22 @@ def main():
             print(f"step {step}/{args.steps} loss {run / 100:.4f} lr {sched.get_last_lr()[0]:.2e} "
                   f"elapsed {el / 60:.1f}m eta {el / step * (args.steps - step) / 60:.1f}m", flush=True)
             run = 0.0
-        if step % 150 == 0 or step == args.steps:
+        if step % args.eval_every == 0 or step == args.steps:
             r, _, _ = real_eval(model, val)
             gate = r["print_kept"] >= args.gate_kept and r["hw_precision"] >= args.gate_prec
             score = (args.recall_w * r["hw_recall"] + 0.5 * r["iou_hw"] + 0.25 * r["iou_print"]) if gate else -1 + r["print_kept"]
             pe = None
-            if pen_tiles is not None:   # pen circles / ticks over print: not in the real labels
+            if budget is not None:
+                mm = matched_eval(model, val, budget)
+                score = mm["hw_recall"] + 0.5 * mm["pen_on_print"]
+                pe = {"matched": mm}
+            if pen_tiles is not None and budget is None:   # pen circles / ticks over print: not in the real labels
                 pe = pen_eval(model, pen_tiles)
                 score += args.pen_score_w * (pe["pen_recall"] + pe["under_pen_print"] + pe["pen_not_print"])
+            if paste_tiles is not None:   # real strokes over print: print under them must stay found
+                po = pen_eval(model, paste_tiles)
+                score += args.ov_score_w * (po["under_pen_print"] + po["pen_recall"] + po["print_kept"])
+                pe = dict(pe or {}, pasted_under=po["under_pen_print"], pasted_pen=po["pen_recall"], pasted_kept=po["print_kept"])
             tag = f"  pen={pe}" if pe else ""
             if score > best_score:
                 best_score, best_step = score, step

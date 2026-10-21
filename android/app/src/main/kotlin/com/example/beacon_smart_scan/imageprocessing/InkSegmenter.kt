@@ -73,6 +73,9 @@ object InkSegmenter {
         return Pair(printProb, handwritingProb)
     }
 
+    /** Dev: path prefix to write the handwriting layer after each stage (InkHarness `-e stages 1`). */
+    @JvmStatic var stageDump: String? = null
+
     fun mask(context: Context, inputPath: String, maskPath: String, threshold: Double, colorDelta: Double): Map<String, Any> {
         val model = ensureLoaded(context)
         val src = ImageIO.readOrThrow(inputPath)
@@ -105,9 +108,12 @@ object InkSegmenter {
             // left — tails of those strokes and pen the colour of the print (see ModelFinish)
             val (hw, outPrint, overlap) = InkAnalysis.detectByInkColor(src, colorDelta, printProb, handwritingProb)
             releasing(hw, outPrint, overlap) {
+                stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s1_colour.png", hw) }
                 PenComponentVote.apply(src, hw, outPrint, overlap, handwritingProb)
+                stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s2_vote.png", hw) }
                 ModelFinish.apply(src, hw, outPrint, overlap, ink, handwritingProb, printProb, threshold,
                     HandwritingMask.minSpeckleArea(src))
+                stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s3_finish.png", hw) }
                 StrikeThrough.apply(src, hw, outPrint, overlap)
                 IsolatedPrint.apply(hw, outPrint, overlap, printProb, HandwritingMask.minSpeckleArea(src))
                 TickOverPrint.apply(src, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
