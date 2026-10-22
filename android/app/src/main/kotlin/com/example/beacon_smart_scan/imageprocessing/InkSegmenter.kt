@@ -75,6 +75,8 @@ object InkSegmenter {
 
     /** Dev: path prefix to write the handwriting layer after each stage (InkHarness `-e stages 1`). */
     @JvmStatic var stageDump: String? = null
+    /** Dev: time of each mask stage of the last run (InkHarness report). */
+    @JvmStatic var timing = ""
 
     fun mask(context: Context, inputPath: String, maskPath: String, threshold: Double, colorDelta: Double): Map<String, Any> {
         val model = ensureLoaded(context)
@@ -86,7 +88,10 @@ object InkSegmenter {
         val handwriting = Mat()
         val print = Mat()
         return releasing(src, printProb, handwritingProb, gray, ink, handwriting, print) {
+            var tt = System.currentTimeMillis(); val tb = StringBuilder("mask stages:")
+            fun lap(name: String) { val now = System.currentTimeMillis(); tb.append(" $name ${now - tt}"); tt = now }
             segmentPage(model, src, printProb, handwritingProb)
+            lap("model")
 
             // The model runs at a reduced scale, so its masks are soft at full resolution — snap
             // both to the page's actual ink so erase touches strokes, not blobs of paper.
@@ -107,17 +112,23 @@ object InkSegmenter {
             // handwriting, exactly as "Ink colour" alone), then the model only finishes what colour
             // left — tails of those strokes and pen the colour of the print (see ModelFinish)
             val (hw, outPrint, overlap) = InkAnalysis.detectByInkColor(src, colorDelta, printProb, handwritingProb)
+            lap("colour")
             releasing(hw, outPrint, overlap) {
                 stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s1_colour.png", hw) }
                 PenComponentVote.apply(src, hw, outPrint, overlap, handwritingProb)
+                lap("vote")
                 stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s2_vote.png", hw) }
                 ModelFinish.apply(src, hw, outPrint, overlap, ink, handwritingProb, printProb, threshold,
                     HandwritingMask.minSpeckleArea(src))
+                lap("finish")
                 stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s3_finish.png", hw) }
                 StrikeThrough.apply(src, hw, outPrint, overlap)
-                IsolatedPrint.apply(hw, outPrint, overlap, printProb, HandwritingMask.minSpeckleArea(src))
+                IsolatedPrint.apply(hw, outPrint, overlap, printProb, HandwritingMask.minSpeckleArea(src), src)
+                lap("isolated")
                 TickOverPrint.apply(src, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
                 LoopArcs.apply(ink, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
+                lap("tick+loops")
+                timing = tb.toString() + "\n"
                 HandwritingMask.write(hw, outPrint, overlap, maskPath)
                 HandwritingMask.result(maskPath, hw)
             }

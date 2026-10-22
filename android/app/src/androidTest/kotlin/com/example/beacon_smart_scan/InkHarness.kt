@@ -128,6 +128,10 @@ class InkHarness : Instrumentation() {
             com.example.beacon_smart_scan.imageprocessing.ModelFinish.fillHoles = args.getString("holes") != "0"
             com.example.beacon_smart_scan.imageprocessing.ModelFinish.colourVeto = args.getString("colveto") != "0"
             com.example.beacon_smart_scan.imageprocessing.ModelFinish.ruleVeto = args.getString("ruleveto") != "0"
+            com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.amidPen = args.getString("amid") != "0"
+            args.getString("amidprint")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.AMID_PRINT = it.toDouble() }
+            com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.probe = args.getString("isoprobe")?.split(",")?.map { it.toInt() }?.toIntArray()
+            args.getString("maxpasses")?.let { com.example.beacon_smart_scan.imageprocessing.MultiPassEraser.MAX_PASSES = it.toInt() }
             args.getString("pixshare")?.let { com.example.beacon_smart_scan.imageprocessing.ModelFinish.PIXEL_SHARE = it.toDouble() }
             args.getString("isoreach")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.REACH = it.toDouble() }
             val mask = "${base}_mask.png"
@@ -157,7 +161,9 @@ class InkHarness : Instrumentation() {
             val t2 = System.currentTimeMillis()
             val report = StringBuilder("mask ${t1 - t0} ms, erase ${t2 - t1} ms, coverage ${result["coverage"]}\n")
             report.append(com.example.beacon_smart_scan.imageprocessing.ModelFinish.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.InkSegmenter.timing)
             report.append(com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.probeLog)
             report.append(com.example.beacon_smart_scan.imageprocessing.PenComponentVote.report)
             report.append(com.example.beacon_smart_scan.imageprocessing.TickOverPrint.report)
             report.append(com.example.beacon_smart_scan.imageprocessing.LoopArcs.report)
@@ -170,6 +176,7 @@ class InkHarness : Instrumentation() {
                     args.getString("method") != "color", 0.8 - 0.6 * s, 0.08 - 0.06 * s)
                 report.append(com.example.beacon_smart_scan.imageprocessing.LineHeal.stats)
                 report.append("multi-pass: ${r["passes"]} passes, ${System.currentTimeMillis() - tp} ms\n")
+                report.append(com.example.beacon_smart_scan.imageprocessing.MultiPassEraser.timing)
             }
             out.putString(REPORT_KEY_STREAMRESULT, report.toString())
             finish(0, out)

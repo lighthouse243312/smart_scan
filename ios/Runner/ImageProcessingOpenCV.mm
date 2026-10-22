@@ -760,7 +760,14 @@ static void ModelFinish(cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap, 
 static const double kIsoReach = 1.0, kIsoMaxSize = 1.5, kIsoMinSize = 0.4, kIsoTwinIou = 0.6, kIsoSurePrint = 0.6;
 static const int kIsoLeftoverUnits = 2;
 
-static void IsolatedPrint(cv::Mat &handwriting, cv::Mat &print, const cv::Mat &overlap, const cv::Mat &modelPrint, int minArea) {
+// case 2 — a piece amid the writing (see IsolatedPrint.kt): connected to the pen, letter-tall, with
+// handwriting around it and no printed letter right beside it, not crossed or encircled by the pen,
+// not set off by a coloured pen, the model not reading it as print, and no printed twin.
+static const double kAmidMinH = 0.55, kAmidMaxW = 2.5, kAmidPrint = 0.5, kAmidCrossed = 0.6,
+                    kAmidColour = 4.0, kAmidKeepPrint = 0.45, kAmidTwinIou = 0.75;
+static const int kAmidClear = 2;
+
+static void IsolatedPrint(cv::Mat &handwriting, cv::Mat &print, const cv::Mat &overlap, const cv::Mat &modelPrint, int minArea, const cv::Mat &src) {
     const int W = handwriting.cols, H = handwriting.rows;
     const int unit = inkanalysis::StrokeUnit(handwriting);
     // print as the mask will show it: none of the pen's pixels; print under the pen counts
@@ -843,6 +850,84 @@ static void IsolatedPrint(cv::Mat &handwriting, cv::Mat &print, const cv::Mat &o
             const int j = *it;
             if (w(j) < 0.82 * w(i) || w(j) > 1.22 * w(i)) continue;
             if (iou(i, j) >= kIsoTwinIou) { alone[i] = 0; break; }
+        }
+    }
+    // case 2: pieces amid the writing
+    {
+        auto X = [&](int i) { return S(i, cv::CC_STAT_LEFT); };
+        auto Y = [&](int i) { return S(i, cv::CC_STAT_TOP); };
+        auto A = [&](int i) { return S(i, cv::CC_STAT_AREA); };
+        const int gx = (int)std::lround(cap), gy = (int)std::lround(0.3 * cap), half = (int)std::lround(0.6 * cap);
+        const int px = (int)std::lround(0.25 * cap);
+        cv::Mat hwI, prI, hw01 = handwriting > 0, tall(H, W, CV_8U, cv::Scalar(0));
+        for (int y = 0; y < H; y++) { const int *lp = labels.ptr<int>(y); uchar *tp = tall.ptr<uchar>(y);
+            for (int x = 0; x < W; x++) tp[x] = (lp[x] && h(lp[x]) >= kAmidMinH * cap) ? 1 : 0; }
+        cv::integral(hw01 / 255, hwI, CV_32S); cv::integral(tall, prI, CV_32S);
+        auto count = [&](const cv::Mat &I, int x0, int y0, int x1, int y1) {
+            x0 = std::max(0, x0); y0 = std::max(0, y0); x1 = std::min(W, x1); y1 = std::min(H, y1);
+            if (x1 <= x0 || y1 <= y0) return 0;
+            return I.at<int>(y1, x1) - I.at<int>(y0, x1) - I.at<int>(y1, x0) + I.at<int>(y0, x0);
+        };
+        cv::Mat reach, touch;
+        cv::dilate(handwriting, reach, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * gx + 1, 2 * gx + 1)));
+        cv::dilate(handwriting, touch, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * kAmidClear + 1, 2 * kAmidClear + 1)));
+        cv::Mat lab3; cv::cvtColor(src, lab3, cv::COLOR_BGR2Lab);
+        std::vector<char> nearW(n, 0), connected(n, 0);
+        std::vector<double> sumC(n, 0); std::vector<int> cntC(n, 0);
+        cv::Mat chroma(H, W, CV_32F);
+        for (int y = 0; y < H; y++) {
+            const int *lp = labels.ptr<int>(y); const uchar *rp = reach.ptr<uchar>(y), *tp = touch.ptr<uchar>(y);
+            const cv::Vec3b *lb = lab3.ptr<cv::Vec3b>(y); float *cp = chroma.ptr<float>(y);
+            for (int x = 0; x < W; x++) {
+                const double a = lb[x][1] - 128.0, b = lb[x][2] - 128.0; cp[x] = (float)std::sqrt(a * a + b * b);
+                const int l = lp[x]; if (!l) continue;
+                if (rp[x]) nearW[l] = 1;
+                if (tp[x]) connected[l] = 1;
+                sumC[l] += cp[x]; cntC[l]++;
+            }
+        }
+        double sp = 0; long np = 0;
+        for (int i = 1; i < n; i++) if (!nearW[i] && h(i) >= kIsoMinSize * cap) { sp += sumC[i]; np += cntC[i]; }
+        const double printChroma = np ? sp / np : 0.0;
+        auto hwChroma = [&](int x0, int y0, int x1, int y1, double &out) {
+            double s0 = 0; int c0 = 0;
+            for (int yy = std::max(0, y0); yy < std::min(H, y1); yy++) for (int xx = std::max(0, x0); xx < std::min(W, x1); xx++)
+                if (handwriting.at<uchar>(yy, xx)) { s0 += chroma.at<float>(yy, xx); c0++; }
+            if (c0 < 10) return false;
+            out = s0 / c0; return true;
+        };
+        for (int i = 1; i < n; i++) {
+            if (alone[i] || underPen[i] || !nearW[i] || !connected[i]) continue;
+            if (h(i) < kAmidMinH * cap || h(i) > kIsoMaxSize * cap || w(i) > kAmidMaxW * cap || w(i) > 3 * h(i)) continue;
+            // crossed by the pen (case 1): pen or pen-over-print through most of its box's columns
+            int cols = 0;
+            for (int xx = X(i); xx < X(i) + w(i); xx++) for (int yy = Y(i); yy < Y(i) + h(i); yy++)
+                if ((handwriting.at<uchar>(yy, xx) || overlap.at<uchar>(yy, xx)) && labels.at<int>(yy, xx) != i) { cols++; break; }
+            if (cols >= kAmidCrossed * w(i)) continue;
+            const int y0 = Y(i) - gy, y1 = Y(i) + h(i) + gy;
+            const int hwN = count(hwI, X(i) - gx, y0, X(i) + w(i) + gx, y1);
+            const int prN = count(prI, X(i) - px, y0, X(i) + w(i) + px, y1) - A(i);
+            if (hwN < 2 * A(i) || prN > kAmidPrint * A(i)) continue;
+            const bool up = count(hwI, X(i), Y(i) - half, X(i) + w(i), Y(i)) > 0;
+            const bool down = count(hwI, X(i), Y(i) + h(i), X(i) + w(i), Y(i) + h(i) + half) > 0;
+            if (up && down) continue;
+            const bool left = count(hwI, X(i) - half, Y(i), X(i), Y(i) + h(i)) > 0;
+            const bool right = count(hwI, X(i) + w(i), Y(i), X(i) + w(i) + half, Y(i) + h(i)) > 0;
+            if (up && down && left && right) continue;
+            double cw;
+            const double cpc = sumC[i] / std::max(1, cntC[i]);
+            if (hwChroma(X(i) - gx, y0, X(i) + w(i) + gx, y1, cw) && cw > std::max(cpc, printChroma) + kAmidColour) continue;
+            if (sumPr[i] / A(i) >= kAmidKeepPrint) continue;
+            // a printed twin among print standing clear of the writing
+            bool twin = false;
+            const int hLo = (int)std::floor(h(i) * 0.85), hHi = (int)std::ceil(h(i) * 1.18);
+            for (int j = 1; j < n && !twin; j++) {
+                if (j == i || nearW[j] || h(j) < hLo || h(j) > hHi || w(j) < 0.82 * w(i) || w(j) > 1.22 * w(i)) continue;
+                if (std::abs(A(j) - A(i)) > 0.25 * A(i)) continue;
+                twin = iou(i, j) >= kAmidTwinIou;
+            }
+            if (twin) continue;
+            alone[i] = 1;
         }
     }
     for (int y = 0; y < H; y++) {
@@ -1062,7 +1147,7 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     inkanalysis::PenComponentVote(src, combinedHw, combinedPrint, overlap, handwritingProb);
     ModelFinish(combinedHw, combinedPrint, overlap, ink, handwritingProb, printProb, threshold, MinSpeckleArea(src));
     // StrikeThrough(src, combinedHw, combinedPrint, overlap);   // off, see StrikeThrough.kt
-    IsolatedPrint(combinedHw, combinedPrint, overlap, printProb, MinSpeckleArea(src));
+    IsolatedPrint(combinedHw, combinedPrint, overlap, printProb, MinSpeckleArea(src), src);
 
     if (!WriteMaskFile(combinedHw, combinedPrint, overlap, maskPath, error)) return nil;
     return Coverage(combinedHw);
@@ -1141,8 +1226,8 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
 // also call print the first pass damaged "handwriting", so the first mask — the one the user
 // reviewed, measured on the untouched page's colours — is the reference for what is print.
 
-/// Most erase passes per page (the first included).
-static const int kMaxErasePasses = 3;
+/// Most erase passes per page (the first included); two — a third changed nothing on 30 labelled pages.
+static const int kMaxErasePasses = 2;
 /// A later pass runs only if its re-detection, once guarded, still covers this share of the page.
 static const double kMinPassCoverage = 0.0002;
 /// Clearance kept around any handwriting when restoring print, so a pen's rim never returns.
