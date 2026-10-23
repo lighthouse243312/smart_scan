@@ -63,7 +63,8 @@ object PrintRetypeset {
     /** Dev switch for comparing with/without re-typesetting (InkHarness `-e retypeset 0`). */
     @JvmStatic var enabled = true
 
-    fun retypeset(dst: Mat, analysis: Mat, handwriting: Mat, printMask: Mat, k: Int) {
+    /** [strike]: pen strike-throughs ([StrikeThrough]) — print coloured, but pen: unknown like coloured pen. */
+    fun retypeset(dst: Mat, analysis: Mat, handwriting: Mat, printMask: Mat, k: Int, strike: Mat? = null) {
         if (!enabled) return
         if (Core.countNonZero(handwriting) == 0) return
         val owned = ArrayList<Mat>()
@@ -103,11 +104,15 @@ object PrintRetypeset {
             }
             norm = sqrt(max(norm, 1e-12f))
             for (c in 0 until 3) dir[c] /= norm
-            val thr = 0.5f * norm
-            if (thr < 0.004f) return   // no distinguishable pen colour on this page
+            val hasStrike = strike != null && !strike.empty() && Core.countNonZero(strike) > 0
+            // no distinguishable pen colour on this page: nothing to re-typeset, unless black pen
+            // lines struck through print (all ink then counts as print coloured)
+            val noColour = 0.5f * norm < 0.004f
+            if (noColour && !hasStrike) return
+            val thr = if (noColour) 1f else 0.5f * norm
             val unknown = own(Mat.zeros(H, W, CvType.CV_8U))
             val proj = own(Mat.zeros(H, W, CvType.CV_32F))
-            run {
+            if (!noColour) run {
                 for (c in 0 until 3) {
                     val t = own(Mat()); Core.subtract(chroma[c], Scalar(refPr[c].toDouble()), t)
                     Core.scaleAdd(t, dir[c].toDouble(), proj, proj)
@@ -136,6 +141,10 @@ object PrintRetypeset {
                 val alone = own(Mat(lab.size(), CvType.CV_8U)); alone.put(0, 0, out)
                 Imgproc.dilate(alone, alone, Mat.ones(3, 3, CvType.CV_8U))
                 Core.bitwise_or(unknown, alone, unknown)
+            }
+            if (hasStrike) {
+                val sd = own(Mat()); Imgproc.dilate(strike, sd, Mat.ones(3, 3, CvType.CV_8U))
+                Core.bitwise_or(unknown, sd, unknown)
             }
             var known = not(unknown)
             val erasedArea = own(Mat()); Imgproc.dilate(handwriting, erasedArea, Mat.ones(5, 5, CvType.CV_8U))

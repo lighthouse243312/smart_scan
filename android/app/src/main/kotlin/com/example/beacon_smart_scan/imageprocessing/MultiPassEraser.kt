@@ -67,7 +67,7 @@ object MultiPassEraser {
             var erased = File(work, "erased_1.png").path
             var tt = System.currentTimeMillis(); val tb = StringBuilder("erase stages:")
             fun lap(name: String) { val now = System.currentTimeMillis(); tb.append(" $name ${now - tt}"); tt = now }
-            MaskEraser.erase(inputPath, analysisPath, maskPath, erased)
+            MaskEraser.erase(inputPath, analysisPath, maskPath, erased, grid = false)
             lap("pass1")
             val laterMasks = ArrayList<String>()
             var passes = 1
@@ -80,7 +80,7 @@ object MultiPassEraser {
                 val guarded = File(work, "mask_$pass.png").path
                 if ((PrintGuard.guardMask(found, maskPath, guarded)["coverage"] as Double) < MIN_PASS_COVERAGE) break
                 val next = File(work, "erased_$pass.png").path
-                MaskEraser.erase(erased, erased, guarded, next)
+                MaskEraser.erase(erased, erased, guarded, next, grid = false)
                 lap("erase$pass")
                 erased = next
                 laterMasks.add(guarded)
@@ -103,6 +103,8 @@ object MultiPassEraser {
                     RuleRedraw.apply(analysis, ref.handwriting, ref.print, dst)
                     LineHeal.apply(dst, ref.handwriting, ref.print)
                     SpeckClean.apply(dst, ref.handwriting, ref.print)
+                    // grid paper the writing was on, drawn again through the erased area, last
+                    GridRedraw.apply(analysis, dst, ref.handwriting, ref.print)
                     ImageIO.writeOrThrow(dst, outputPath)
                 } finally {
                     dst.release(); analysis.release(); ref.release()

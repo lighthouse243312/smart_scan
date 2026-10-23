@@ -122,14 +122,15 @@ object InkSegmenter {
                     HandwritingMask.minSpeckleArea(src))
                 lap("finish")
                 stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_s3_finish.png", hw) }
-                StrikeThrough.apply(src, hw, outPrint, overlap)
+                val strikes = StrikeThrough.apply(src, hw, outPrint, overlap)
                 IsolatedPrint.apply(hw, outPrint, overlap, printProb, HandwritingMask.minSpeckleArea(src), src)
                 lap("isolated")
                 TickOverPrint.apply(src, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
                 LoopArcs.apply(ink, hw, outPrint, overlap, HandwritingMask.minSpeckleArea(src))
                 lap("tick+loops")
                 timing = tb.toString() + "\n"
-                HandwritingMask.write(hw, outPrint, overlap, maskPath)
+                HandwritingMask.write(hw, outPrint, overlap, maskPath, strikes)
+                strikes?.release()
                 HandwritingMask.result(maskPath, hw)
             }
         }

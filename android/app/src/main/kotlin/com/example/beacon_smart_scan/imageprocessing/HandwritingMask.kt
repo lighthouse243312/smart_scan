@@ -24,6 +24,9 @@ import kotlin.math.min
  */
 object HandwritingMask {
     private const val OVERLAY_ALPHA = 160.0
+    /** Alpha of a pen strike-through's pixels ([StrikeThrough]): handwriting like any other, but the
+     *  erase must not draw it back as a printed rule or print (it runs level through printed words). */
+    private const val STRIKE_ALPHA = 159.0
 
     // "Ink" = noticeably darker than the local paper — used to snap the model's soft,
     // reduced-scale masks onto the page's actual strokes.
@@ -86,11 +89,12 @@ object HandwritingMask {
      * overlap = print hidden under handwriting, restored on erase (green — red + green shows it
      * yellow in the overlay). Caller releases them.
      */
-    class Layers(val handwriting: Mat, val print: Mat, val overlap: Mat) {
+    class Layers(val handwriting: Mat, val print: Mat, val overlap: Mat, val strike: Mat = Mat.zeros(handwriting.size(), CvType.CV_8UC1)) {
         fun release() {
             handwriting.release()
             print.release()
             overlap.release()
+            strike.release()
         }
     }
 
@@ -102,7 +106,7 @@ object HandwritingMask {
     /** Print within this many pixels of handwriting may be its rim (see [strokesTouchingPrint]). */
     private const val RIM_CLEAR = 2
 
-    fun write(handwriting: Mat, print: Mat, overlap: Mat, path: String) {
+    fun write(handwriting: Mat, print: Mat, overlap: Mat, path: String, strike: Mat? = null) {
         val red = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
         val alpha = Mat.zeros(handwriting.size(), CvType.CV_8UC1)
         val blue = Mat()
@@ -112,6 +116,9 @@ object HandwritingMask {
         releasing(red, alpha, blue, notHw, under, file) {
             red.setTo(Scalar(255.0), handwriting)
             alpha.setTo(Scalar(OVERLAY_ALPHA), handwriting)
+            if (strike != null && !strike.empty()) {
+                val s = Mat(); Core.bitwise_and(strike, handwriting, s); alpha.setTo(Scalar(STRIKE_ALPHA), s); s.release()
+            }
             // print layer = print with no handwriting on it, pixel by pixel: a pixel both layers
             // claim is print only as print under the pen (the overlap layer, kept apart so it shows
             // yellow, not white). Upstream steps that vote per ink component can leave a pen pixel
@@ -219,7 +226,8 @@ object HandwritingMask {
             Imgproc.threshold(alpha, handwriting, 0.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.threshold(blue, print, 127.0, 255.0, Imgproc.THRESH_BINARY)
             Imgproc.threshold(green, overlap, 127.0, 255.0, Imgproc.THRESH_BINARY)
-            Layers(handwriting, print, overlap)
+            val strike = Mat(); Core.inRange(alpha, Scalar(STRIKE_ALPHA), Scalar(STRIKE_ALPHA), strike)
+            Layers(handwriting, print, overlap, strike)
         }
     }
 

@@ -286,6 +286,16 @@ def build(page, overrides):
         red, green, blue = b[..., 2] > 127, b[..., 1] > 127, b[..., 0] > 127
         b_hw, b_print, b_ign = a & red & ~green & ~blue, a & blue & ~red & ~green, a & green & ~red & ~blue
         brush_hw = b_hw & (contrast > INK_MARGIN // 2)     # faint pencil counts when a person says so
+        # a broad brush stroke along an answer line paints the printed line too: a long straight
+        # rule — one that runs on past the brush for a quarter of its length, unlike a painted pen
+        # strike — stays print, except where the pen's own strokes cross it; the pen sitting on the
+        # rule there is unscored (the erase keeps the rule either way)
+        nr, lr, sr, _ = cv2.connectedComponentsWithStats(lines.astype(np.uint8), connectivity=8)
+        r_out = np.bincount(lr.ravel(), (lines & ~b_hw).ravel().astype(np.float64), nr)
+        long_rule = ((sr[:, 2] >= 60) & (r_out >= 0.25 * sr[:, 4]))[lr] & (lr > 0)
+        cross = cv2.dilate((brush_hw & ~long_rule).astype(np.uint8), np.ones((5, 1), np.uint8)) > 0
+        ign |= brush_hw & long_rule & ~cross & (cv2.dilate(cross.astype(np.uint8), np.ones((1, 9), np.uint8)) > 0)
+        brush_hw &= ~(long_rule & ~cross)
         hw[b_hw] = brush_hw[b_hw]
         hw[b_print] = False
         ign |= b_ign
@@ -324,6 +334,14 @@ def build(page, overrides):
     # pen crossing a printed rule: overlap pixel, not scored for hw (the erase keeps the rule)
     v_hw = valid & ~band & ~unk & ~loose_hw & ~(hw & cv2.dilate(lines.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool))
     v_print = v_print & ~unk
+    # a dark "print" sliver lying wholly along the pen is the pen's own rim (a brush paints the
+    # stroke's middle, not its edge): unscored. A printed glyph the pen touches stands mostly clear.
+    pen_rim_zone = cv2.dilate(hw.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    nq, lq = cv2.connectedComponents(print_.astype(np.uint8), connectivity=8)
+    q_clear = np.bincount(lq.ravel(), (print_ & ~pen_rim_zone).ravel().astype(np.float64), nq)
+    q_size = np.bincount(lq.ravel(), print_.ravel().astype(np.float64), nq)
+    rim = (q_clear < 0.3 * np.maximum(q_size, 1)); rim[0] = False
+    v_print = v_print & ~(rim[lq] & pen_rim_zone)
     # printed rule pixels touching handwriting: overlap, not scored for print either
     rule_ov = lines & (cv2.dilate(hw.astype(np.uint8), np.ones((13, 13), np.uint8)) > 0)
     # (for print: only where the pen actually crosses the rule; the rule beyond is print)

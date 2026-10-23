@@ -100,14 +100,14 @@ class InkHarness : Instrumentation() {
             com.example.beacon_smart_scan.imageprocessing.LoopArcs.enabled = args.getString("arcs") == "1"
             com.example.beacon_smart_scan.imageprocessing.SpeckClean.enabled = args.getString("speck") != "0"
             args.getString("isogroup")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.MAX_LEFTOVER_GROUP = it.toInt() }
-            com.example.beacon_smart_scan.imageprocessing.StrikeThrough.slanted = args.getString("strikeslant") != "0"
-            args.getString("strikelen")?.let { com.example.beacon_smart_scan.imageprocessing.StrikeThrough.MIN_LEN = it.toInt() }
+            com.example.beacon_smart_scan.imageprocessing.StrikeThrough.probe = args.getString("strikeprobe") == "1"
+            com.example.beacon_smart_scan.imageprocessing.GridRedraw.enabled = args.getString("grid") != "0"
             com.example.beacon_smart_scan.imageprocessing.PrintRestore.keepStrikesOut = args.getString("strikeout") == "1"
             com.example.beacon_smart_scan.imageprocessing.HandwritingMask.consistent = args.getString("consistent") != "0"
             com.example.beacon_smart_scan.imageprocessing.RuleRedraw.enabled = args.getString("rules") != "0"
             com.example.beacon_smart_scan.imageprocessing.HandwritingMask.touchCheck = args.getString("touch") != "0"
             com.example.beacon_smart_scan.imageprocessing.StrokeVote.pieces = args.getString("pieces") != "0"
-            com.example.beacon_smart_scan.imageprocessing.StrikeThrough.enabled = args.getString("strike") == "1"
+            com.example.beacon_smart_scan.imageprocessing.StrikeThrough.enabled = args.getString("strike") != "0"
             com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.enabled = args.getString("isolated") != "0"
             com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.nearPen = args.getString("isonear") != "0"
             com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.glyphs = args.getString("isoglyph") != "0"
@@ -136,6 +136,7 @@ class InkHarness : Instrumentation() {
             args.getString("isoreach")?.let { com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.REACH = it.toDouble() }
             val mask = "${base}_mask.png"
             com.example.beacon_smart_scan.imageprocessing.InkSegmenter.stageDump = if (args.getString("stages") == "1") base else null
+            com.example.beacon_smart_scan.imageprocessing.InkRefine.stageDump = if (args.getString("stages") == "1") base else null
             if (args.getString("layers") == "1") {
                 // the two detectors separately: model probabilities and the colour method's layers
                 val src = ImageIO.readOrThrow(input)
@@ -163,6 +164,8 @@ class InkHarness : Instrumentation() {
             report.append(com.example.beacon_smart_scan.imageprocessing.ModelFinish.report)
             report.append(com.example.beacon_smart_scan.imageprocessing.InkSegmenter.timing)
             report.append(com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.StrikeThrough.report)
+            report.append(com.example.beacon_smart_scan.imageprocessing.GridRedraw.report)
             report.append(com.example.beacon_smart_scan.imageprocessing.IsolatedPrint.probeLog)
             report.append(com.example.beacon_smart_scan.imageprocessing.PenComponentVote.report)
             report.append(com.example.beacon_smart_scan.imageprocessing.TickOverPrint.report)

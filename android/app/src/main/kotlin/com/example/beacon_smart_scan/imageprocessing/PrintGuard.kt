@@ -114,7 +114,7 @@ object PrintGuard {
                 Core.bitwise_not(protect, notProtect)
                 Core.bitwise_and(layers.handwriting, notProtect, layers.handwriting)
                 Core.bitwise_or(layers.print, protect, layers.print)
-                HandwritingMask.write(layers.handwriting, layers.print, layers.overlap, outputPath)
+                HandwritingMask.write(layers.handwriting, layers.print, layers.overlap, outputPath, layers.strike)
             }
             return HandwritingMask.result(outputPath, layers.handwriting)
         } finally {

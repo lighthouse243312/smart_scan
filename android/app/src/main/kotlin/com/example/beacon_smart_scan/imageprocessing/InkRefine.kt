@@ -916,7 +916,12 @@ object InkRefine {
     }
 
     /** [recognizer]: reads the page's text, to restore pen-hidden print (optional). */
-    fun erase(target: Mat, analysis: Mat, handwriting: Mat, print: Mat, overlap: Mat, recognizer: TextRecognizer? = null): Mat {
+    /** Dev: path prefix to write the page after each erase step (InkHarness `-e stages 1`). */
+    @JvmStatic var stageDump: String? = null
+    private fun dump(name: String, m: Mat) { stageDump?.let { org.opencv.imgcodecs.Imgcodecs.imwrite("${it}_e_$name.png", m) } }
+
+    /** [strike]: pen strike-throughs (see [StrikeThrough]) — erased, never re-joined as a printed rule. */
+    fun erase(target: Mat, analysis: Mat, handwriting: Mat, print: Mat, overlap: Mat, recognizer: TextRecognizer? = null, strike: Mat? = null): Mat {
         val k = InkAnalysis.strokeUnit(target.cols(), target.rows())
         val s = k / 9.0
         val dst = target.clone()
@@ -996,6 +1001,9 @@ object InkRefine {
                     area = or(area, specks)
                     releasing(nearHw, leftover, labels, stats, centroids, specks) {}
                 }
+                if (strike != null && !strike.empty()) {
+                    val st = strike.submat(roi); restoreMask = and(restoreMask, not(st)); st.release()
+                }
                 val restore = and(area, restoreMask)
                 val paperArea = and(area, not(restore))
 
@@ -1057,15 +1065,27 @@ object InkRefine {
                 d.release()
                 collectNative()
             }
+            dump("1_rebuild", dst)
             cleanupLeftovers(dst, erasedAll, restoredAll, handwriting, print, overlap, targetPaperSmallBright, k)
+            dump("2_cleanup", dst)
             val beforeRepair = dst.clone()
-            PrintRepair.repairByExample(dst, erasedAll, target, k)
+            // a strike-through's own pixels are no lost print: the repairs below, which rebuild
+            // letters the erase took (and re-spell words by reading the original, where the struck
+            // word misreads), leave the words it crossed as the line's removal left them
+            val erasedPrint = if (strike != null && !strike.empty() && Core.countNonZero(strike) > 0) {
+                val sz = dilate(strike, Mat.ones(5, 5, CvType.CV_8U)); val nz = not(sz); val r = and(erasedAll, nz); sz.release(); nz.release(); r
+            } else erasedAll
+            PrintRepair.repairByExample(dst, erasedPrint, target, k)
+            dump("3_repair", dst)
             // printed letters the pen crossed, re-typeset from the page's own glyphs
             val printOrOverlap = Mat(); Core.bitwise_or(print, overlap, printOrOverlap)
             PrintRetypeset.retypeset(dst, analysis, handwriting, printOrOverlap, k)
             printOrOverlap.release()
+            dump("4_retypeset", dst)
             // printed letters the pen hid entirely, restored by reading them
-            PrintRecognition.restore(dst, analysis, erasedAll, k, recognizer)
+            PrintRecognition.restore(dst, analysis, erasedPrint, k, recognizer)
+            if (erasedPrint !== erasedAll) erasedPrint.release()
+            dump("5_recognition", dst)
             // stray ink review; print put back by the repair steps is protected like restored print
             run {
                 val changed = Mat(); Core.absdiff(dst, beforeRepair, changed)
@@ -1086,6 +1106,7 @@ object InkRefine {
                 val bright = Mat(); Imgproc.resize(targetPaperSmallBright, bright, dst.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
                 Imgproc.GaussianBlur(bright, bright, Size(0.0, 0.0), 8.0)
                 StrayInk.remove(dst, erasedAll, handwriting, protect, bright, k)
+                dump("6_stray", dst)
                 releasing(changed, protect, bright, beforeRepair) {}
             }
         } finally {

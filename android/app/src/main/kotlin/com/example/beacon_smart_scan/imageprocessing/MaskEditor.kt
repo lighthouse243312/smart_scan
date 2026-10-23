@@ -49,7 +49,7 @@ object MaskEditor {
                 }
                 brush.release()
             }
-            HandwritingMask.write(handwriting, layers.print, layers.overlap, outputPath)
+            HandwritingMask.write(handwriting, layers.print, layers.overlap, outputPath, layers.strike)
             return HandwritingMask.result(outputPath, handwriting)
         } finally {
             layers.release()

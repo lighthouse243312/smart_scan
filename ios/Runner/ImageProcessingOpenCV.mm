@@ -8,12 +8,15 @@
 
 #import <algorithm>
 #import <cmath>
+#import <map>
+#import <set>
 #import <vector>
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
 #import <Vision/Vision.h>
 #import "ImageProcessingOpenCV.h"
+#import "GridRedraw.hpp"
 #import "InkAnalysis.hpp"
 #import "PrintRestore.hpp"
 #import "RuleRedraw.hpp"
@@ -57,6 +60,9 @@ static bool WriteOrFail(const cv::Mat &mat, NSString *path, NSError **error) {
 // crossed by a pen stroke is restored rather than smeared.
 
 static const int kOverlayAlpha = 160;
+// Alpha of a pen strike-through's pixels (StrikeThrough): handwriting like any other, but the erase
+// must not draw it back as a printed rule or print (it runs level through printed words).
+static const int kStrikeAlpha = 159;
 // "Ink" = noticeably darker than the local paper — used to snap the model's soft, reduced-scale
 // masks onto the page's actual strokes.
 static const int kInkContrastLoose = 8;
@@ -164,7 +170,8 @@ static cv::Mat PrintThroughPen(const cv::Mat &overlap, const cv::Mat &purePrint,
     return ((left & right) | (up & down) | rule) & overlap & StrokesTouchingPrint(purePrint, handwriting, k);
 }
 
-static bool WriteMaskFile(const cv::Mat &handwriting, const cv::Mat &print, const cv::Mat &overlap, NSString *path, NSError **error) {
+static bool WriteMaskFile(const cv::Mat &handwriting, const cv::Mat &print, const cv::Mat &overlap, NSString *path, NSError **error,
+                          const cv::Mat &strike = cv::Mat()) {
     cv::Mat file(handwriting.size(), CV_8UC4, cv::Scalar(0, 0, 0, 0));
     std::vector<cv::Mat> channels;
     cv::split(file, channels);
@@ -176,11 +183,14 @@ static bool WriteMaskFile(const cv::Mat &handwriting, const cv::Mat &print, cons
     channels[1] = PrintThroughPen(overlap, channels[0], handwriting, inkanalysis::StrokeUnit(handwriting));   // G: overlap
     channels[2].setTo(255, handwriting);                           // R: overlay colour
     channels[3].setTo(kOverlayAlpha, handwriting);                 // A: handwriting
+    if (!strike.empty()) channels[3].setTo(kStrikeAlpha, strike & handwriting);   // A: strike-through
     cv::merge(channels, file);
     return WriteOrFail(file, path, error);
 }
 
-static bool ReadMaskFileOrFail(NSString *path, cv::Mat *outHandwriting, cv::Mat *outPrint, cv::Mat *outOverlap, NSError **error) {
+/// `outStrike` (optional): the strike-through layer (alpha == kStrikeAlpha), part of the handwriting.
+static bool ReadMaskFileOrFail(NSString *path, cv::Mat *outHandwriting, cv::Mat *outPrint, cv::Mat *outOverlap, NSError **error,
+                               cv::Mat *outStrike = nullptr) {
     cv::Mat raw = cv::imread([path UTF8String], cv::IMREAD_UNCHANGED);
     if (raw.empty() || raw.channels() != 4) {
         *error = MakeError(ImageProcessingErrorFileNotFound,
@@ -194,6 +204,7 @@ static bool ReadMaskFileOrFail(NSString *path, cv::Mat *outHandwriting, cv::Mat 
     cv::threshold(alpha, *outHandwriting, 0, 255, cv::THRESH_BINARY);
     cv::threshold(blue, *outPrint, 127, 255, cv::THRESH_BINARY);
     cv::threshold(green, *outOverlap, 127, 255, cv::THRESH_BINARY);
+    if (outStrike) cv::inRange(alpha, kStrikeAlpha, kStrikeAlpha, *outStrike);
     return true;
 }
 
@@ -939,65 +950,348 @@ static void IsolatedPrint(cv::Mat &handwriting, cv::Mat &print, const cv::Mat &o
 
 // MARK: - Strike-throughs (mirror StrikeThrough.kt on Android)
 //
-// Pen strike-throughs across printed words. A black pen line has the print's colour, so the colour
-// layers call it print and it was never erased. It is found by shape and place instead: a long
-// (6 stroke units), thin, horizontal run of ink with print right above AND right below it along
-// most of its length — it runs through the middle of the letters (an underline has print only above
-// it, a table rule none close). The line becomes handwriting, erased whole; where a printed letter
-// crosses it (print right at its top and bottom edge) the pixels are remembered as print under the
-// pen. The letters it crossed are then redrawn from the page's own glyphs (RetypesetPrint).
-static void StrikeThrough(const cv::Mat &src, cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap) {
-    const int W = src.cols, H = src.rows;
-    const int k = inkanalysis::StrokeUnit(src);
-    cv::Mat ink;
-    {
-        cv::Mat g, bg;
-        cv::cvtColor(src, g, cv::COLOR_BGR2GRAY);
-        cv::morphologyEx(g, bg, cv::MORPH_CLOSE, cv::Mat::ones(25, 25, CV_8U));
-        ink = (bg - g) > 40;
+// Pen strike-throughs across printed words ("Fruit / are / your" crossed out). A black pen line has
+// the print's colour, so the colour layers call it print and it was never erased. It is told from
+// print by shape — measured on 30 labelled pages, every feature below separates the two:
+//  - it is one straight thin line of ink, unbroken for 1.5 text heights: an opening with a 1-px line
+//    kernel at small tilts, on the ink itself (no growth — growing the ink first merged the tops of
+//    bold letters into "lines"). Printed text at mid height always has paper between letters.
+//  - printed letters cross it (ink runs on through it, up and down) at 2+ places, and the letters
+//    are text sized (a drawing or a table border is not).
+//  - its thickness is a pen stroke's (0.5–1.25 stroke units): a bold letter's edge or a picture's
+//    line is thicker, a grid line or wood grain thinner.
+//  - it crosses the gaps between letters: in a share of its columns nothing touches it right above
+//    or below (a run along the tops of touching bold letters has a letter under every column).
+//  - it is hand drawn: it wobbles off a straight fit, or overshoots the word onto the paper.
+// The line becomes handwriting, but it is erased only where it stands free (paper right above and
+// below: between letters, inside a counter, the overshoot). Where a letter crosses it, or its pixels
+// lie right against a letter's arch or bar, or taking them would open a letter's closed counter (the
+// eye of an "e"), they are print under the pen (overlap), drawn back. A line along the letters' tops
+// or feet loses only its word gaps and overshoot. Its own pixels go to the mask file (the strike
+// layer, kStrikeAlpha), so the erase does not re-join them as a printed rule nor re-spell the words
+// it crossed.
+
+/// Found at this long side at most (the line opening costs pixels × kernel length).
+static const int kStrikeWorkLong = 1600;
+static const double kStrikeAngles[] = {-8.0, -5.0, -2.5, 0.0, 2.5, 5.0, 8.0};
+/// An unbroken line at least this many text heights long (and 8 stroke units).
+static const double kStrikeMinLen = 1.5;
+/// No longer than this: a longer straight line is a rule or an answer line.
+static const double kStrikeMaxLen = 12.0;
+/// Ink running on through the line this far (text heights) up and down is a letter crossing.
+static const double kStrikeCrossReach = 0.15;
+/// A column is over paper when no ink is this near (text heights) above and below.
+static const double kStrikeClearReach = 0.4;
+
+/// Kotlin's roundToInt (halves round up), so both platforms build the same kernels and sizes.
+static int RoundHalfUp(double v) { return (int)std::floor(v + 0.5); }
+
+/// A 1-px line `len` long tilted by `deg` degrees, as a structuring element.
+static cv::Mat StrikeLineKernel(int len, double deg) {
+    const int half = len / 2;
+    const double rise = std::tan(deg * CV_PI / 180.0) * half;
+    const int dy = RoundHalfUp(std::fabs(rise));
+    cv::Mat kern = cv::Mat::zeros(2 * dy + 1, 2 * half + 1, CV_8U);
+    cv::line(kern, cv::Point(0, dy - RoundHalfUp(rise)), cv::Point(2 * half, dy + RoundHalfUp(rise)), cv::Scalar(1), 1);
+    return kern;
+}
+
+/// Standard deviation of the line's centre row around its least-squares straight fit.
+static double StrikeFitDeviation(const std::vector<int> &cols, const std::vector<int> &top, const std::vector<int> &bot) {
+    const int m = (int)cols.size();
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int j = 0; j < m; j++) {
+        const double y = (top[cols[j]] + bot[cols[j]]) / 2.0;
+        sx += j; sy += y; sxx += (double)j * j; sxy += j * y;
     }
-    cv::Mat run;
-    cv::morphologyEx(ink, run, cv::MORPH_OPEN, cv::Mat::ones(1, 3 * k, CV_8U));
-    cv::Mat labels, stats, cents;
-    const int n = cv::connectedComponentsWithStats(run, labels, stats, cents, 8, CV_32S);
-    const cv::Mat pure = (print > 127) & (handwriting == 0);
-    const int reach = (int)(1.5 * k);
-    auto pureIn = [&](int c, int y0, int y1) {
-        for (int y = std::max(0, y0); y <= std::min(H - 1, y1); y++) if (pure.at<uchar>(y, c)) return true;
-        return false;
+    const double den = m * sxx - sx * sx;
+    const double a = den != 0 ? (m * sxy - sx * sy) / den : 0;
+    const double b = (sy - a * sx) / m;
+    double ss = 0;
+    for (int j = 0; j < m; j++) { const double r = (top[cols[j]] + bot[cols[j]]) / 2.0 - (a * j + b); ss += r * r; }
+    return std::sqrt(ss / m);
+}
+
+/// Ink of something other than line `l` right beside (`x`, `y`) (8-neighbours).
+static bool StrikeBesideLetter(const std::vector<uchar> &ink, const std::vector<int> &lab, int l, int w, int h, int x, int y) {
+    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+        const int px = x + dx, py = y + dy;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+        const int i = py * w + px;
+        if (ink[i] && lab[i] != l) return true;
+    }
+    return false;
+}
+
+/// A letter's closed counter (the eye of an "e", whose bar the strike ran along) must stay closed:
+/// erased line pixels that would open a hole of the ink to the paper outside are kept. Splitting one
+/// hole in two by the strike and joining them back (an "o" struck through) opens nothing.
+static void StrikeKeepClosedCounters(const std::vector<uchar> &ink, const std::vector<char> &out, std::vector<char> &keep,
+                                     int w, int xa, int ya, int xb, int yb) {
+    const int cw = xb - xa, ch = yb - ya;
+    if (cw < 3 || ch < 3) return;
+    auto paperLabels = [&](bool erased) {
+        cv::Mat m(ch, cw, CV_8U);
+        for (int y = 0; y < ch; y++) {
+            uchar *mp = m.ptr<uchar>(y);
+            for (int x = 0; x < cw; x++) {
+                const int i = (ya + y) * w + xa + x;
+                const bool inkHere = ink[i] && !(erased && out[i] && !keep[i]);
+                mp[x] = inkHere ? 0 : 1;
+            }
+        }
+        cv::Mat lb;
+        cv::connectedComponents(m, lb, 4, CV_32S);
+        return lb;
     };
+    auto outside = [&](const cv::Mat &lab) {
+        std::set<int> o;
+        for (int x = 0; x < cw; x++) { o.insert(lab.at<int>(0, x)); o.insert(lab.at<int>(ch - 1, x)); }
+        for (int y = 0; y < ch; y++) { o.insert(lab.at<int>(y, 0)); o.insert(lab.at<int>(y, cw - 1)); }
+        o.erase(0);
+        return o;
+    };
+    const cv::Mat before = paperLabels(false);
+    const std::set<int> outB = outside(before);
+    const cv::Mat after = paperLabels(true);
+    const std::set<int> outA = outside(after);
+    // holes before whose paper is now joined to the outside
+    std::set<int> opened;
+    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
+        const int b = before.at<int>(y, x);
+        if (b > 0 && !outB.count(b) && outA.count(after.at<int>(y, x))) opened.insert(b);
+    }
+    if (opened.empty()) return;
+    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
+        const int i = (ya + y) * w + xa + x;
+        if (!out[i] || keep[i]) continue;
+        // an erased pixel bordering an opened hole
+        bool near = false;
+        for (int dy = -1; dy <= 1 && !near; dy++) for (int dx = -1; dx <= 1; dx++) {
+            const int px = x + dx, py = y + dy;
+            if (px >= 0 && px < cw && py >= 0 && py < ch && opened.count(before.at<int>(py, px))) { near = true; break; }
+        }
+        if (near) keep[i] = 1;
+    }
+}
+
+/// `src`: the page (BGR); `handwriting` / `print` / `overlap`: CV_8UC1 255 = set, updated in place.
+/// Returns the strike lines' own pixels (not where letters cross them), for the mask file — or an
+/// empty Mat when there are none.
+static cv::Mat StrikeThrough(const cv::Mat &src, cv::Mat &handwriting, cv::Mat &print, cv::Mat &overlap) {
+    const int fw = src.cols, fh = src.rows;
+    const double s = std::min(1.0, (double)kStrikeWorkLong / std::max(fw, fh));
+    const int w = std::max(1, RoundHalfUp(fw * s)), h = std::max(1, RoundHalfUp(fh * s));
+    // dark ink (well clear of the paper) at the working scale
+    cv::Mat inkM;
+    {
+        cv::Mat small, g, bg;
+        if (s < 1.0) cv::resize(src, small, cv::Size(w, h), 0, 0, cv::INTER_AREA); else small = src;
+        cv::cvtColor(small, g, cv::COLOR_BGR2GRAY);
+        cv::morphologyEx(g, bg, cv::MORPH_CLOSE, cv::Mat::ones(25, 25, CV_8U));
+        cv::threshold(bg - g, inkM, 40, 1, cv::THRESH_BINARY);
+    }
+    std::vector<uchar> ink(inkM.begin<uchar>(), inkM.end<uchar>());
+    auto scaled = [&](const cv::Mat &m) {
+        cv::Mat t;
+        if (s < 1.0) cv::resize(m, t, cv::Size(w, h), 0, 0, cv::INTER_NEAREST); else t = m;
+        return t;
+    };
+    const cv::Mat hwS = scaled(handwriting), prS = scaled(print);
+    // pure print (print and not handwriting): what the line must cross
+    const cv::Mat prmM = (prS != 0) & (hwS == 0);
+    std::vector<char> prm(w * h);
+    for (int y = 0; y < h; y++) { const uchar *p = prmM.ptr<uchar>(y); for (int x = 0; x < w; x++) prm[y * w + x] = p[x] != 0; }
+
+    // stroke unit: twice the median ridge of the ink's distance transform
+    int k;
+    {
+        cv::Mat dt, dil;
+        cv::distanceTransform(inkM, dt, cv::DIST_L2, 3);
+        cv::dilate(dt, dil, cv::Mat::ones(3, 3, CV_8U));
+        std::vector<float> ridge;
+        for (int y = 0; y < h; y++) {
+            const float *dp = dt.ptr<float>(y), *mp = dil.ptr<float>(y);
+            for (int x = 0; x < w; x++) if (dp[x] > 0 && dp[x] >= mp[x]) ridge.push_back(dp[x]);
+        }
+        if (ridge.empty()) return cv::Mat();
+        std::sort(ridge.begin(), ridge.end());
+        k = std::max(2, RoundHalfUp(2 * ridge[ridge.size() / 2]));
+    }
+    // text height: median height of letter-shaped print pieces (not dots, accents, rules)
+    double textH;
+    {
+        cv::Mat lb, st, ce;
+        const int n = cv::connectedComponentsWithStats(prmM, lb, st, ce, 8, CV_32S);
+        std::vector<int> hs;
+        for (int l = 1; l < n; l++) {
+            const int cw = st.at<int>(l, cv::CC_STAT_WIDTH), ch = st.at<int>(l, cv::CC_STAT_HEIGHT), a = st.at<int>(l, cv::CC_STAT_AREA);
+            if (a >= 6 * k * k && ch < h / 20 && cw >= 0.4 * ch) hs.push_back(ch);
+        }
+        std::sort(hs.begin(), hs.end());
+        textH = hs.empty() ? 8.0 * k : (double)hs[hs.size() / 2];
+    }
+    // straight unbroken lines: opening with a thin line kernel at small tilts
+    const int len = RoundHalfUp(std::max(kStrikeMinLen * textH, 8.0 * k)) | 1;
+    cv::Mat runM = cv::Mat::zeros(h, w, CV_8U);
+    for (double deg : kStrikeAngles) {
+        cv::Mat t;
+        cv::morphologyEx(inkM, t, cv::MORPH_OPEN, StrikeLineKernel(len, deg));
+        runM |= t;
+    }
+    cv::Mat labM, stats, cents;
+    const int n = cv::connectedComponentsWithStats(runM, labM, stats, cents, 8, CV_32S);
+    std::vector<int> lab(labM.begin<int>(), labM.end<int>());
+    // ink blobs: a struck word stays about a text line tall, a drawing does not
+    cv::Mat inkLabM, inkSt, inkCe;
+    cv::connectedComponentsWithStats(inkM, inkLabM, inkSt, inkCe, 8, CV_32S);
+    std::vector<int> inkLab(inkLabM.begin<int>(), inkLabM.end<int>());
+    auto inkAt = [&](int x, int y) { return y >= 0 && y < h && ink[y * w + x] != 0; };
+    const int reach = std::max(2, (int)(kStrikeCrossReach * textH)), clearR = std::max(4, (int)(kStrikeClearReach * textH));
+    std::vector<char> out(w * h, 0), keep(w * h, 0);
+    int found = 0;
     for (int l = 1; l < n; l++) {
         const int x0 = stats.at<int>(l, cv::CC_STAT_LEFT), y0 = stats.at<int>(l, cv::CC_STAT_TOP);
         const int bw = stats.at<int>(l, cv::CC_STAT_WIDTH), bh = stats.at<int>(l, cv::CC_STAT_HEIGHT);
-        if (bw < 6 * k || bh > 2 * k) continue;
-        std::vector<int> top(bw, INT_MAX), bot(bw, -1);
-        for (int y = y0; y < y0 + bh; y++) {
-            const int *lp = labels.ptr<int>(y);
-            for (int x = x0; x < x0 + bw; x++) if (lp[x] == l) { const int c = x - x0; top[c] = std::min(top[c], y); bot[c] = std::max(bot[c], y); }
+        if (bw > kStrikeMaxLen * textH) continue;
+        std::vector<int> top(bw, -1), bot(bw, -1);
+        for (int y = y0; y < y0 + bh; y++) for (int c = 0; c < bw; c++) if (lab[y * w + x0 + c] == l) {
+            if (top[c] < 0) top[c] = y;
+            bot[c] = y;
         }
-        std::vector<int> ext; int up = 0, dn = 0, cols = 0;
-        for (int c = 0; c < bw; c++) {
-            if (bot[c] < 0) continue;
-            cols++; ext.push_back(bot[c] - top[c] + 1);
-            if (pureIn(x0 + c, top[c] - reach, top[c] - 2)) up++;
-            if (pureIn(x0 + c, bot[c] + 2, bot[c] + reach)) dn++;
-        }
-        if (!cols) continue;
-        std::nth_element(ext.begin(), ext.begin() + ext.size() / 2, ext.end());
-        if (ext[ext.size() / 2] > 0.6 * k) continue;                 // thin, column by column
-        if (up < 0.4 * cols || dn < 0.4 * cols) continue;            // through the letters
-        for (int c = 0; c < bw; c++) {
-            if (bot[c] < 0) continue;
-            const int x = x0 + c;
-            const bool crossed = pureIn(x, top[c] - 2, top[c] - 1) && pureIn(x, bot[c] + 1, bot[c] + 2);
-            for (int y = top[c]; y <= bot[c]; y++) {
-                if (labels.at<int>(y, x) != l) continue;
-                handwriting.at<uchar>(y, x) = 255;
-                overlap.at<uchar>(y, x) = crossed ? 255 : 0;
-                print.at<uchar>(y, x) = crossed ? 255 : 0;
+        std::vector<int> cols;
+        for (int c = 0; c < bw; c++) if (top[c] >= 0) cols.push_back(c);
+        if (cols.size() < 2) continue;
+        const int m = (int)cols.size();
+        std::vector<char> cross(m, 0), clear(m, 0), touchC(m, 0);
+        std::vector<int> vext;
+        int cpN = 0, touchN = 0;
+        for (int j = 0; j < m; j++) {
+            const int c = cols[j], x = x0 + c, t = top[c], b = bot[c];
+            int u = 0; while (inkAt(x, t - u - 1)) u++;
+            int d = 0; while (inkAt(x, b + d + 1)) d++;
+            bool any = false;
+            for (int y = std::max(0, t - clearR); y < std::max(0, t - 1); y++) if (ink[y * w + x]) { any = true; break; }
+            if (!any) for (int y = b + 2; y < std::min(h, b + 1 + clearR); y++) if (ink[y * w + x]) { any = true; break; }
+            clear[j] = !any;
+            if (inkAt(x, t - 1) || inkAt(x, b + 1)) { touchN++; touchC[j] = 1; }
+            if (u >= reach && d >= reach) {
+                cross[j] = 1; vext.push_back(u + d + b - t + 1);
+                const bool up = prm[(t - 1) * w + x] || prm[(t - u) * w + x];
+                const bool dn = prm[(b + 1) * w + x] || prm[(b + d) * w + x];
+                if (up && dn) cpN++;
             }
         }
+        int groups = 0;
+        for (int j = 0; j < m; j++) if (cross[j] && (j == 0 || !cross[j - 1])) groups++;
+        if (groups < 2) continue;
+        // features (units: text height / stroke unit)
+        std::vector<int> ext;
+        for (int c : cols) ext.push_back(bot[c] - top[c] + 1);
+        std::sort(ext.begin(), ext.end());
+        const double thick = (double)ext[ext.size() / 2] / k;
+        std::sort(vext.begin(), vext.end());
+        const double vmed = vext[vext.size() / 2] / textH;
+        const double cprint = (double)cpN / vext.size();
+        const double touch = (double)touchN / m;
+        const double bridge = (double)std::count(clear.begin(), clear.end(), 1) / m;
+        int ovL = m, ovR = m;
+        for (int j = 0; j < m; j++) if (!clear[j]) { ovL = j; break; }
+        for (int j = 0; j < m; j++) if (!clear[m - 1 - j]) { ovR = j; break; }
+        const double ovmax = std::max(ovL, ovR) / textH;
+        const double dev = StrikeFitDeviation(cols, top, bot);
+        const double lenH = bw / textH;
+        int blob = 0;
+        {
+            std::map<int, int> cnt;
+            for (int c : cols) for (int y = top[c]; y <= bot[c]; y++) { const int il = inkLab[y * w + x0 + c]; if (il > 0) cnt[il]++; }
+            int best = 0;
+            for (const auto &e : cnt) if (e.second > best) { best = e.second; blob = e.first; }
+        }
+        const double blobH = blob > 0 ? inkSt.at<int>(blob, cv::CC_STAT_HEIGHT) / textH : 0.0;
+        const bool ok = cprint >= 0.5 && blobH <= 2.0 && thick >= 0.5 && thick <= 1.25 && vmed <= 1.0 && touch <= 0.9 &&
+                        (dev >= 0.3 || ovmax >= 0.2) && (lenH >= 2.0 || bridge >= 0.15);
+#ifdef INK_DEBUG
+        fprintf(stderr, "  strike %s (%d,%d) len %.2f thick %.2f dev %.2f touch %.2f vmed %.2f groups %d bridge %.2f cprint %.2f ov %.2f blob %.2f\n",
+                ok ? "A" : "-", RoundHalfUp(x0 / s), RoundHalfUp(y0 / s), lenH, thick, dev, touch, vmed, groups, bridge, cprint, ovmax, blobH);
+#endif
+        if (!ok) continue;
+        found++;
+        // through the letters' middle, or along their tops / feet? Over the word, letters lie close
+        // on both sides of a line through the middle; one along the tops has letter bodies under it
+        // and only ascenders above
+        int firstLetter = 0, lastLetter = m - 1;
+        for (int j = 0; j < m; j++) if (cross[j] || touchC[j]) { firstLetter = j; break; }
+        for (int j = m - 1; j >= 0; j--) if (cross[j] || touchC[j]) { lastLetter = j; break; }
+        const int near = std::max(2, (int)(0.35 * textH));
+        int nAbove = 0, nBelow = 0;
+        for (int j = firstLetter; j <= lastLetter; j++) {
+            const int x = x0 + cols[j], t = top[cols[j]], b = bot[cols[j]];
+            for (int y = std::max(0, t - near); y < t; y++) if (ink[y * w + x]) { nAbove++; break; }
+            for (int y = b + 1; y <= std::min(h - 1, b + near); y++) if (ink[y * w + x]) { nBelow++; break; }
+        }
+        const int span = std::max(1, lastLetter - firstLetter + 1);
+        const bool edge = std::min(nAbove, nBelow) < 0.35 * span;
+        // along the letters' edge the line lies on their arches and bars: only its free runs as wide
+        // as a word space (and the overshoot) go
+        std::vector<char> wideFree(m, 0);
+        for (int j = 0; j < m;) {
+            if (cross[j] || touchC[j]) { j++; continue; }
+            int e = j;
+            while (e + 1 < m && !cross[e + 1] && !touchC[e + 1]) e++;
+            if (e - j + 1 >= 0.3 * textH) for (int q = j; q <= e; q++) wideFree[q] = 1;
+            j = e + 1;
+        }
+        // erased only where it stands free (paper right above and below: a gap between letters, a
+        // letter's counter, the overshoot); where it lies along a letter's own stroke (crossing a
+        // stem, merged with an arch or a bar's top) those pixels may be the letter's: kept
+        for (int j = 0; j < m; j++) {
+            const int c = cols[j];
+            for (int y = top[c]; y <= bot[c]; y++) {
+                const int i = y * w + x0 + c;
+                if (lab[i] != l) continue;
+                out[i] = 1;
+                const bool over = j < firstLetter || j > lastLetter;
+                if (edge) { if (!over && !wideFree[j]) keep[i] = 1; }
+                else if (cross[j]) keep[i] = 1;
+                // merged with a letter's arch or bar: the pixels right against the letter's own ink
+                else if (touchC[j] && StrikeBesideLetter(ink, lab, l, w, h, x0 + c, y)) keep[i] = 1;
+            }
+        }
+        StrikeKeepClosedCounters(ink, out, keep, w, std::max(0, x0 - 2), std::max(0, y0 - clearR),
+                                 std::min(w, x0 + bw + 2), std::min(h, y0 + bh + clearR));
     }
+#ifdef INK_DEBUG
+    fprintf(stderr, "strike: text %.0f px, unit %d, lines %d\n", textH / s, k, found);
+#endif
+    if (found == 0) return cv::Mat();
+
+    // back to the page's scale: the found line (grown a pixel) on the page's own ink
+    cv::Mat outM(h, w, CV_8U), keepM(h, w, CV_8U);
+    for (int y = 0; y < h; y++) {
+        uchar *op = outM.ptr<uchar>(y), *kp = keepM.ptr<uchar>(y);
+        for (int x = 0; x < w; x++) { op[x] = out[y * w + x] ? 255 : 0; kp[x] = keep[y * w + x] ? 255 : 0; }
+    }
+    if (s < 1.0) {
+        cv::resize(outM, outM, cv::Size(fw, fh), 0, 0, cv::INTER_NEAREST);
+        cv::resize(keepM, keepM, cv::Size(fw, fh), 0, 0, cv::INTER_NEAREST);
+        cv::dilate(outM, outM, cv::Mat::ones(3, 3, CV_8U));
+        cv::dilate(keepM, keepM, cv::Mat::ones(3, 3, CV_8U));
+    }
+    cv::Mat line = cv::Mat::zeros(fh, fw, CV_8U);
+    for (int y = 0; y < fh; y++) {
+        const uchar *op = outM.ptr<uchar>(y), *kp = keepM.ptr<uchar>(y);
+        uchar *hp = handwriting.ptr<uchar>(y), *pp = print.ptr<uchar>(y), *vp = overlap.ptr<uchar>(y), *lp = line.ptr<uchar>(y);
+        for (int x = 0; x < fw; x++) {
+            if (!op[x]) continue;
+            if (!hp[x] && !pp[x] && !vp[x]) continue;                       // paper
+            if (!kp[x]) lp[x] = 255;
+            if (hp[x] && !vp[x]) continue;                                  // already pen
+            hp[x] = 255;
+            if (kp[x]) { vp[x] = 255; pp[x] = 255; } else { vp[x] = 0; pp[x] = 0; }
+        }
+    }
+    return line;
 }
 
 @implementation ImageProcessingOpenCV
@@ -1146,10 +1440,10 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
     inkanalysis::DetectByInkColor(src, colorDelta, &combinedHw, &combinedPrint, &overlap, printProb, handwritingProb);
     inkanalysis::PenComponentVote(src, combinedHw, combinedPrint, overlap, handwritingProb);
     ModelFinish(combinedHw, combinedPrint, overlap, ink, handwritingProb, printProb, threshold, MinSpeckleArea(src));
-    // StrikeThrough(src, combinedHw, combinedPrint, overlap);   // off, see StrikeThrough.kt
+    const cv::Mat strikes = StrikeThrough(src, combinedHw, combinedPrint, overlap);
     IsolatedPrint(combinedHw, combinedPrint, overlap, printProb, MinSpeckleArea(src), src);
 
-    if (!WriteMaskFile(combinedHw, combinedPrint, overlap, maskPath, error)) return nil;
+    if (!WriteMaskFile(combinedHw, combinedPrint, overlap, maskPath, error, strikes)) return nil;
     return Coverage(combinedHw);
 }
 
@@ -1159,8 +1453,8 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
                                          error:(NSError **)error {
     // Only the handwriting layer is edited — the print layer stays, so print under a stroke the
     // user brushes in is still restored on erase.
-    cv::Mat handwriting, print, overlap;
-    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error)) return nil;
+    cv::Mat handwriting, print, overlap, strike;
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error, &strike)) return nil;
 
     for (NSDictionary<NSString *, id> *stroke in strokes) {
         NSArray<NSNumber *> *points = stroke[@"points"];
@@ -1190,19 +1484,18 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
         (void)value;
     }
 
-    if (!WriteMaskFile(handwriting, print, overlap, outputPath, error)) return nil;
+    if (!WriteMaskFile(handwriting, print, overlap, outputPath, error, strike)) return nil;
     return Coverage(handwriting);
 }
 
-+ (BOOL)eraseWithMaskAtPath:(NSString *)inputPath
-                analysisPath:(NSString *)analysisPath
-                    maskPath:(NSString *)maskPath
-                  outputPath:(NSString *)outputPath
-                       error:(NSError **)error {
-    cv::Mat target, analysis, handwriting, print, overlap;
+/// One erase of `inputPath` with the mask at `maskPath`, written to `outputPath`. `grid`: draw grid
+/// paper again here (the multi-pass erase does it once, last).
+static bool EraseWithMask(NSString *inputPath, NSString *analysisPath, NSString *maskPath, NSString *outputPath, bool grid,
+                          NSError **error) {
+    cv::Mat target, analysis, handwriting, print, overlap, strike;
     if (!ReadOrFail(inputPath, &target, error)) return NO;
     if (!ReadOrFail(analysisPath, &analysis, error)) return NO;
-    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error)) return NO;
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error, &strike)) return NO;
     if (analysis.size() != target.size()) {
         cv::resize(analysis, analysis, target.size(), 0, 0, cv::INTER_AREA);
     }
@@ -1210,13 +1503,24 @@ quarterTurnsClockwise:(NSInteger)quarterTurnsClockwise
         cv::resize(handwriting, handwriting, target.size(), 0, 0, cv::INTER_NEAREST);
         cv::resize(print, print, target.size(), 0, 0, cv::INTER_NEAREST);
         cv::resize(overlap, overlap, target.size(), 0, 0, cv::INTER_NEAREST);
+        cv::resize(strike, strike, target.size(), 0, 0, cv::INTER_NEAREST);
     }
-    cv::Mat dst = inkanalysis::EraseHandwriting(target, analysis, handwriting, print, overlap, RecognizeText);
+    cv::Mat dst = inkanalysis::EraseHandwriting(target, analysis, handwriting, print, overlap, RecognizeText, strike);
     // give back print / rules the erase took beyond the writing, clear the pen it left
     printrestore::Restore(analysis, target, dst, handwriting, print);
     // rules the handwriting was written on: cleared of pen leftovers and drawn again
     ruleredraw::Apply(analysis, handwriting, print, dst);
+    // grid paper the writing was on: its lines drawn again through the erased area
+    if (grid) gridredraw::Apply(analysis, dst, handwriting, print);
     return WriteOrFail(dst, outputPath, error);
+}
+
++ (BOOL)eraseWithMaskAtPath:(NSString *)inputPath
+                analysisPath:(NSString *)analysisPath
+                    maskPath:(NSString *)maskPath
+                  outputPath:(NSString *)outputPath
+                       error:(NSError **)error {
+    return EraseWithMask(inputPath, analysisPath, maskPath, outputPath, true, error);
 }
 
 // MARK: - Multi-pass erase (mirror PrintGuard.kt / MultiPassEraser.kt on Android)
@@ -1244,8 +1548,8 @@ static void FitMask(cv::Mat &m, const cv::Size &size) {
 /// Drops from the mask at `maskPath` every handwriting pixel `referenceMaskPath` calls pure print,
 /// moving it to the print layer; written to `outputPath`. Returns the handwriting coverage.
 static NSNumber *GuardMask(NSString *maskPath, NSString *referenceMaskPath, NSString *outputPath, NSError **error) {
-    cv::Mat handwriting, print, overlap, refHw, refPrint, refOverlap;
-    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error)) return nil;
+    cv::Mat handwriting, print, overlap, strike, refHw, refPrint, refOverlap;
+    if (!ReadMaskFileOrFail(maskPath, &handwriting, &print, &overlap, error, &strike)) return nil;
     if (!ReadMaskFileOrFail(referenceMaskPath, &refHw, &refPrint, &refOverlap, error)) return nil;
     FitMask(refHw, handwriting.size());
     FitMask(refPrint, handwriting.size());
@@ -1253,7 +1557,7 @@ static NSNumber *GuardMask(NSString *maskPath, NSString *referenceMaskPath, NSSt
     cv::Mat protect = refPrint & ~refHw;
     handwriting &= ~protect;
     print |= protect;
-    if (!WriteMaskFile(handwriting, print, overlap, outputPath, error)) return nil;
+    if (!WriteMaskFile(handwriting, print, overlap, outputPath, error, strike)) return nil;
     return Coverage(handwriting);
 }
 
@@ -1301,6 +1605,8 @@ static bool RestorePrint(NSString *inputPath, NSString *cleanPath, NSString *ref
     }
     cv::Mat restore = ((pure & ~hwAll) | pieces) & lighter;
     clean.copyTo(out, restore);
+    // the page as restored so far (PrintGuard.redrawUnderPen reads it after the copy above)
+    cv::cvtColor(out, grayOut, cv::COLOR_BGR2GRAY);
     // print remembered under the pen (overlap) that came out as paper: drawn back in the page's
     // print colour (the clean page carries the pen's colour there)
     FitMask(refOverlap, out.size());
@@ -1317,6 +1623,93 @@ static bool RestorePrint(NSString *inputPath, NSString *cleanPath, NSString *ref
         out.setTo(colour, paperNow);
     }
     return WriteOrFail(out, outputPath, error);
+}
+
+// MARK: - Speck clean (mirror SpeckClean.kt on Android)
+//
+// Very last erase step: specks the erase left where the handwriting was — a few dark pixels of a
+// stroke's rim, JPEG ringing round it — become paper. Only tiny pieces (up to kSpeckMaxAreaUnits
+// stroke units square), only inside the handwriting's zone, and never one touching print.
+
+/// Dev switch (Android: InkHarness `-e speck 0`).
+static const bool kSpeckCleanEnabled = true;
+static const double kSpeckMaxAreaUnits = 1.0;
+
+/// `dst` the erased page (CV_8UC3), updated in place; `handwriting` / `print` the mask's layers.
+static void SpeckClean(cv::Mat &dst, const cv::Mat &handwriting, const cv::Mat &print) {
+    if (!kSpeckCleanEnabled) return;
+    const int w = dst.cols, h = dst.rows;
+    const int k = inkanalysis::StrokeUnit(dst);
+    cv::Mat gray, paperG, ink;
+    cv::cvtColor(dst, gray, cv::COLOR_BGR2GRAY);
+    cv::dilate(gray, paperG, cv::Mat::ones(2 * k + 1, 2 * k + 1, CV_8U));
+    cv::medianBlur(paperG, paperG, 21);
+    cv::subtract(paperG, gray, ink);   // saturates at 0
+    cv::threshold(ink, ink, 30, 255, cv::THRESH_BINARY);
+    cv::Mat zone, nearPrint;
+    cv::dilate(handwriting, zone, cv::Mat::ones(2 * k + 1, 2 * k + 1, CV_8U));
+    cv::dilate(print, nearPrint, cv::Mat::ones(3, 3, CV_8U));
+    cv::Mat labels, stats, cents;
+    const int n = cv::connectedComponentsWithStats(ink, labels, stats, cents, 8, CV_32S);
+    const int maxArea = (int)(kSpeckMaxAreaUnits * k * k);
+    std::vector<int> inZone(n, 0);
+    std::vector<char> touchPrint(n, 0);
+    for (int y = 0; y < h; y++) {
+        const int *la = labels.ptr<int>(y);
+        const uchar *zo = zone.ptr<uchar>(y), *np = nearPrint.ptr<uchar>(y);
+        for (int x = 0; x < w; x++) {
+            const int l = la[x];
+            if (l == 0) continue;
+            if (zo[x]) inZone[l]++;
+            if (np[x]) touchPrint[l] = 1;
+        }
+    }
+    std::vector<char> clear(n, 0);
+    for (int l = 1; l < n; l++) {
+        const int area = stats.at<int>(l, cv::CC_STAT_AREA);
+        clear[l] = area <= maxArea && inZone[l] == area && !touchPrint[l];
+    }
+    cv::Mat paper;
+    cv::medianBlur(dst, paper, 21);
+    // a speck's own pixels and the 1 px halo round it
+    for (int y = 0; y < h; y++) {
+        cv::Vec3b *o = dst.ptr<cv::Vec3b>(y);
+        const cv::Vec3b *p = paper.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < w; x++) {
+            bool hit = clear[labels.at<int>(y, x)];
+            for (int dy = -1; dy <= 1 && !hit; dy++) {
+                const int yy = y + dy;
+                if (yy < 0 || yy >= h) continue;
+                const int *la = labels.ptr<int>(yy);
+                for (int dx = -1; dx <= 1; dx++) {
+                    const int xx = x + dx;
+                    if (xx >= 0 && xx < w && clear[la[xx]]) { hit = true; break; }
+                }
+            }
+            if (hit) o[x] = p[x];
+        }
+    }
+}
+
+/// Last steps of the multi-pass erase on the restored page at `outputPath` (in place), in
+/// MultiPassEraser.kt's order: the restore draws print back from the clean page, pen bits stuck to
+/// the rules with it, so the rules the handwriting touched are cleared and drawn once more
+/// (RuleRedraw); LineHeal (off on Android, `LineHeal.enabled = false`, not ported); specks the
+/// erase left become paper (SpeckClean); grid paper the writing was on, drawn again through the
+/// erased area once, after every pass (GridRedraw), last.
+static bool FinishErase(NSString *outputPath, NSString *analysisPath, NSString *maskPath, NSError **error) {
+    cv::Mat dst, analysis, refHw, refPrint, refOverlap;
+    if (!ReadOrFail(outputPath, &dst, error)) return false;
+    if (!ReadOrFail(analysisPath, &analysis, error)) return false;
+    if (!ReadMaskFileOrFail(maskPath, &refHw, &refPrint, &refOverlap, error)) return false;
+    if (analysis.size() != dst.size()) cv::resize(analysis, analysis, dst.size(), 0, 0, cv::INTER_AREA);
+    FitMask(refHw, dst.size());
+    FitMask(refPrint, dst.size());
+    ruleredraw::Apply(analysis, refHw, refPrint, dst);
+    // LineHeal.apply(dst, hw, print): disabled on Android (enabled = false) — a no-op there
+    SpeckClean(dst, refHw, refPrint);
+    gridredraw::Apply(analysis, dst, refHw, refPrint);
+    return WriteOrFail(dst, outputPath, error);
 }
 
 + (nullable NSNumber *)eraseHandwritingAtPath:(NSString *)inputPath
@@ -1361,7 +1754,7 @@ static bool RestorePrint(NSString *inputPath, NSString *cleanPath, NSString *ref
     NSNumber *result = nil;
     do {
         NSString *erased = file(@"erased_1.png");
-        if (![self eraseWithMaskAtPath:inputPath analysisPath:analysisPath maskPath:maskPath outputPath:erased error:error]) break;
+        if (!EraseWithMask(inputPath, analysisPath, maskPath, erased, false, error)) break;
         NSMutableArray<NSString *> *laterMasks = [NSMutableArray array];
         int passes = 1;
         bool failed = false;
@@ -1377,13 +1770,14 @@ static bool RestorePrint(NSString *inputPath, NSString *cleanPath, NSString *ref
             if (guardedCoverage == nil) { failed = true; break; }
             if (guardedCoverage.doubleValue < kMinPassCoverage) break;
             NSString *next = file([NSString stringWithFormat:@"erased_%d.png", pass]);
-            if (![self eraseWithMaskAtPath:erased analysisPath:erased maskPath:guarded outputPath:next error:error]) { failed = true; break; }
+            if (!EraseWithMask(erased, erased, guarded, next, false, error)) { failed = true; break; }
             erased = next;
             [laterMasks addObject:guarded];
             passes = pass;
         }
         if (failed) break;
         if (!RestorePrint(erased, inputPath, maskPath, laterMasks, outputPath, error)) break;
+        if (!FinishErase(outputPath, analysisPath, maskPath, error)) break;
         result = @(passes);
     } while (false);
     [[NSFileManager defaultManager] removeItemAtPath:work error:nil];

@@ -3276,8 +3276,10 @@ inline cv::Mat LevelRules(const cv::Mat &ink, const cv::Mat &handwriting, int k,
 /// paper colour during inpainting so it cannot bleed in, then put back). `analysis` is the
 /// unprocessed page the masks were computed on (same geometry).
 /// `recognize`: the platform's text recogniser, for restoring pen-hidden print (optional).
+/// `strike`: pen strike-throughs (StrikeThrough in ImageProcessingOpenCV.mm) — erased, never
+/// re-joined as a printed rule (optional).
 inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, const cv::Mat &handwriting, const cv::Mat &print, const cv::Mat &overlap,
-                                const TextRecognizer &recognize = nullptr) {
+                                const TextRecognizer &recognize = nullptr, const cv::Mat &strike = cv::Mat()) {
     const int k = StrokeUnit(target);
     const double s = k / 9.0;   // the window sizes below were measured at k = 9 (a 4032 px photo)
     cv::Mat dst = target.clone();
@@ -3354,6 +3356,7 @@ inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, 
             for (int i = 1; i < cl.count; i++) small[i] = cl.area[i] <= (2 * k) * (2 * k);
             area |= PaintComponents(cl.labels, small);
         }
+        if (!strike.empty()) restoreMask &= ~strike(roi);
         cv::Mat restore = area & restoreMask;
         cv::Mat paperArea = area & ~restore;
 
@@ -3483,14 +3486,23 @@ inline cv::Mat EraseHandwriting(const cv::Mat &target, const cv::Mat &analysis, 
         bright.copyTo(dst, cleanMask);
     }
     const cv::Mat beforeRepair = dst.clone();
+    // a strike-through's own pixels are no lost print: the repairs below, which rebuild letters the
+    // erase took (and re-spell words by reading the original, where the struck word misreads),
+    // leave the words it crossed as the line's removal left them
+    cv::Mat erasedPrint = erasedAll;
+    if (!strike.empty() && cv::countNonZero(strike) > 0) {
+        cv::Mat near;
+        cv::dilate(strike, near, cv::Mat::ones(5, 5, CV_8U));
+        erasedPrint = erasedAll & ~near;
+    }
 #ifndef INK_NO_REPAIR
-    RepairPrintByExample(dst, erasedAll, target, k);
+    RepairPrintByExample(dst, erasedPrint, target, k);
 #endif
 #ifndef INK_NO_RETYPESET
     RetypesetPrint(dst, analysis, handwriting, print | overlap, k);
 #endif
 #ifndef INK_NO_RECOGNITION
-    RestorePrintByRecognition(dst, analysis, erasedAll, k, recognize);
+    RestorePrintByRecognition(dst, analysis, erasedPrint, k, recognize);
 #endif
 #ifndef INK_NO_STRAY
     {
